@@ -1,54 +1,118 @@
+# =========================
 # Dependencies
+# =========================
 node_modules/
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
 
-# Environment variables
+# =========================
+# Environment Variables
+# =========================
 .env
+.env.*
+!.env.example
 .env.local
 .env.development.local
 .env.test.local
 .env.production.local
-.env.*.local
 
-# Generated files
-/src/generated/
-/prisma/migrations/*
-!/prisma/migrations/.gitkeep
+# =========================
+# Generated Files
+# =========================
+src/generated/
+prisma/
 
-# Build & Distribution
-/dist
-/build
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+.next/
+out/
 
+# =========================
 # Logs
+# =========================
+logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+pnpm-debug.log*
 lerna-debug.log*
-.pnpm-debug.log*
 
-# Testing
-/coverage
-/.nyc_output
+# =========================
+# Coverage / Testing
+# =========================
+coverage/
+.nyc_output/
+*.lcov
 
-# IDE & Editor
+# =========================
+# Cache Files
+# =========================
+.cache/
+.parcel-cache/
+.eslintcache
+*.tsbuildinfo
+
+# =========================
+# Temporary Files
+# =========================
+tmp/
+temp/
+*.tmp
+
+# =========================
+# IDE / Editors
+# =========================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.DS_Store
-Thumbs.db
-
-# OS
-.AppleDouble
-.LSOverride
 *.sublime-project
 *.sublime-workspace
 
+# =========================
+# Mac / Windows System Files
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# =========================
+# Vercel
+# =========================
+.vercel/
+
+# =========================
+# Linux VPS / Deployment
+# =========================
+*.pid
+*.seed
+*.pid.lock
+
+# =========================
+# Uploads / Local Storage
+# (uncomment if needed)
+# =========================
+# uploads/
+# public/uploads/
+
+# =========================
+# Docker
+# =========================
+.dockerignore
+
+# =========================
 # Misc
-.cache/
-tmp/
-temp/
+# =========================
+*.tgz
+*.gz
+*.zip
+*.tar
+*.bak
