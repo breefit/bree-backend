@@ -1,0 +1,54 @@
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+
+# Generated files
+/src/generated/
+/prisma/migrations/*
+!/prisma/migrations/.gitkeep
+
+# Build & Distribution
+/dist
+/build
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Testing
+/coverage
+/.nyc_output
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS
+.AppleDouble
+.LSOverride
+*.sublime-project
+*.sublime-workspace
+
+# Misc
+.cache/
+tmp/
+temp/
