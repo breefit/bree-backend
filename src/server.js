@@ -20,9 +20,15 @@ const PORT = process.env.PORT || 4000;
 /* -------------------------------------------------------------------------- */
 
 const httpServer = createServer(app);
+
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
+  .split(",")
+  .map((u) => u.trim())
+  .filter(Boolean);
+
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
   },
 });

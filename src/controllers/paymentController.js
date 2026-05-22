@@ -81,16 +81,15 @@ export const createOrder = async (req, res) => {
 
     const orderRes = await client.query(
       `INSERT INTO orders
-         (user_id, customer_name, email, mobile_number, shipping_address,
-          amount, order_status, payment_status, razorpay_order_id)
-       VALUES ($1,$2,$3,$4,$5,$6,'pending','pending',$7)
+         (user_id, contact_name, contact_email, contact_phone,
+          subtotal, total, order_status, payment_status, razorpay_order_id)
+       VALUES ($1,$2,$3,$4,$5,$5,'pending','pending',$6)
        RETURNING id`,
       [
         req.user?.id || null,
         customerName || req.user?.name || "Guest",
         email || req.user?.email || "",
         mobileNumber || "",
-        shippingAddress,
         serverTotal,
         rzpOrder.id,
       ],
@@ -100,9 +99,16 @@ export const createOrder = async (req, res) => {
 
     for (const item of validatedItems) {
       await client.query(
-        `INSERT INTO order_items (order_id, product_id, name, quantity, price)
-         VALUES ($1,$2,$3,$4,$5)`,
-        [orderId, item.product_id, item.name, item.quantity, item.price],
+        `INSERT INTO order_items (order_id, product_id, product_name, product_price, quantity, subtotal)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          orderId,
+          item.product_id,
+          item.name,
+          item.price,
+          item.quantity,
+          item.price * item.quantity,
+        ],
       );
     }
 
@@ -354,14 +360,14 @@ export const verifyPayment = async (req, res) => {
   }
 
   const { rows: itemRows } = await query(
-    "SELECT name, quantity, price::float FROM order_items WHERE order_id = $1",
+    "SELECT product_name AS name, quantity, product_price::float AS price, subtotal FROM order_items WHERE order_id = $1",
     [order.id],
   );
   sendOrderConfirmation({
-    to: order.email,
-    name: order.customer_name,
+    to: order.contact_email,
+    name: order.contact_name,
     orderId: order.id,
-    amount: order.amount,
+    amount: order.total,
     items: itemRows,
   }).catch(() => {});
 
@@ -382,19 +388,18 @@ export const getPaymentStatus = async (req, res) => {
   const { rows } = await query(
     `SELECT
        o.id AS order_id,
-       o.amount,
+       o.total AS amount,
        o.order_status,
        o.payment_status,
        o.razorpay_order_id,
-       o.transaction_id,
-       o.customer_name,
-       o.email,
-       o.mobile_number,
-       o.shipping_address,
-       json_agg(json_build_object('name', oi.name, 'quantity', oi.quantity, 'price', oi.price)) FILTER (WHERE oi.id IS NOT NULL) AS items
+       o.razorpay_payment_id AS transaction_id,
+       o.contact_name,
+       o.contact_email,
+       o.contact_phone,
+       json_agg(json_build_object('name', oi.product_name, 'quantity', oi.quantity, 'price', oi.product_price)) FILTER (WHERE oi.id IS NOT NULL) AS items
      FROM orders o
      LEFT JOIN order_items oi ON oi.order_id = o.id
-     WHERE o.transaction_id = $1 OR o.razorpay_order_id = $1
+     WHERE o.razorpay_payment_id = $1 OR o.razorpay_order_id = $1
      GROUP BY o.id`,
     [paymentId],
   );
@@ -417,10 +422,9 @@ export const getPaymentStatus = async (req, res) => {
     amount_total: Math.round(Number(order.amount) * 100),
     metadata,
     order_id: order.order_id,
-    customer_name: order.customer_name,
-    email: order.email,
-    mobile_number: order.mobile_number,
-    shipping_address: order.shipping_address,
+    customer_name: order.contact_name,
+    email: order.contact_email,
+    mobile_number: order.contact_phone,
   });
 };
 
@@ -429,7 +433,7 @@ export const handleWebhook = async (req, res) => {
   const signature = req.headers["x-razorpay-signature"];
   // Prefer the preserved raw body set by the raw middleware; fall back to
   // the stringified parsed body if not available (defensive).
-  const raw = req.rawBody ?? (req.body ? JSON.stringify(req.body) : '');
+  const raw = req.rawBody ?? (req.body ? JSON.stringify(req.body) : "");
   if (!verifyWebhookSignature(raw, signature)) {
     return res.status(400).json({ message: "Invalid webhook signature" });
   }

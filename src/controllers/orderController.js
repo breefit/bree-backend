@@ -4,6 +4,15 @@ import {
   getOrderSchemaInfo,
 } from "../utils/orderSchema.js";
 
+const normalizeOrderStatus = (s) => {
+  if (!s) return null;
+  const l = String(s).toLowerCase();
+  if (["processing", "shipped", "out_for_delivery", "dispatched"].includes(l))
+    return "dispatched";
+  if (["pending", "confirmed", "delivered", "cancelled"].includes(l)) return l;
+  return l;
+};
+
 // ========================================
 // VALIDATE CART BEFORE CHECKOUT
 // ========================================
@@ -29,7 +38,11 @@ export const validateCart = async (req, res) => {
         [item.id],
       );
 
-      if (!productRows.length || !productRows[0].is_active || productRows[0].status !== 'In Stock') {
+      if (
+        !productRows.length ||
+        !productRows[0].is_active ||
+        productRows[0].status !== "In Stock"
+      ) {
         validationResults.push({
           productId: item.id,
           valid: false,
@@ -192,7 +205,11 @@ export const createOrder = async (req, res) => {
         [productId],
       );
 
-      if (!prodRows.length || !prodRows[0].is_active || prodRows[0].status !== 'In Stock') {
+      if (
+        !prodRows.length ||
+        !prodRows[0].is_active ||
+        prodRows[0].status !== "In Stock"
+      ) {
         await client.query("ROLLBACK");
         return res
           .status(400)
@@ -373,13 +390,11 @@ export const createOrder = async (req, res) => {
       items: orderItems,
     };
 
-    return res
-      .status(201)
-      .json({
-        orderId: order.id,
-        order: orderResponse,
-        message: "Order created successfully",
-      });
+    return res.status(201).json({
+      orderId: order.id,
+      order: orderResponse,
+      message: "Order created successfully",
+    });
   } catch (err) {
     try {
       await client.query("ROLLBACK");
