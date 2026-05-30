@@ -26,7 +26,15 @@ export const adminLogin = async (req, res, next) => {
 
     const token = signAdminToken(admin.id);
     res.cookie(ADMIN_COOKIE_NAME, token, ADMIN_COOKIE_OPTIONS);
-    res.json({ admin: { id: admin.id, email: admin.email, name: admin.name } });
+
+    res.json({
+      token,
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        name: admin.name,
+      },
+    });
   } catch (err) {
     next(err);
   }
