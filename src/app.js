@@ -20,7 +20,7 @@ import {
 import adminRouter from "./routes/admin/index.js";
 import errorHandler from "./middleware/errorHandler.js";
 
-console.log("STEP 2 - App file loaded");
+// console.log("STEP 2 - App file loaded");
 
 const app = express();
 
@@ -125,7 +125,7 @@ try {
   app.use("/api/testimonials", testimonialRouter);
   app.use("/api/admin", adminRouter);
 
-  console.log("STEP 7 - Routes loaded");
+  // console.log("STEP 7 - Routes loaded");
 } catch (err) {
   console.error("❌ App route setup failed:", err);
   throw err;
