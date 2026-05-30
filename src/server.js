@@ -1,66 +1,77 @@
 import dotenv from "dotenv";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import app from "./app.js";
-
-/* -------------------------------------------------------------------------- */
-/*                              LOAD ENV FILE                                 */
-/* -------------------------------------------------------------------------- */
 
 dotenv.config();
 
-/* -------------------------------------------------------------------------- */
-/*                                  PORT                                      */
-/* -------------------------------------------------------------------------- */
+console.log("STEP 1 - Server file loaded");
+console.log("STEP 4 - Environment variables loaded");
+console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
+console.log("FRONTEND_URL exists:", !!process.env.FRONTEND_URL);
+console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
+
+process.on("uncaughtException", (err) => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("UNHANDLED REJECTION:", err);
+});
 
 const PORT = process.env.PORT || 4000;
 
-/* -------------------------------------------------------------------------- */
-/*                              START SERVER                                  */
-/* -------------------------------------------------------------------------- */
+const startServer = async () => {
+  try {
+    const { default: app } = await import("./app.js");
 
-const httpServer = createServer(app);
+    const httpServer = createServer(app);
 
-const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
-  .split(",")
-  .map((u) => u.trim())
-  .filter(Boolean);
+    const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
+      .split(",")
+      .map((u) => u.trim())
+      .filter(Boolean);
 
-const io = new Server(httpServer, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ["GET", "POST"],
-  },
-});
+    const io = new Server(httpServer, {
+      cors: {
+        origin: allowedOrigins,
+        methods: ["GET", "POST"],
+      },
+    });
 
-// Attach io to app for access in route handlers
-app.locals.io = io;
+    // Attach io to app for access in route handlers
+    app.locals.io = io;
 
-const server = httpServer.listen(PORT, () => {
-  console.log("\n=======================================");
-  console.log("🚀 BREE BACKEND SERVER RUNNING");
-  console.log("=======================================\n");
+    console.log("STEP 8 - Starting HTTP server");
+    const server = httpServer.listen(PORT, () => {
+      console.log("STEP 9 - Server listening");
+      console.log("\n=======================================");
+      console.log("🚀 BREE BACKEND SERVER RUNNING");
+      console.log("=======================================\n");
 
-  console.log(`🌐 URL: http://localhost:${PORT}`);
-  console.log(`🌿 ENV: ${process.env.NODE_ENV || "development"}`);
-  console.log(`💚 HEALTH: http://localhost:${PORT}/health`);
-  console.log(`📡 Socket.IO: ws://localhost:${PORT}/socket.io`);
+      console.log(`🌐 URL: http://localhost:${PORT}`);
+      console.log(`🌿 ENV: ${process.env.NODE_ENV || "development"}`);
+      console.log(`💚 HEALTH: http://localhost:${PORT}/health`);
+      console.log(`📡 Socket.IO: ws://localhost:${PORT}/socket.io`);
 
-  console.log("\n=======================================\n");
-});
+      console.log("\n=======================================\n");
+    });
 
-// Socket.IO connection handler
-io.on("connection", (socket) => {
-  console.log(`✅ Client connected: ${socket.id}`);
-  socket.on("disconnect", () => {
-    console.log(`❌ Client disconnected: ${socket.id}`);
-  });
-});
+    server.on("error", (error) => {
+      console.error("❌ SERVER ERROR:", error);
+      process.exit(1);
+    });
 
-/* -------------------------------------------------------------------------- */
-/*                           HANDLE SERVER ERRORS                             */
-/* -------------------------------------------------------------------------- */
+    io.on("connection", (socket) => {
+      console.log(`✅ Client connected: ${socket.id}`);
+      socket.on("disconnect", () => {
+        console.log(`❌ Client disconnected: ${socket.id}`);
+      });
+    });
+  } catch (err) {
+    console.error("❌ Startup failed:", err);
+    console.error(err.stack || err);
+    process.exit(1);
+  }
+};
 
-server.on("error", (error) => {
-  console.error("❌ SERVER ERROR:", error);
-});
+await startServer();

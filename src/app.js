@@ -20,6 +20,8 @@ import {
 import adminRouter from "./routes/admin/index.js";
 import errorHandler from "./middleware/errorHandler.js";
 
+console.log("STEP 2 - App file loaded");
+
 const app = express();
 
 // Serve simple static images used as fallbacks by frontend (e.g. /images/default-product.png)
@@ -112,15 +114,22 @@ app.use("/api/auth/login", authLimiter);
 app.use("/api/auth/change-password", authLimiter);
 
 // ── API Routes ────────────────────────────────────────────────────────────────
-app.use("/api/auth", authRouter);
-app.use("/api/products", productRouter);
-app.use("/api/orders", orderRouter);
-app.use("/api/payment", paymentRouter);
-app.use("/api/profile", profileRouter);
-app.use("/api/addresses", addressRouter);
-app.use("/api/contact", contactRouter);
-app.use("/api/testimonials", testimonialRouter);
-app.use("/api/admin", adminRouter);
+try {
+  app.use("/api/auth", authRouter);
+  app.use("/api/products", productRouter);
+  app.use("/api/orders", orderRouter);
+  app.use("/api/payment", paymentRouter);
+  app.use("/api/profile", profileRouter);
+  app.use("/api/addresses", addressRouter);
+  app.use("/api/contact", contactRouter);
+  app.use("/api/testimonials", testimonialRouter);
+  app.use("/api/admin", adminRouter);
+
+  console.log("STEP 7 - Routes loaded");
+} catch (err) {
+  console.error("❌ App route setup failed:", err);
+  throw err;
+}
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) =>

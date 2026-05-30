@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+console.log("STEP 3 - Database file loaded");
+
 import mysql from "mysql2/promise";
 
 if (!process.env.DATABASE_URL) {
@@ -88,7 +90,15 @@ const testConnection = async () => {
   }
 };
 
-await testConnection();
+try {
+  console.log("STEP 5 - Testing database connection");
+  await testConnection();
+  console.log("STEP 6 - Database connected successfully");
+} catch (err) {
+  console.error("❌ Database connection failed:", err);
+  console.error(err.stack || err);
+  throw err;
+}
 
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);
