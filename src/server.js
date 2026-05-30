@@ -4,11 +4,11 @@ import { Server } from "socket.io";
 
 dotenv.config();
 
-console.log("STEP 1 - Server file loaded");
-console.log("STEP 4 - Environment variables loaded");
-console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
-console.log("FRONTEND_URL exists:", !!process.env.FRONTEND_URL);
-console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
+// console.log("STEP 1 - Server file loaded");
+// console.log("STEP 4 - Environment variables loaded");
+// console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
+// console.log("FRONTEND_URL exists:", !!process.env.FRONTEND_URL);
+// console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
 
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
@@ -41,7 +41,7 @@ const startServer = async () => {
     // Attach io to app for access in route handlers
     app.locals.io = io;
 
-    console.log("STEP 8 - Starting HTTP server");
+    // console.log("STEP 8 - Starting HTTP server");
     const server = httpServer.listen(PORT, () => {
       console.log("STEP 9 - Server listening");
       console.log("\n=======================================");
@@ -62,14 +62,14 @@ const startServer = async () => {
     });
 
     io.on("connection", (socket) => {
-      console.log(`✅ Client connected: ${socket.id}`);
+      // console.log(`✅ Client connected: ${socket.id}`);
       socket.on("disconnect", () => {
         console.log(`❌ Client disconnected: ${socket.id}`);
       });
     });
   } catch (err) {
     console.error("❌ Startup failed:", err);
-    console.error(err.stack || err);
+    // console.error(err.stack || err);
     process.exit(1);
   }
 };
