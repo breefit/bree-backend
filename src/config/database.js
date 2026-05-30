@@ -123,11 +123,11 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-console.log("STEP 3 - Database file loaded");
+// console.log("STEP 3 - Database file loaded");
 
 import mysql from "mysql2/promise";
 
-console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
+// console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
 
 const cleanEnv = (value) => value?.trim();
 
@@ -237,9 +237,9 @@ const testConnection = async () => {
 
   try {
     await connection.ping();
-    console.log("✅ MySQL connected");
-    console.log("DB host:", poolConfig.host);
-    console.log("DB name:", poolConfig.database);
+    // console.log("✅ MySQL connected");
+    // console.log("DB host:", poolConfig.host);
+    // console.log("DB name:", poolConfig.database);
   } catch (err) {
     console.error("❌ Database connection failed:", err.message);
     throw err;
@@ -249,13 +249,13 @@ const testConnection = async () => {
 };
 
 try {
-  console.log("STEP 5 - Testing database connection");
+  // console.log("STEP 5 - Testing database connection");
   await testConnection();
-  console.log("STEP 6 - Database connected successfully");
+  // console.log("STEP 6 - Database connected successfully");
 } catch (err) {
   console.error("❌ Database connection failed");
   console.error(err.stack || err);
-  console.log("⚠️ Continuing startup without DB");
+  // console.log("⚠️ Continuing startup without DB");
 }
 
 export const query = async (text, params = []) => {
