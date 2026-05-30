@@ -5,6 +5,8 @@ console.log("STEP 3 - Database file loaded");
 
 import mysql from "mysql2/promise";
 
+console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
+
 if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL environment variable is not set");
 }
@@ -25,7 +27,6 @@ const pool = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
   decimalNumbers: true,
-  namedPlaceholders: false,
   supportBigNumbers: true,
   bigNumberStrings: true,
   charset: "utf8mb4_unicode_ci",
@@ -71,7 +72,6 @@ const runQuery = async (connection, text, params = []) => {
     console.error("SQL:", sql);
     console.error("Params:", params);
     console.error(err);
-
     throw err;
   }
 };
@@ -90,14 +90,17 @@ const testConnection = async () => {
   }
 };
 
+// Startup test
 try {
   console.log("STEP 5 - Testing database connection");
   await testConnection();
   console.log("STEP 6 - Database connected successfully");
 } catch (err) {
-  console.error("❌ Database connection failed:", err);
+  console.error("❌ Database connection failed");
   console.error(err.stack || err);
-  throw err;
+
+  // TEMPORARY DEBUGGING
+  console.log("⚠️ Continuing startup without DB");
 }
 
 export const query = async (text, params = []) => {
