@@ -5,7 +5,7 @@ import { query } from "../config/database.js";
 export const getProfile = async (req, res, next) => {
   try {
     const { rows } = await query(
-      "SELECT id, name, email, phone, picture, provider, created_at FROM users WHERE id = $1",
+      "SELECT id, name, email, phone, picture, provider, created_at FROM users WHERE id = ?",
       [req.user.id],
     );
     res.json(rows[0]);
@@ -34,12 +34,14 @@ export const updateProfile = async (req, res, next) => {
     if (!updates.length)
       return res.status(400).json({ message: "No fields to update" });
 
-    updates.push(`updated_at = now()`);
+    updates.push(`updated_at = CURRENT_TIMESTAMP`);
     params.push(req.user.id);
 
+    await query(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`, params);
+
     const { rows } = await query(
-      `UPDATE users SET ${updates.join(", ")} WHERE id = $${idx} RETURNING id, name, email, phone, picture`,
-      params,
+      `SELECT id, name, email, phone, picture FROM users WHERE id = ?`,
+      [req.user.id],
     );
     res.json(rows[0]);
   } catch (err) {
@@ -53,7 +55,7 @@ export const changePassword = async (req, res, next) => {
     const { currentPassword, newPassword } = req.body;
 
     const { rows } = await query(
-      "SELECT password, provider FROM users WHERE id = $1",
+      "SELECT password, provider FROM users WHERE id = ?",
       [req.user.id],
     );
     if (!rows.length)
@@ -71,10 +73,10 @@ export const changePassword = async (req, res, next) => {
       return res.status(401).json({ message: "Current password is incorrect" });
 
     const hashed = await bcrypt.hash(newPassword, 12);
-    await query("UPDATE users SET password=$1, updated_at=now() WHERE id=$2", [
-      hashed,
-      req.user.id,
-    ]);
+    await query(
+      "UPDATE users SET password = ?, updated_at = now() WHERE id = ?",
+      [hashed, req.user.id],
+    );
     res.json({ message: "Password updated successfully" });
   } catch (err) {
     next(err);

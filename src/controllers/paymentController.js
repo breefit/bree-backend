@@ -4,7 +4,7 @@ import {
   verifyWebhookSignature,
 } from "../utils/razorpay.js";
 import { query, getClient } from "../config/database.js";
-import { sendOrderConfirmation } from "../services/email.js";
+import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 
 // POST /api/payment/create-order
 export const createOrder = async (req, res) => {
@@ -33,7 +33,7 @@ export const createOrder = async (req, res) => {
     }
 
     const { rows } = await query(
-      "SELECT id, name, price::float AS price, stock_qty FROM products WHERE id = $1 AND is_active = true AND status = 'In Stock'",
+      "SELECT id, name, image, price AS price, stock_qty FROM products WHERE id = ? AND is_active = 1 AND status = 'In Stock'",
       [productId],
     );
 
@@ -44,6 +44,7 @@ export const createOrder = async (req, res) => {
     }
 
     const product = rows[0];
+
     if (product.stock_qty < quantity) {
       return res
         .status(400)
@@ -54,12 +55,15 @@ export const createOrder = async (req, res) => {
     const itemTotal = itemPrice * quantity;
     serverTotal += itemTotal;
 
-    validatedItems.push({
+    const validatedItem = {
       product_id: product.id,
       name: product.name,
+      image: product.image || null,
       quantity,
       price: itemPrice,
-    });
+    };
+
+    validatedItems.push(validatedItem);
   }
 
   if (Math.abs(serverTotal - Number(amount)) > 1) {
@@ -79,47 +83,54 @@ export const createOrder = async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    const orderRes = await client.query(
+    await client.query(
       `INSERT INTO orders
          (user_id, contact_name, contact_email, contact_phone,
           subtotal, total, order_status, payment_status, razorpay_order_id)
-       VALUES ($1,$2,$3,$4,$5,$5,'pending','pending',$6)
-       RETURNING id`,
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`,
       [
         req.user?.id || null,
         customerName || req.user?.name || "Guest",
         email || req.user?.email || "",
         mobileNumber || "",
         serverTotal,
+        serverTotal,
         rzpOrder.id,
       ],
     );
 
-    const orderId = orderRes.rows[0].id;
+    const { rows: orderRows } = await client.query(
+      `SELECT id FROM orders WHERE razorpay_order_id = ? LIMIT 1`,
+      [rzpOrder.id],
+    );
+    const orderId = orderRows[0]?.id;
 
     for (const item of validatedItems) {
+      const insertValues = [
+        orderId,
+        item.product_id,
+        item.name,
+        item.image || null,
+        item.price,
+        item.quantity,
+        item.price * item.quantity,
+      ];
+
       await client.query(
-        `INSERT INTO order_items (order_id, product_id, product_name, product_price, quantity, subtotal)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [
-          orderId,
-          item.product_id,
-          item.name,
-          item.price,
-          item.quantity,
-          item.price * item.quantity,
-        ],
+        `INSERT INTO order_items (order_id, product_id, product_name, product_image, product_price, quantity, subtotal)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        insertValues,
       );
     }
 
     await client.query(
       `INSERT INTO payments (order_id, razorpay_order_id, amount, status)
-       VALUES ($1,$2,$3,'created')`,
+       VALUES (?, ?, ?, 'created')`,
       [orderId, rzpOrder.id, serverTotal],
     );
     await client.query(
       `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes)
-       VALUES ($1,$2,$3,$4,$5)`,
+       VALUES (?, ?, ?, ?, ?)`,
       [
         orderId,
         null,
@@ -161,11 +172,6 @@ export const verifyPayment = async (req, res) => {
     return res.status(400).json({ message: "Missing payment fields" });
   }
 
-  console.info("Payment verify request received", {
-    razorpay_order_id,
-    razorpay_payment_id,
-  });
-
   // ── CRITICAL: Verify HMAC signature ─────────────────────────────────────
   const isValid = verifyPaymentSignature({
     razorpay_order_id,
@@ -181,7 +187,7 @@ export const verifyPayment = async (req, res) => {
   }
 
   const { rows: existingPaymentRows } = await query(
-    "SELECT * FROM orders WHERE razorpay_payment_id = $1",
+    "SELECT * FROM orders WHERE razorpay_payment_id = ?",
     [razorpay_payment_id],
   );
 
@@ -201,7 +207,7 @@ export const verifyPayment = async (req, res) => {
   }
 
   const { rows: orderRows } = await query(
-    "SELECT * FROM orders WHERE razorpay_order_id = $1",
+    "SELECT * FROM orders WHERE razorpay_order_id = ?",
     [razorpay_order_id],
   );
 
@@ -211,6 +217,9 @@ export const verifyPayment = async (req, res) => {
   }
 
   const order = orderRows[0];
+
+  // Ensure we have a reliable numeric total for legacy and new schemas
+  const dbTotal = order.total ?? order.amount ?? 0;
 
   if (order.payment_status === "paid") {
     if (order.razorpay_payment_id === razorpay_payment_id) {
@@ -241,7 +250,7 @@ export const verifyPayment = async (req, res) => {
     await client.query("BEGIN");
 
     const { rows: lockedRows } = await client.query(
-      "SELECT * FROM orders WHERE id = $1 FOR UPDATE",
+      "SELECT * FROM orders WHERE id = ? FOR UPDATE",
       [order.id],
     );
     const lockedOrder = lockedRows[0];
@@ -262,21 +271,15 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    console.info("Finalizing order payment", {
-      orderId: order.id,
-      razorpay_order_id,
-      razorpay_payment_id,
-    });
-
     await client.query(
       `UPDATE orders SET payment_status='paid', order_status='confirmed',
-          transaction_id=$1, razorpay_payment_id=$2, updated_at=now(), paid_at=now() WHERE id=$3`,
+          transaction_id = ?, razorpay_payment_id = ?, updated_at = now(), paid_at = now() WHERE id = ?`,
       [razorpay_payment_id, razorpay_payment_id, order.id],
     );
 
     const paymentUpdate = await client.query(
-      `UPDATE payments SET razorpay_payment_id=$1, razorpay_signature=$2,
-          status='captured', updated_at=now() WHERE razorpay_order_id=$3`,
+      `UPDATE payments SET razorpay_payment_id = ?, razorpay_signature = ?,
+          status = 'captured', updated_at = now() WHERE razorpay_order_id = ?`,
       [razorpay_payment_id, razorpay_signature, razorpay_order_id],
     );
 
@@ -291,26 +294,26 @@ export const verifyPayment = async (req, res) => {
       );
       await client.query(
         `INSERT INTO payments (order_id, razorpay_order_id, razorpay_payment_id, razorpay_signature, amount, currency, status)
-         VALUES ($1,$2,$3,$4,$5,'INR','captured')`,
+         VALUES (?, ?, ?, ?, ?, 'INR', 'captured')`,
         [
           order.id,
           razorpay_order_id,
           razorpay_payment_id,
           razorpay_signature,
-          order.amount,
+          dbTotal,
         ],
       );
     }
 
     const { rows: items } = await client.query(
-      "SELECT product_id, quantity FROM order_items WHERE order_id = $1",
+      "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
       [order.id],
     );
 
     for (const item of items) {
       const stockResult = await client.query(
-        "UPDATE products SET stock_qty = stock_qty - $1 WHERE id = $2 AND stock_qty >= $1",
-        [item.quantity, item.product_id],
+        "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ? AND stock_qty >= ?",
+        [item.quantity, item.product_id, item.quantity],
       );
 
       if (!stockResult.rowCount) {
@@ -335,7 +338,7 @@ export const verifyPayment = async (req, res) => {
 
     await client.query(
       `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes)
-       VALUES ($1,$2,$3,$4,$5)`,
+       VALUES (?, ?, ?, ?, ?)`,
       [order.id, order.order_status, "confirmed", null, "Payment captured"],
     );
 
@@ -360,14 +363,14 @@ export const verifyPayment = async (req, res) => {
   }
 
   const { rows: itemRows } = await query(
-    "SELECT product_name AS name, quantity, product_price::float AS price, subtotal FROM order_items WHERE order_id = $1",
+    "SELECT product_name AS name, quantity, product_price AS price, subtotal FROM order_items WHERE order_id = ?",
     [order.id],
   );
-  sendOrderConfirmation({
+  sendOrderConfirmationEmail({
     to: order.contact_email,
     name: order.contact_name,
     orderId: order.id,
-    amount: order.total,
+    amount: dbTotal,
     items: itemRows,
   }).catch(() => {});
 
@@ -388,20 +391,17 @@ export const getPaymentStatus = async (req, res) => {
   const { rows } = await query(
     `SELECT
        o.id AS order_id,
-       o.total AS amount,
+       COALESCE(o.total, o.amount) AS amount,
        o.order_status,
        o.payment_status,
        o.razorpay_order_id,
        o.razorpay_payment_id AS transaction_id,
        o.contact_name,
        o.contact_email,
-       o.contact_phone,
-       json_agg(json_build_object('name', oi.product_name, 'quantity', oi.quantity, 'price', oi.product_price)) FILTER (WHERE oi.id IS NOT NULL) AS items
+       o.contact_phone
      FROM orders o
-     LEFT JOIN order_items oi ON oi.order_id = o.id
-     WHERE o.razorpay_payment_id = $1 OR o.razorpay_order_id = $1
-     GROUP BY o.id`,
-    [paymentId],
+     WHERE o.razorpay_payment_id = ? OR o.razorpay_order_id = ?`,
+    [paymentId, paymentId],
   );
 
   if (!rows.length) {
@@ -409,17 +409,24 @@ export const getPaymentStatus = async (req, res) => {
   }
 
   const order = rows[0];
+  const { rows: items } = await query(
+    `SELECT product_name AS name, quantity, product_price AS price, subtotal
+     FROM order_items
+     WHERE order_id = ?`,
+    [order.order_id],
+  );
+
   const quantity =
-    order.items?.reduce((sum, item) => sum + (item.quantity || 0), 0) || 1;
+    items.reduce((sum, item) => sum + (item.quantity || 0), 0) || 1;
   const metadata = {
-    product_name: order.items?.[0]?.name || "BREE Wellness Shot",
+    product_name: items[0]?.name || "BREE Wellness Shot",
     quantity,
   };
 
   res.json({
     payment_status: order.payment_status,
     status: order.payment_status === "paid" ? "paid" : "pending",
-    amount_total: Math.round(Number(order.amount) * 100),
+    amount_total: Math.round(Number(order.total ?? order.amount ?? 0) * 100),
     metadata,
     order_id: order.order_id,
     customer_name: order.contact_name,
@@ -445,17 +452,17 @@ export const handleWebhook = async (req, res) => {
     if (rzpOrderId) {
       await query(
         `UPDATE orders SET payment_status='failed', updated_at=now()
-         WHERE razorpay_order_id=$1`,
+         WHERE razorpay_order_id = ?`,
         [rzpOrderId],
       );
       try {
         const { rows } = await query(
-          "SELECT id, order_status FROM orders WHERE razorpay_order_id=$1",
+          "SELECT id, order_status FROM orders WHERE razorpay_order_id = ?",
           [rzpOrderId],
         );
         if (rows[0]) {
           await query(
-            `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes) VALUES ($1,$2,$3,$4,$5)`,
+            `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes) VALUES (?, ?, ?, ?, ?)`,
             [
               rows[0].id,
               rows[0].order_status,

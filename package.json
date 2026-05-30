@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "migrate": "node migrations/migrate.js",
+    "migrate": "node migrations/mysql-migrate.js",
     "seed": "node migrations/seed.js"
   },
   "author": "Pavan Veguru",
@@ -34,7 +34,7 @@
     "multer": "^2.0.0",
     "multer-storage-cloudinary": "^4.0.0",
     "nodemailer": "^6.9.9",
-    "pg": "^8.13.1",
+    "mysql2": "^3.4.4",
     "razorpay": "^2.9.6",
     "socket.io": "^4.8.3"
   },

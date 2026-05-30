@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import { query, getClient } from "../config/database.js";
 import {
   formatAddressSnapshot,
@@ -32,9 +33,9 @@ export const validateCart = async (req, res) => {
 
     for (const item of cartItems) {
       const { rows: productRows } = await query(
-        `SELECT id, name, price::float, stock_qty, is_active, status
+        `SELECT id, name, price, stock_qty, is_active, status
          FROM products
-         WHERE id = $1`,
+         WHERE id = ?`,
         [item.id],
       );
 
@@ -133,7 +134,7 @@ export const createOrder = async (req, res) => {
     await client.query("BEGIN");
 
     const { rows: userRows } = await client.query(
-      "SELECT id FROM users WHERE id = $1 LIMIT 1",
+      "SELECT id FROM users WHERE id = ? LIMIT 1",
       [userId],
     );
     if (!userRows.length) {
@@ -144,7 +145,7 @@ export const createOrder = async (req, res) => {
     const { rows: addressRows } = await client.query(
       `SELECT id, full_name, phone, address_line_1, address_line_2, city, state, pincode, country
        FROM user_addresses
-       WHERE id = $1 AND user_id = $2
+       WHERE id = ? AND user_id = ?
        LIMIT 1`,
       [addressId, userId],
     );
@@ -155,7 +156,7 @@ export const createOrder = async (req, res) => {
       const { rows: fallbackRows } = await client.query(
         `SELECT id, label, line1, line2, city, state, pincode, country
          FROM addresses
-         WHERE id = $1 AND user_id = $2
+         WHERE id = ? AND user_id = ?
          LIMIT 1`,
         [addressId, userId],
       );
@@ -198,9 +199,9 @@ export const createOrder = async (req, res) => {
       }
 
       const { rows: prodRows } = await client.query(
-        `SELECT id, name, image, price::float AS price, mrp::float AS mrp, quantity AS pack_size, stock_qty, is_active, status
+        `SELECT id, name, image, price AS price, mrp AS mrp, quantity AS pack_size, stock_qty, is_active, status
          FROM products
-         WHERE id = $1
+         WHERE id = ?
          LIMIT 1`,
         [productId],
       );
@@ -250,48 +251,69 @@ export const createOrder = async (req, res) => {
       // insert it into `user_addresses` (uuid id) so it can be referenced by orders.address_id
       let finalAddressId = addressId;
       if (addressFromLegacy) {
-        const insertAddr = `INSERT INTO user_addresses (user_id, full_name, phone, address_line_1, address_line_2, city, state, pincode, country, is_default)
-                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,false) RETURNING id`;
-        const { rows: newAddrRows } = await client.query(insertAddr, [
-          userId,
-          contactName || null,
-          contactPhone || null,
-          address.line1 || null,
-          address.line2 || null,
-          address.city || null,
-          address.state || null,
-          address.pincode || null,
-          address.country || "India",
-        ]);
-        finalAddressId = newAddrRows[0].id;
+        const addressIdValue = crypto.randomUUID();
+        await client.query(
+          `INSERT INTO user_addresses (id, user_id, full_name, phone, address_line_1, address_line_2, city, state, pincode, country, is_default)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            addressIdValue,
+            userId,
+            contactName || null,
+            contactPhone || null,
+            address.line1 || null,
+            address.line2 || null,
+            address.city || null,
+            address.state || null,
+            address.pincode || null,
+            address.country || "India",
+            0,
+          ],
+        );
+        finalAddressId = addressIdValue;
       }
 
-      const insertOrder = `INSERT INTO orders (user_id, address_id, contact_email, contact_phone, contact_name, subtotal, shipping, tax, total, payment_status, order_status)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending','pending') RETURNING *`;
-      const { rows: createdOrderRows } = await client.query(insertOrder, [
-        userId,
-        finalAddressId,
-        contactEmail,
-        contactPhone,
-        contactName,
-        calculatedSubtotal,
-        shippingCost,
-        taxCost,
-        calculatedTotal,
-      ]);
+      const orderId = crypto.randomUUID();
+      await client.query(
+        `INSERT INTO orders (id, user_id, address_id, contact_email, contact_phone, contact_name, subtotal, shipping, tax, total, payment_status, order_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
+        [
+          orderId,
+          userId,
+          finalAddressId,
+          contactEmail,
+          contactPhone,
+          contactName,
+          calculatedSubtotal,
+          shippingCost,
+          taxCost,
+          calculatedTotal,
+        ],
+      );
+      const { rows: createdOrderRows } = await client.query(
+        `SELECT * FROM orders WHERE id = ? LIMIT 1`,
+        [orderId],
+      );
       order = createdOrderRows[0];
     } else {
       const shippingAddress = formatAddressSnapshot(address);
-      const insertOrder = `INSERT INTO orders (user_id, customer_name, email, mobile_number, shipping_address, amount, payment_status, order_status)
-                           VALUES ($1,$2,$3,$4,$5,$6,'pending','pending') RETURNING *`;
-      const { rows: createdOrderRows } = await client.query(insertOrder, [
-        userId,
-        contactName,
-        contactEmail,
-        contactPhone,
-        shippingAddress,
-        calculatedTotal,
-      ]);
+      const orderId = crypto.randomUUID();
+      await client.query(
+        `INSERT INTO orders (id, user_id, customer_name, email, mobile_number, shipping_address, amount, payment_status, order_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
+        [
+          orderId,
+          userId,
+          contactName,
+          contactEmail,
+          contactPhone,
+          shippingAddress,
+          calculatedTotal,
+        ],
+      );
+      const { rows: createdOrderRows } = await client.query(
+        `SELECT * FROM orders WHERE id = ? LIMIT 1`,
+        [orderId],
+      );
       order = createdOrderRows[0];
     }
 
@@ -299,7 +321,7 @@ export const createOrder = async (req, res) => {
       if (hasNewOrderItems) {
         await client.query(
           `INSERT INTO order_items (order_id, product_id, product_name, product_image, product_price, product_mrp, product_quantity_pack, quantity, subtotal)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             order.id,
             oi.productId,
@@ -315,7 +337,7 @@ export const createOrder = async (req, res) => {
       } else {
         await client.query(
           `INSERT INTO order_items (order_id, product_id, name, quantity, price)
-           VALUES ($1,$2,$3,$4,$5)`,
+           VALUES (?, ?, ?, ?, ?)`,
           [
             order.id,
             oi.productId,
@@ -327,8 +349,8 @@ export const createOrder = async (req, res) => {
       }
 
       const { rowCount } = await client.query(
-        "UPDATE products SET stock_qty = stock_qty - $1 WHERE id = $2 AND stock_qty >= $1",
-        [oi.quantity, oi.productId],
+        "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ? AND stock_qty >= ?",
+        [oi.quantity, oi.productId, oi.quantity],
       );
 
       if (!rowCount) {
@@ -345,7 +367,7 @@ export const createOrder = async (req, res) => {
     try {
       await client.query(
         `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes)
-         VALUES ($1,$2,$3,$4,$5)`,
+         VALUES (?, ?, ?, ?, ?)`,
         [order.id, null, order.order_status, userId || null, "Order created"],
       );
     } catch (e) {
@@ -381,9 +403,7 @@ export const createOrder = async (req, res) => {
         : calculatedSubtotal,
       shipping: isNewOrderSchema ? parseFloat(order.shipping) : shippingCost,
       tax: isNewOrderSchema ? parseFloat(order.tax) : taxCost,
-      total: isNewOrderSchema
-        ? parseFloat(order.total)
-        : parseFloat(order.amount ?? calculatedTotal),
+      total: parseFloat(order.total ?? order.amount ?? calculatedTotal),
       paymentStatus: order.payment_status,
       orderStatus: order.order_status,
       createdAt: order.created_at,
@@ -425,15 +445,15 @@ export const getOrder = async (req, res) => {
 
     const orderQuery = isNewOrderSchema
       ? `SELECT id, user_id, contact_email, contact_phone, contact_name,
-                 subtotal, shipping, tax, total, payment_status, order_status,
-                 razorpay_order_id, razorpay_payment_id, created_at, updated_at
-         FROM orders
-         WHERE id = $1 AND user_id = $2`
+         subtotal, shipping, tax, total, payment_status, order_status,
+         razorpay_order_id, razorpay_payment_id, created_at, updated_at
+       FROM orders
+       WHERE id = ? AND user_id = ?`
       : `SELECT id, user_id, email AS contact_email, mobile_number AS contact_phone,
-                 customer_name AS contact_name, amount AS total, payment_status,
-                 order_status, razorpay_order_id, created_at, updated_at
-         FROM orders
-         WHERE id = $1 AND user_id = $2`;
+         customer_name AS contact_name, amount AS total, payment_status,
+         order_status, razorpay_order_id, created_at, updated_at
+       FROM orders
+       WHERE id = ? AND user_id = ?`;
     const { rows: orderRows } = await query(orderQuery, [id, userId]);
     if (!orderRows.length) {
       return res.status(404).json({ message: "Order not found" });
@@ -443,12 +463,12 @@ export const getOrder = async (req, res) => {
       ? `SELECT id, product_id, product_name AS name, product_image, product_price AS price,
                  product_mrp AS mrp, product_quantity_pack AS quantity_pack, quantity, subtotal
          FROM order_items
-         WHERE order_id = $1`
-      : `SELECT id, product_id, name AS product_name, NULL::text AS product_image,
-                 price::float AS product_price, NULL::numeric AS product_mrp,
-                 NULL::int AS product_quantity_pack, quantity, (price * quantity)::float AS subtotal
+         WHERE order_id = ?`
+      : `SELECT id, product_id, name AS product_name, NULL AS product_image,
+                 price AS product_price, NULL AS product_mrp,
+                 NULL AS product_quantity_pack, quantity, (price * quantity) AS subtotal
          FROM order_items
-         WHERE order_id = $1`;
+         WHERE order_id = ?`;
 
     const { rows: itemRows } = await query(itemQuery, [id]);
 
@@ -463,6 +483,159 @@ export const getOrder = async (req, res) => {
 };
 
 // ========================================
+// GET ORDER HISTORY
+// ========================================
+export const getOrderHistory = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { id } = req.params;
+
+    const { rows: orderRows } = await query(
+      "SELECT id FROM orders WHERE id = ? AND user_id = ?",
+      [id, userId],
+    );
+
+    if (!orderRows.length) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    const { rows: historyRows } = await query(
+      `SELECT id, previous_status, new_status, changed_by, notes, created_at
+       FROM order_status_history
+       WHERE order_id = ?
+       ORDER BY created_at ASC`,
+      [id],
+    );
+
+    res.json({ success: true, history: historyRows });
+  } catch (error) {
+    console.error("Error fetching order history:", error);
+    res.status(500).json({ message: "Failed to fetch order history" });
+  }
+};
+
+// ========================================
+// GET ORDER SUCCESS DETAILS
+// ========================================
+export const getOrderSuccess = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    const { id } = req.params;
+
+    const schemaInfo = await getOrderSchemaInfo();
+    const isNewOrderSchema = schemaInfo.isNewOrderSchema;
+    const useNewOrderItems = schemaInfo.hasNewOrderItems;
+
+    const orderQuery = isNewOrderSchema
+      ? `SELECT id, user_id, contact_name AS contact_name, contact_email AS contact_email,
+           contact_phone AS contact_phone, address_id, subtotal, shipping, tax, total,
+           payment_status, order_status, razorpay_order_id, razorpay_payment_id,
+           created_at, updated_at
+         FROM orders
+         WHERE id = ? AND user_id = ?`
+      : `SELECT id, user_id, customer_name AS contact_name, email AS contact_email,
+           mobile_number AS contact_phone, shipping_address, amount AS total,
+           payment_status, order_status, razorpay_order_id, razorpay_payment_id,
+           created_at, updated_at
+         FROM orders
+         WHERE id = ? AND user_id = ?`;
+
+    const { rows: orderRows } = await query(orderQuery, [id, userId]);
+    if (!orderRows.length) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    const orderRow = orderRows[0];
+    let shippingAddress = "";
+
+    if (isNewOrderSchema) {
+      if (orderRow.address_id) {
+        const { rows: addressRows } = await query(
+          `SELECT full_name, phone, address_line_1, address_line_2, city, state, pincode, country
+           FROM user_addresses
+           WHERE id = ? LIMIT 1`,
+          [orderRow.address_id],
+        );
+        const address = addressRows[0];
+        if (address) {
+          shippingAddress = [
+            address.full_name,
+            address.address_line_1,
+            address.address_line_2,
+            address.city,
+            address.state,
+            address.pincode,
+            address.country,
+          ]
+            .filter(Boolean)
+            .join(", ");
+        }
+      }
+    } else {
+      shippingAddress = orderRow.shipping_address || "";
+    }
+
+    const canonicalOrder = {
+      id: orderRow.id,
+      userId: orderRow.user_id,
+      contactName: orderRow.contact_name,
+      contactEmail: orderRow.contact_email,
+      contactPhone: orderRow.contact_phone,
+      shippingAddress,
+      subtotal: parseFloat(orderRow.subtotal ?? 0),
+      shipping: parseFloat(orderRow.shipping ?? 0),
+      tax: parseFloat(orderRow.tax ?? 0),
+      total: parseFloat(orderRow.total ?? orderRow.amount ?? 0),
+      paymentStatus: orderRow.payment_status,
+      orderStatus: orderRow.order_status,
+      razorpayOrderId: orderRow.razorpay_order_id,
+      razorpayPaymentId: orderRow.razorpay_payment_id,
+      createdAt: orderRow.created_at,
+      updatedAt: orderRow.updated_at,
+    };
+
+    const itemQuery = useNewOrderItems
+      ? `SELECT product_id, product_name AS name, product_image AS image, product_price AS unit_price,
+                 quantity, subtotal
+         FROM order_items
+         WHERE order_id = ?`
+      : `SELECT product_id, name AS name, NULL AS image, price AS unit_price,
+                 quantity, (price * quantity) AS subtotal
+         FROM order_items
+         WHERE order_id = ?`;
+
+    const { rows: itemRows } = await query(itemQuery, [id]);
+
+    const { rows: paymentRows } = await query(
+      `SELECT id, order_id, razorpay_order_id, razorpay_payment_id, amount, currency, status,
+              created_at, updated_at
+       FROM payments
+       WHERE order_id = ?
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [id],
+    );
+
+    const paymentDetails = paymentRows[0] || {
+      razorpay_order_id: canonicalOrder.razorpayOrderId,
+      razorpay_payment_id: canonicalOrder.razorpayPaymentId,
+      amount: canonicalOrder.total,
+      currency: "INR",
+      status: canonicalOrder.paymentStatus,
+    };
+
+    return res.json({
+      order: canonicalOrder,
+      items: itemRows,
+      paymentDetails,
+    });
+  } catch (error) {
+    console.error("Error fetching order success details:", error);
+    res.status(500).json({ message: "Failed to fetch order details" });
+  }
+};
+
+// ========================================
 // GET USER ORDERS (EXISTING - KEPT FOR COMPATIBILITY)
 // ========================================
 export const getMyOrders = async (req, res) => {
@@ -470,17 +643,12 @@ export const getMyOrders = async (req, res) => {
     const schemaInfo = await getOrderSchemaInfo();
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
-    const orderQuery = isNewOrderSchema
-      ? `SELECT id, user_id, contact_name AS contact_name, total AS total,
-                 payment_status, order_status, created_at
-         FROM orders
-         WHERE user_id = $1
-         ORDER BY created_at DESC`
-      : `SELECT id, user_id, customer_name AS contact_name, amount AS total,
-                 payment_status, order_status, created_at
-         FROM orders
-         WHERE user_id = $1
-         ORDER BY created_at DESC`;
+    const orderQuery = `SELECT id, user_id,
+         ${isNewOrderSchema ? "contact_name, COALESCE(total, amount) AS total" : "customer_name AS contact_name, COALESCE(amount, total) AS total"},
+         payment_status, order_status, created_at
+       FROM orders
+       WHERE user_id = ?
+       ORDER BY created_at DESC`;
 
     const { rows } = await query(orderQuery, [req.user.id]);
     res.json(rows);
@@ -498,83 +666,148 @@ export const getOrderTracking = async (req, res) => {
 
     // Ensure user owns the order
     const { rows: orderRows } = await query(
-      "SELECT id, user_id, contact_name AS customer_name, contact_email AS email, contact_phone AS mobile_number, subtotal, shipping, tax, total, payment_status, order_status, created_at FROM orders WHERE id = $1 AND user_id = $2",
+      `SELECT
+          id,
+          user_id,
+          contact_name AS customer_name,
+          contact_email AS email,
+          contact_phone AS mobile_number,
+          subtotal,
+          shipping,
+          tax,
+          total,
+          payment_status,
+          order_status,
+          created_at
+       FROM orders
+       WHERE id = ? AND user_id = ?`,
       [id, userId],
     );
-    if (!orderRows.length)
-      return res
-        .status(404)
-        .json({ success: false, message: "Order not found" });
+
+    if (!orderRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Order not found",
+      });
+    }
+
     const order = orderRows[0];
+
+    // Fetch order items
+    const { rows: itemRows } = await query(
+      `SELECT
+          id,
+          product_id,
+          product_name,
+          product_image,
+          product_price,
+          product_mrp,
+          product_quantity_pack,
+          quantity,
+          subtotal
+       FROM order_items
+       WHERE order_id = ?`,
+      [id],
+    );
 
     // Fetch status history
     const { rows: historyRows } = await query(
-      `SELECT id, previous_status, new_status, changed_by, notes, created_at
+      `SELECT
+          id,
+          previous_status,
+          new_status,
+          changed_by,
+          notes,
+          created_at
        FROM order_status_history
-       WHERE order_id = $1
+       WHERE order_id = ?
        ORDER BY created_at ASC`,
       [id],
     );
 
-    // Normalize and build tracking timeline
-    const mapStatus = (s) => {
-      if (!s) return null;
-      const lower = String(s).toLowerCase();
-      if (lower === "pending") return "placed";
-      if (lower === "confirmed") return "confirmed";
-      if (
-        ["processing", "shipped", "out_for_delivery", "dispatched"].includes(
-          lower,
-        )
-      )
-        return "dispatched";
-      if (lower === "delivered") return "delivered";
-      if (lower === "cancelled") return "cancelled";
-      return lower;
-    };
-
-    const timelineKeys = [
-      { key: "placed", label: "Order Placed" },
+    const timelineSteps = [
+      { key: "pending", label: "Order Placed" },
       { key: "confirmed", label: "Confirmed" },
+      { key: "processing", label: "Processing" },
       { key: "dispatched", label: "Dispatched" },
       { key: "delivered", label: "Delivered" },
     ];
 
-    // Build a map of latest timestamp for each normalized status
     const statusTimestamps = {};
     for (const h of historyRows) {
-      const norm = mapStatus(h.new_status || h.previous_status);
-      if (!norm) continue;
-      statusTimestamps[norm] = statusTimestamps[norm] || h.created_at;
-    }
-    // Ensure 'placed' exists from order.created_at
-    statusTimestamps.placed = statusTimestamps.placed || order.created_at;
-
-    const tracking = timelineKeys.map((step) => ({
-      key: step.key,
-      label: step.label,
-      completed:
-        !!statusTimestamps[step.key] && order.order_status !== "cancelled",
-      timestamp: statusTimestamps[step.key] || null,
-    }));
-
-    // If order is cancelled, mark cancelled as special
-    if (normalizeOrderStatus(order.order_status) === "cancelled") {
-      tracking.push({
-        key: "cancelled",
-        label: "Order Cancelled",
-        completed: true,
-        timestamp: statusTimestamps.cancelled || null,
-      });
+      const statusKey = String(
+        h.new_status || h.previous_status || "",
+      ).toLowerCase();
+      if (!statusKey) continue;
+      statusTimestamps[statusKey] = statusTimestamps[statusKey] || h.created_at;
     }
 
-    order.status = normalizeOrderStatus(order.order_status);
-    return res.json({ success: true, order, tracking, history: historyRows });
+    statusTimestamps.pending = statusTimestamps.pending || order.created_at;
+    const currentStatus = String(order.order_status || "pending").toLowerCase();
+    const currentStepIndex = timelineSteps.findIndex(
+      (step) => step.key === currentStatus,
+    );
+
+    const tracking = timelineSteps.map((step, index) => {
+      const timestamp = statusTimestamps[step.key] || null;
+      const isFinalStatus = index === timelineSteps.length - 1;
+      const isCurrentStatus = index === currentStepIndex;
+      const isBeforeCurrent = currentStepIndex >= 0 && index < currentStepIndex;
+
+      if (
+        currentStepIndex === timelineSteps.length - 1 &&
+        index <= currentStepIndex
+      ) {
+        return {
+          key: step.key,
+          label: step.label,
+          status: "completed",
+          timestamp,
+        };
+      }
+
+      if (isBeforeCurrent) {
+        return {
+          key: step.key,
+          label: step.label,
+          status: "completed",
+          timestamp,
+        };
+      }
+
+      if (isCurrentStatus) {
+        return {
+          key: step.key,
+          label: step.label,
+          status: "active",
+          timestamp,
+        };
+      }
+
+      return {
+        key: step.key,
+        label: step.label,
+        status: "pending",
+        timestamp,
+      };
+    });
+
+    order.status = order.order_status;
+
+    return res.json({
+      success: true,
+      order,
+      items: itemRows,
+      tracking,
+      history: historyRows,
+    });
   } catch (err) {
     console.error("Error fetching tracking:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch tracking" });
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch tracking",
+    });
   }
 };
 
@@ -588,7 +821,7 @@ export const updatePaymentStatus = async (req, res) => {
     const { paymentStatus, razorpayOrderId, razorpayPaymentId } = req.body;
 
     const { rows: orderRows } = await query(
-      `SELECT id FROM orders WHERE id = $1 AND user_id = $2`,
+      `SELECT id FROM orders WHERE id = ? AND user_id = ?`,
       [id, userId],
     );
 
@@ -598,16 +831,23 @@ export const updatePaymentStatus = async (req, res) => {
 
     const schemaInfo = await getOrderSchemaInfo();
     const paidAtClause = schemaInfo.orders.has("paid_at")
-      ? `, paid_at = CASE WHEN $1 = 'paid' THEN NOW() ELSE paid_at END`
+      ? `, paid_at = CASE WHEN ? = 'paid' THEN NOW() ELSE paid_at END`
       : "";
 
-    const { rows } = await query(
+    const updateParams = schemaInfo.orders.has("paid_at")
+      ? [paymentStatus, razorpayOrderId, razorpayPaymentId, paymentStatus, id]
+      : [paymentStatus, razorpayOrderId, razorpayPaymentId, id];
+
+    await query(
       `UPDATE orders
-       SET payment_status = $1, razorpay_order_id = $2, razorpay_payment_id = $3${paidAtClause}
-       WHERE id = $4
-       RETURNING *`,
-      [paymentStatus, razorpayOrderId, razorpayPaymentId, id],
+       SET payment_status = ?, razorpay_order_id = ?, razorpay_payment_id = ?${paidAtClause}
+       WHERE id = ?`,
+      updateParams,
     );
+
+    const { rows } = await query(`SELECT * FROM orders WHERE id = ? LIMIT 1`, [
+      id,
+    ]);
 
     // Emit socket event for updated order (best-effort)
     try {

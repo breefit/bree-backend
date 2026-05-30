@@ -1,71 +1,94 @@
-import { query } from '../config/database.js';
+import { query } from "../config/database.js";
 
 export const getApprovedTestimonials = async () => {
   const { rows } = await query(
     `SELECT id, user_id, name, role, avatar, text, rating, created_at, updated_at
      FROM testimonials
      WHERE status = 'approved'
-     ORDER BY created_at DESC`
+     ORDER BY created_at DESC`,
   );
   return rows;
 };
 
-export const createTestimonial = async ({ userId, name, role, text, rating }) => {
+export const createTestimonial = async ({
+  userId,
+  name,
+  role,
+  text,
+  rating,
+}) => {
   // Prevent obvious duplicates: same name + text
   const dup = await query(
-    `SELECT id FROM testimonials WHERE name = $1 AND text = $2 LIMIT 1`,
-    [name, text]
+    `SELECT id FROM testimonials WHERE name = ? AND text = ? LIMIT 1`,
+    [name, text],
   );
   if (dup.rows.length) return null;
 
-  const { rows } = await query(
+  await query(
     `INSERT INTO testimonials (user_id, name, role, text, rating, approved, status, created_at, updated_at)
-     VALUES ($1, $2, $3, $4, $5, false, 'pending', now(), now())
-     RETURNING id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at`,
-    [userId, name, role, text, rating]
+     VALUES (?, ?, ?, ?, ?, 0, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [userId, name, role, text, rating],
   );
+
+  const { rows } = await query(
+    `SELECT id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at
+     FROM testimonials
+     WHERE user_id = ? AND name = ? AND text = ?
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [userId, name, text],
+  );
+
   return rows[0];
 };
 
-export const getAdminTestimonials = async ({ status = 'all', limit = 20, offset = 0 }) => {
-  const whereClause = status !== 'all'
-    ? `WHERE status = $1`
-    : '';
+export const getAdminTestimonials = async ({
+  status = "all",
+  limit = 20,
+  offset = 0,
+}) => {
+  const whereClause = status !== "all" ? `WHERE status = ?` : "";
 
-  const params = status !== 'all'
-    ? [status, limit, offset]
-    : [limit, offset];
+  const params = status !== "all" ? [status, limit, offset] : [limit, offset];
 
   const { rows } = await query(
     `SELECT id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at
      FROM testimonials
      ${whereClause}
      ORDER BY created_at DESC
-     LIMIT $${status !== 'all' ? '2' : '1'}
-     OFFSET $${status !== 'all' ? '3' : '2'}`,
-    params
+     LIMIT ?
+     OFFSET ?`,
+    params,
   );
 
   return rows;
 };
 
 export const updateTestimonialStatus = async (id, approved, status) => {
-  const { rows } = await query(
+  await query(
     `UPDATE testimonials
-     SET approved = $2,
-         status = $3,
-         updated_at = now()
-     WHERE id = $1
-     RETURNING id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at`,
-    [id, approved, status]
+     SET approved = ?,
+         status = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [approved, status, id],
+  );
+
+  const { rows } = await query(
+    `SELECT id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at
+     FROM testimonials
+     WHERE id = ?`,
+    [id],
   );
   return rows[0];
 };
 
 export const deleteTestimonialById = async (id) => {
-  const { rows } = await query(
-    `DELETE FROM testimonials WHERE id = $1 RETURNING id`,
-    [id]
-  );
-  return rows[0];
+  const { rows } = await query(`SELECT id FROM testimonials WHERE id = ?`, [
+    id,
+  ]);
+  if (!rows.length) return null;
+
+  await query(`DELETE FROM testimonials WHERE id = ?`, [id]);
+  return { id };
 };

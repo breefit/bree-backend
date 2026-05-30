@@ -18,8 +18,8 @@ const PRODUCT_SELECT = `
     p.slug,
     p.category,
     p.description,
-    p.price::float,
-    p.mrp::float,
+    p.price,
+    p.mrp,
     p.quantity,
     p.stock_qty,
     p.image,
@@ -30,15 +30,15 @@ const PRODUCT_SELECT = `
 
     COALESCE(
       (
-        SELECT json_agg(
-          json_build_object(
+        SELECT JSON_ARRAYAGG(
+          JSON_OBJECT(
             'id', rp.id,
             'name', rp.name,
             'slug', rp.slug,
             'category', rp.category,
             'description', rp.description,
-            'price', rp.price::float,
-            'mrp', rp.mrp::float,
+            'price', rp.price,
+            'mrp', rp.mrp,
             'quantity', rp.quantity,
             'stock_qty', rp.stock_qty,
             'image', rp.image,
@@ -48,10 +48,10 @@ const PRODUCT_SELECT = `
           )
         )
         FROM products rp
-        WHERE rp.id::uuid = ANY(p.recommended_product_ids)
-        AND rp.is_active = true
+        WHERE JSON_CONTAINS(p.recommended_product_ids, JSON_QUOTE(rp.id))
+        AND rp.is_active = 1
       ),
-      '[]'::json
+      JSON_ARRAY()
     ) AS recommendations
 
   FROM products p
@@ -76,8 +76,8 @@ export const getProducts = async (req, res) => {
     const hasCategory = Boolean(category);
     const queryText = `
       ${PRODUCT_SELECT}
-      WHERE p.is_active = true
-      ${hasCategory ? "AND p.category = $1" : ""}
+      WHERE p.is_active = 1
+      ${hasCategory ? "AND p.category = ?" : ""}
       ORDER BY p.popular DESC, p.created_at ASC
     `;
     const params = hasCategory ? [category] : [];
@@ -110,8 +110,8 @@ export const getProduct = async (req, res) => {
     const { rows } = await query(
       `
       ${PRODUCT_SELECT}
-      WHERE (p.id = $1 OR p.slug = $1)
-      AND p.is_active = true
+      WHERE (p.id = ? OR p.slug = ?)
+      AND p.is_active = 1
       LIMIT 1
       `,
       [req.params.id],
@@ -156,15 +156,15 @@ export const getHomeProducts = async (req, res) => {
 
     const trialRes = await query(`
       ${PRODUCT_SELECT}
-      WHERE p.is_active = true
+      WHERE p.is_active = 1
       AND p.quantity = 7
       LIMIT 1
     `);
 
     const featuredRes = await query(`
       ${PRODUCT_SELECT}
-      WHERE p.is_active = true
-      AND p.popular = true
+      WHERE p.is_active = 1
+      AND p.popular = 1
       LIMIT 1
     `);
 
@@ -184,7 +184,7 @@ export const getHomeProducts = async (req, res) => {
     if (results.length < 2) {
       const { rows } = await query(`
         ${PRODUCT_SELECT}
-        WHERE p.is_active = true
+        WHERE p.is_active = 1
         ORDER BY p.popular DESC, p.created_at ASC
         LIMIT 2
       `);
@@ -216,7 +216,7 @@ export const getCategories = async (req, res) => {
     }
 
     const { rows } = await query(
-      `SELECT DISTINCT category FROM products WHERE is_active = true AND category IS NOT NULL ORDER BY category ASC`
+      `SELECT DISTINCT category FROM products WHERE is_active = 1 AND category IS NOT NULL ORDER BY category ASC`,
     );
 
     const categories = rows.map((row) => row.category).filter(Boolean);
@@ -238,41 +238,44 @@ export const getHomeData = async (req, res) => {
 
     const banners = [
       {
-        id: 'hero',
-        title: 'Pure Amla Wellness',
-        subtitle: 'Every day natural immunity in a shot',
-        image: '/images/home-banner-1.png',
+        id: "hero",
+        title: "Pure Amla Wellness",
+        subtitle: "Every day natural immunity in a shot",
+        image: "/images/home-banner-1.png",
       },
       {
-        id: 'shipping',
-        title: 'Free Shipping',
-        subtitle: 'On all orders above ₹499',
-        image: '/images/home-banner-2.png',
+        id: "shipping",
+        title: "Free Shipping",
+        subtitle: "On all orders above ₹499",
+        image: "/images/home-banner-2.png",
       },
     ];
 
-    const [featuredRes, popularRes, categoriesRes, testimonialsRes] = await Promise.all([
-      query(`
+    const [featuredRes, popularRes, categoriesRes, testimonialsRes] =
+      await Promise.all([
+        query(`
         ${PRODUCT_SELECT}
-        WHERE p.is_active = true
+        WHERE p.is_active = 1
         AND p.quantity = 7
         LIMIT 1
       `),
-      query(`
+        query(`
         ${PRODUCT_SELECT}
-        WHERE p.is_active = true
-        AND p.popular = true
+        WHERE p.is_active = 1
+        AND p.popular = 1
         LIMIT 4
       `),
-      query(`SELECT DISTINCT category FROM products WHERE is_active = true AND category IS NOT NULL ORDER BY category ASC`),
-      query(`
+        query(
+          `SELECT DISTINCT category FROM products WHERE is_active = 1 AND category IS NOT NULL ORDER BY category ASC`,
+        ),
+        query(`
         SELECT id, user_id, name, role, avatar, text, rating, created_at, updated_at
         FROM testimonials
         WHERE status = 'approved'
         ORDER BY created_at DESC
         LIMIT 10
       `),
-    ]);
+      ]);
 
     const data = {
       banners,
@@ -300,6 +303,7 @@ export const getRecommendations = async (req, res) => {
     const cacheKey = `products:${prodId}:recommendations`;
     const cached = cache.get(cacheKey);
     if (cached) {
+
       return res.json(cached);
     }
 
@@ -307,54 +311,82 @@ export const getRecommendations = async (req, res) => {
       `
       SELECT recommended_product_ids
       FROM products
-      WHERE (id = $1 OR slug = $1)
-      AND is_active = true
+      WHERE (id = ? OR slug = ?)
+      AND is_active = 1
       LIMIT 1
       `,
-      [prodId],
+      [prodId, prodId],
     );
 
     if (!prodRows.length) {
+      console.log("❌ Product not found:", prodId);
       return res.status(404).json({
         message: "Product not found",
       });
     }
 
-    const recommendedIds = prodRows[0].recommended_product_ids || [];
+    let recommendedIds = prodRows[0].recommended_product_ids || [];
 
-    if (!recommendedIds.length) {
+    // Parse JSON if it's a string (shouldn't happen with mysql2 but just in case)
+    if (typeof recommendedIds === "string") {
+      try {
+        recommendedIds = JSON.parse(recommendedIds);
+      } catch (e) {
+        console.warn(
+          "Failed to parse recommended_product_ids:",
+          recommendedIds,
+        );
+        recommendedIds = [];
+      }
+    }
+
+
+    if (!Array.isArray(recommendedIds) || !recommendedIds.length) {
+      console.log("⚠️  No recommendations found for product:", prodId);
       cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
       return res.json([]);
     }
 
+    const placeholders = recommendedIds.map(() => "?").join(",");
     const { rows } = await query(
-      `
-      SELECT
-        id,
-        name,
-        slug,
-        category,
-        description,
-        price::float,
-        mrp::float,
-        quantity,
-        stock_qty,
-        image,
-        features,
-        popular,
-        status
-      FROM products
-      WHERE id::uuid = ANY($1::uuid[])
-      AND is_active = true
-      ORDER BY array_position($1::uuid[], id::uuid)
-      `,
-      [recommendedIds],
+      `SELECT
+         id,
+         name,
+         slug,
+         category,
+         description,
+         price,
+         mrp,
+         quantity,
+         stock_qty,
+         image,
+         features,
+         popular,
+         status
+       FROM products
+       WHERE id IN (${placeholders})
+       AND is_active = 1
+       AND stock_qty > 0
+       ORDER BY FIELD(id, ${placeholders})`,
+      [...recommendedIds, ...recommendedIds],
     );
 
-    cache.set(cacheKey, rows, RECOMMENDATIONS_TTL);
-    res.json(rows);
+
+    // Format response
+    const formattedRecommendations = rows.map((prod) => ({
+      id: prod.id,
+      name: prod.name,
+      image: prod.image,
+      price: parseFloat(prod.price),
+      mrp: parseFloat(prod.mrp),
+      quantity: prod.quantity,
+    }));
+
+
+    cache.set(cacheKey, formattedRecommendations, RECOMMENDATIONS_TTL);
+    res.json(formattedRecommendations);
   } catch (error) {
-    console.error("Error fetching recommendations:", error);
+    console.error("❌ Error fetching recommendations:", error);
 
     res.status(500).json({
       message: "Failed to fetch recommendations",

@@ -1,6 +1,6 @@
-import bcrypt from 'bcryptjs';
-import { query } from '../config/database.js';
-import firebaseAuth from '../config/firebaseAdmin.js';
+import bcrypt from "bcryptjs";
+import { query } from "../config/database.js";
+import firebaseAuth from "../config/firebaseAdmin.js";
 import {
   signUserToken,
   verifyUserToken,
@@ -8,7 +8,7 @@ import {
   REFRESH_COOKIE_NAME,
   COOKIE_OPTIONS,
   REFRESH_COOKIE_OPTIONS,
-} from '../utils/jwt.js';
+} from "../utils/jwt.js";
 import {
   createRefreshToken,
   findRefreshTokenByValue,
@@ -16,7 +16,7 @@ import {
   revokeRefreshTokenById,
   revokeUserRefreshTokens,
   loadUserById,
-} from '../services/authService.js';
+} from "../services/authService.js";
 
 const SALT_ROUNDS = 12;
 
@@ -27,30 +27,34 @@ const safeUser = (u) => ({
   phone: u.phone,
   picture: u.picture,
   provider: u.provider,
-  role: u.role || 'user',
+  role: u.role || "user",
 });
 
 const setAuthCookies = async (res, userId, req) => {
   const accessToken = signUserToken(userId);
   const refreshToken = await createRefreshToken(userId, {
-    userAgent: req.get('User-Agent'),
+    userAgent: req.get("User-Agent"),
     ipAddress: req.ip,
   });
 
   res.cookie(COOKIE_NAME, accessToken, COOKIE_OPTIONS);
-  res.cookie(REFRESH_COOKIE_NAME, refreshToken.refreshToken, REFRESH_COOKIE_OPTIONS);
+  res.cookie(
+    REFRESH_COOKIE_NAME,
+    refreshToken.refreshToken,
+    REFRESH_COOKIE_OPTIONS,
+  );
 
   return accessToken;
 };
 
 const getBearerToken = (req) => {
   const authHeader = req.headers.authorization;
-  return authHeader?.startsWith('Bearer ') ? authHeader.split(' ')[1] : null;
+  return authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
 };
 
 const loadUser = async (userId) => {
   const user = await loadUserById(userId);
-  if (!user) throw new Error('User not found');
+  if (!user) throw new Error("User not found");
   return user;
 };
 
@@ -59,17 +63,24 @@ export const register = async (req, res, next) => {
   try {
     const { name, email, password } = req.body;
 
-    const existing = await query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+    const existing = await query("SELECT id FROM users WHERE email = ?", [
+      email.toLowerCase(),
+    ]);
     if (existing.rows.length) {
-      return res.status(409).json({ message: 'Email already in use' });
+      return res.status(409).json({ message: "Email already in use" });
     }
 
     const hashed = await bcrypt.hash(password, SALT_ROUNDS);
-    const { rows } = await query(
+    await query(
       `INSERT INTO users (name, email, password, provider)
-       VALUES ($1, $2, $3, 'email')
-       RETURNING id, name, email, phone, picture, provider, role`,
-      [name.trim(), email.toLowerCase(), hashed]
+       VALUES (?, ?, ?, 'email')`,
+      [name.trim(), email.toLowerCase(), hashed],
+    );
+
+    const { rows } = await query(
+      `SELECT id, name, email, phone, picture, provider, role
+       FROM users WHERE email = ?`,
+      [email.toLowerCase()],
     );
 
     const user = rows[0];
@@ -86,22 +97,25 @@ export const login = async (req, res, next) => {
     const { email, password } = req.body;
 
     const { rows } = await query(
-      'SELECT id, name, email, phone, picture, provider, role, password FROM users WHERE email = $1',
-      [email.toLowerCase()]
+      "SELECT id, name, email, phone, picture, provider, role, password FROM users WHERE email = ?",
+      [email.toLowerCase()],
     );
 
     if (!rows.length) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const user = rows[0];
     if (!user.password) {
-      return res.status(400).json({ message: 'This account was created with Google. Please sign in with Google instead.' });
+      return res.status(400).json({
+        message:
+          "This account was created with Google. Please sign in with Google instead.",
+      });
     }
 
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) {
-      return res.status(401).json({ message: 'Invalid credentials' });
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const accessToken = await setAuthCookies(res, user.id, req);
@@ -115,44 +129,55 @@ export const login = async (req, res, next) => {
 export const googleSignIn = async (req, res) => {
   const { token } = req.body;
   if (!token) {
-    return res.status(400).json({ message: 'Firebase auth token is required.' });
+    return res
+      .status(400)
+      .json({ message: "Firebase auth token is required." });
   }
 
   let decodedToken;
   try {
     decodedToken = await firebaseAuth.verifyIdToken(token);
   } catch (error) {
-    console.error('Firebase token verification failed:', error);
-    return res.status(401).json({ message: 'Invalid or expired Google authentication token.' });
+    console.error("Firebase token verification failed:", error);
+    return res
+      .status(401)
+      .json({ message: "Invalid or expired Google authentication token." });
   }
 
   const email = decodedToken.email?.toLowerCase();
   if (!email) {
-    return res.status(400).json({ message: 'Google user email is required.' });
+    return res.status(400).json({ message: "Google user email is required." });
   }
 
-  const name = decodedToken.name || email.split('@')[0];
+  const name = decodedToken.name || email.split("@")[0];
   const picture = decodedToken.picture || null;
 
   try {
-    const { rows } = await query(
+    await query(
       `INSERT INTO users (name, email, picture, provider)
-       VALUES ($1, $2, $3, 'google')
-       ON CONFLICT (email) DO UPDATE
-         SET name = EXCLUDED.name,
-             picture = EXCLUDED.picture,
-             provider = 'google',
-             updated_at = now()
-       RETURNING id, name, email, phone, picture, provider, role`,
-      [name.trim(), email, picture]
+       VALUES (?, ?, ?, 'google')
+       ON DUPLICATE KEY UPDATE
+         name = VALUES(name),
+         picture = VALUES(picture),
+         provider = 'google',
+         updated_at = CURRENT_TIMESTAMP`,
+      [name.trim(), email, picture],
+    );
+
+    const { rows } = await query(
+      `SELECT id, name, email, phone, picture, provider, role
+       FROM users WHERE email = ?`,
+      [email],
     );
 
     const user = rows[0];
     const accessToken = await setAuthCookies(res, user.id, req);
     return res.json({ ...safeUser(user), accessToken });
   } catch (error) {
-    console.error('Error creating or updating Google user:', error);
-    return res.status(500).json({ message: 'Unable to complete Google sign-in at this time.' });
+    console.error("Error creating or updating Google user:", error);
+    return res
+      .status(500)
+      .json({ message: "Unable to complete Google sign-in at this time." });
   }
 };
 
@@ -172,26 +197,26 @@ export const verifyAuth = async (req, res) => {
   }
 
   if (!refreshToken) {
-    return res.status(401).json({ message: 'Session expired' });
+    return res.status(401).json({ message: "Session expired" });
   }
 
   const stored = await findRefreshTokenByValue(refreshToken);
   if (!stored || stored.revoked || new Date(stored.expires_at) <= new Date()) {
-    return res.status(401).json({ message: 'Session expired' });
+    return res.status(401).json({ message: "Session expired" });
   }
 
   const user = await loadUser(stored.user_id);
   if (!user) {
-    return res.status(401).json({ message: 'User not found' });
+    return res.status(401).json({ message: "User not found" });
   }
 
   const rotated = await rotateRefreshToken(refreshToken, {
-    userAgent: req.get('User-Agent'),
+    userAgent: req.get("User-Agent"),
     ipAddress: req.ip,
   });
 
   if (!rotated) {
-    return res.status(401).json({ message: 'Session refresh failed' });
+    return res.status(401).json({ message: "Session refresh failed" });
   }
 
   const accessTokenValue = signUserToken(user.id);
@@ -217,7 +242,11 @@ export const logout = async (req, res) => {
     await revokeUserRefreshTokens(req.user.id);
   }
 
-  res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: 0, path: '/' });
-  res.clearCookie(REFRESH_COOKIE_NAME, { ...REFRESH_COOKIE_OPTIONS, maxAge: 0, path: '/' });
-  res.json({ message: 'Logged out successfully' });
+  res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: 0, path: "/" });
+  res.clearCookie(REFRESH_COOKIE_NAME, {
+    ...REFRESH_COOKIE_OPTIONS,
+    maxAge: 0,
+    path: "/",
+  });
+  res.json({ message: "Logged out successfully" });
 };

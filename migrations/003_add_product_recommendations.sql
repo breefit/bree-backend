@@ -1,11 +1,8 @@
 -- Add recommended_product_ids column to products table
--- This stores UUIDs of products that should be recommended as upgrades
+-- This stores product IDs as a JSON array for MySQL compatibility.
 
 ALTER TABLE products
-ADD COLUMN recommended_product_ids UUID[] DEFAULT ARRAY[]::UUID[];
+ADD COLUMN IF NOT EXISTS recommended_product_ids JSON NOT NULL DEFAULT '[]';
 
--- Add index for better query performance
-CREATE INDEX idx_products_recommended_ids ON products USING GIN (recommended_product_ids);
-
--- Optional: Add a comment for documentation
-COMMENT ON COLUMN products.recommended_product_ids IS 'Array of product UUIDs to recommend as upgrades for this product';
+-- MySQL does not support direct JSON indexing for array containment in the same way as Postgres GIN.
+-- If needed, a generated column can be added later for search performance.

@@ -1,47 +1,48 @@
 # Backend Setup Guide
 
-Express.js REST API for BREE e-commerce platform with PostgreSQL and Prisma ORM.
+Express.js REST API for the BREE Wellness E-Commerce Platform with MySQL, Razorpay, and Cloudinary.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Tech Stack](#tech-stack)
 - [Project Structure](#project-structure)
-- [Setup Instructions](#setup-instructions)
+- [Setup](#setup)
+- [Environment Variables](#environment-variables)
 - [API Endpoints](#api-endpoints)
 - [Database](#database)
 - [Authentication](#authentication)
-- [Configuration](#configuration)
 - [Available Scripts](#available-scripts)
 
 ---
 
 ## Overview
 
-The BREE backend provides:
+The backend powers BREE with:
 
-- **RESTful API** for customer and admin operations
-- **JWT Authentication** for secure access
-- **Database Management** with Prisma ORM
-- **Payment Processing** via Razorpay
-- **Image Management** via Cloudinary
-- **Email Services** for notifications
-- **Rate Limiting** and security middleware
+- RESTful API for customer and admin workflows
+- JWT authentication and authorization
+- MySQL data persistence for users, products, orders, and recommendations
+- Razorpay order creation and payment verification
+- Cloudinary image upload and management
+- Order tracking and status updates
+- Recommendation endpoint for smart cart suggestions
 
 ---
 
 ## Tech Stack
 
-| Tool | Purpose |
-|------|---------|
-| Node.js | Runtime |
-| Express.js | Web framework |
-| Prisma | ORM |
-| PostgreSQL | Database |
-| JWT | Authentication |
-| bcryptjs | Password hashing |
-| Cloudinary | Image hosting |
-| Razorpay | Payment gateway |
+| Tool           | Purpose             |
+| -------------- | ------------------- |
+| Node.js        | Runtime             |
+| Express.js     | Web framework       |
+| MySQL          | Database            |
+| mysql2         | MySQL driver        |
+| JWT            | Authentication      |
+| bcryptjs       | Password hashing    |
+| Razorpay SDK   | Payment gateway     |
+| Cloudinary     | Image hosting       |
+| Firebase Admin | Google auth support |
 
 ---
 
@@ -50,216 +51,201 @@ The BREE backend provides:
 ```
 backend/
 ├── src/
-│   ├── config/              # Configuration
-│   │   ├── database.js      # Prisma client
-│   │   ├── cloudinary.js    # Cloudinary setup
-│   │   ├── razorpay.js      # Razorpay config
-│   │   └── firebaseAdmin.js # Firebase config
-│   ├── controllers/         # Business logic
+│   ├── config/              # Database, Razorpay, Cloudinary, Firebase configuration
+│   │   ├── database.js
+│   │   ├── cloudinary.js
+│   │   ├── razorpay.js
+│   │   └── firebaseAdmin.js
+│   ├── controllers/         # Business logic layer
+│   │   ├── admin/           # Admin-specific controllers
 │   │   ├── authController.js
 │   │   ├── productController.js
 │   │   ├── orderController.js
 │   │   ├── paymentController.js
-│   │   └── admin/
+│   │   └── profileController.js
 │   ├── middleware/          # Express middleware
-│   │   ├── auth.js          # JWT auth
-│   │   ├── adminAuth.js     # Admin auth
-│   │   └── errorHandler.js  # Error handling
+│   │   ├── auth.js
+│   │   ├── adminAuth.js
+│   │   └── errorHandler.js
 │   ├── routes/              # API routes
+│   │   ├── admin/
 │   │   ├── auth.js
 │   │   ├── products.js
 │   │   ├── orders.js
-│   │   └── admin/
-│   ├── services/            # External services
+│   │   └── webhookRoutes.js
+│   ├── services/            # External service integrations
 │   │   └── authService.js
-│   ├── utils/               # Utilities
-│   │   ├── jwt.js           # JWT helpers
-│   │   └── cache.js         # Caching logic
-│   ├── app.js               # Express app setup
-│   └── server.js            # Server entry point
-├── prisma/
-│   ├── schema.prisma        # Database schema
-│   └── migrations/          # Database migrations
-└── package.json
+│   ├── utils/               # Helpers and utilities
+│   │   ├── jwt.js
+│   │   └── cache.js
+│   ├── app.js               # Express application setup
+│   └── server.js            # HTTP server and Socket.IO
+├── migrations/              # MySQL migration and seed scripts
+├── mysql-schema.sql         # Database schema definition
+├── package.json
+└── README.md
 ```
 
 ---
 
-## Setup Instructions
+## Setup
 
 ### Prerequisites
 
 - Node.js 18+
 - npm or yarn
-- PostgreSQL account (Neon recommended)
-- Razorpay account
+- MySQL 8+
 - Cloudinary account
+- Razorpay account
 
-### 1. Install Dependencies
+### Install Dependencies
 
 ```bash
 cd backend
 npm install
 ```
 
-### 2. Environment Configuration
+### Environment Configuration
 
-Create `.env` file:
+Create a `.env` file in `backend/`:
 
 ```env
-# Server
-PORT=5000
+PORT=4000
 NODE_ENV=development
 FRONTEND_URL=http://localhost:3000
-
-# Database
-DATABASE_URL=postgresql://user:password@host:port/database
-
-# JWT
-JWT_SECRET=your_super_secret_key_minimum_32_chars
-JWT_EXPIRE=7d
-
-# Razorpay
-RAZORPAY_KEY_ID=your_key_id
-RAZORPAY_KEY_SECRET=your_key_secret
-
-# Cloudinary
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USER=your_smtp_username
+SMTP_PASS=your_smtp_password
+SMTP_FROM="BREE Wellness <no-reply@breewellness.com>"
+DATABASE_URL=mysql://user:password@host:3306/database
+JWT_SECRET=your_super_secret_key
+RAZORPAY_KEY_ID=your_razorpay_key_id
+RAZORPAY_KEY_SECRET=your_razorpay_key_secret
 CLOUDINARY_CLOUD_NAME=your_cloud_name
-CLOUDINARY_API_KEY=your_api_key
-CLOUDINARY_API_SECRET=your_api_secret
-
-# Email (Optional)
-EMAIL_HOST=smtp.gmail.com
-EMAIL_PORT=587
-EMAIL_USER=your_email@gmail.com
-EMAIL_PASSWORD=your_app_password
+CLOUDINARY_API_KEY=your_cloudinary_api_key
+CLOUDINARY_API_SECRET=your_cloudinary_api_secret
+RAZORPAY_WEBHOOK_SECRET=your_webhook_secret
 ```
 
-### 3. Initialize Database
+### Database Setup
+
+Run migration and optional seed scripts:
 
 ```bash
-# Run migrations
-npx prisma migrate dev
-
-# Optional: Seed data
-npx prisma db seed
+npm run migrate
+npm run seed
 ```
 
-### 4. Start Server
+### Start the Backend
 
 ```bash
 npm start
 ```
 
-Server runs at: `http://localhost:5000`
+The backend listens on `http://localhost:4000` by default.
+
+---
+
+## Environment Variables
+
+Required backend variables:
+
+- `DATABASE_URL`
+- `JWT_SECRET`
+- `RAZORPAY_KEY_ID`
+- `RAZORPAY_KEY_SECRET`
+- `CLOUDINARY_CLOUD_NAME`
+- `CLOUDINARY_API_KEY`
+- `CLOUDINARY_API_SECRET`
+
+Additional / optional variables:
+
+- `PORT`
+- `NODE_ENV`
+- `FRONTEND_URL`
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_FROM`
+- `RAZORPAY_WEBHOOK_SECRET`
 
 ---
 
 ## API Endpoints
 
 ### Authentication
-- `POST /api/auth/register` - Create account
-- `POST /api/auth/login` - Email login
-- `POST /api/auth/google` - Google OAuth
-- `GET /api/auth/verify` - Verify token
-- `POST /api/auth/logout` - Logout
+
+- `POST /api/auth/register`
+- `POST /api/auth/login`
+- `POST /api/auth/google`
+- `GET /api/auth/verify`
+- `POST /api/auth/logout`
 
 ### Products
-- `GET /api/products` - List products
-- `GET /api/products/:id` - Product details
 
-### Orders (Protected)
-- `GET /api/orders` - User orders
-- `POST /api/orders` - Create order
-- `POST /api/payment/razorpay` - Process payment
+- `GET /api/products`
+- `GET /api/products/:id`
+- `GET /api/products/:id/recommendations`
 
-### Admin (Protected + Admin Role)
-- `GET /api/admin/dashboard` - Analytics
-- `GET /api/admin/products` - All products
-- `POST /api/admin/products` - Create product
-- `PUT /api/admin/products/:id` - Update product
-- `DELETE /api/admin/products/:id` - Delete product
-- `GET /api/admin/orders` - All orders
-- `PATCH /api/admin/orders/:id/status` - Update status
-- `PATCH /api/admin/orders/bulk-status` - Bulk update
+### Cart and Orders
 
-See [API Reference](../docs/API.md) for complete documentation.
+- `POST /api/orders`
+- `GET /api/orders`
+- `GET /api/orders/:id`
+- `GET /api/orders/:id/history`
+
+### Payments
+
+- `POST /api/payment/razorpay`
+- `POST /api/webhooks/razorpay`
+
+### Admin
+
+- `GET /api/admin/dashboard`
+- `GET /api/admin/products`
+- `POST /api/admin/products`
+- `PUT /api/admin/products/:id`
+- `DELETE /api/admin/products/:id`
+- `GET /api/admin/orders`
+- `PATCH /api/admin/orders/:id/status`
+- `PATCH /api/admin/orders/bulk-status`
+
+For complete API details, see [../docs/API.md](../docs/API.md).
 
 ---
 
 ## Database
 
-### Schema Tables
+Supported tables and data relationships include:
 
-- **users** - Customer and admin accounts
-- **products** - Product catalog
-- **orders** - Customer orders
-- **order_items** - Order line items
-- **payments** - Payment transactions
-- **addresses** - Shipping addresses
-- **testimonials** - Customer reviews
-- **contact_inquiries** - Contact form submissions
+- `users`
+- `products`
+- `orders`
+- `order_items`
+- `payments`
+- `addresses`
+- `testimonials`
+- `contact_inquiries`
 
-See [Database Schema](../docs/DATABASE.md) for details.
-
-### Running Migrations
-
-```bash
-# Create new migration
-npx prisma migrate dev --name add_feature
-
-# Deploy to production
-npx prisma migrate deploy
-
-# View migration status
-npx prisma migrate status
-
-# Open Prisma Studio
-npx prisma studio
-```
+Recommendation data is stored in `recommended_product_ids` as a JSON field.
 
 ---
 
 ## Authentication
 
-### JWT Tokens
-
-1. User logs in with email/password or Google OAuth
-2. Backend generates JWT token (valid 7 days)
-3. Token sent to frontend via response + HTTP-only cookie
-4. Frontend includes token in Authorization header
-
-### Token Verification
-
-All protected routes check JWT token:
-
-```javascript
-// middleware/auth.js
-const auth = (req, res, next) => {
-  const token = getToken(req);
-  if (!token) return res.status(401).json({ message: 'Unauthorized' });
-  
-  const decoded = verifyUserToken(token);
-  req.user = decoded;
-  next();
-};
-```
+The backend uses JWT tokens for protected routes and admin authorization. Tokens are issued after login and validated for every secure endpoint.
 
 ---
 
-## Configuration
+## Available Scripts
 
-### Razorpay Setup
-
-1. Create account at razorpay.com
-2. Get test/live keys
-3. Add to `.env`
-4. Payment verification in backend:
-
-```javascript
-// Verify payment signature
-const signature = generateSignature(order_id, payment_id, secret);
-if (signature !== razorpay_signature) throw Error('Invalid');
+```bash
+npm start
+npm run dev
+npm run migrate
+npm run seed
 ```
 
 ### Cloudinary Setup
@@ -291,7 +277,7 @@ Cache invalidated on updates.
 - CORS configuration
 - Helmet.js security headers
 - Input validation
-- SQL injection prevention (Prisma)
+- SQL injection prevention (parameterized mysql2 queries)
 
 ---
 
@@ -299,11 +285,9 @@ Cache invalidated on updates.
 
 ```bash
 npm start              # Start server
-npm run dev           # Dev with nodemon
-npm run migrate       # Run migrations
-npm run seed          # Seed database
-npm run lint          # Lint code
-npm run build         # Build (if applicable)
+npm run dev            # Dev with nodemon
+npm run migrate        # Run migrations
+npm run seed           # Seed database
 ```
 
 ---
@@ -311,16 +295,19 @@ npm run build         # Build (if applicable)
 ## Troubleshooting
 
 **Database connection fails:**
+
 - Verify DATABASE_URL is correct
-- Check PostgreSQL is running
+- Check MySQL is running
 - Test connection locally
 
 **Payment processing fails:**
+
 - Verify Razorpay keys (live vs test)
 - Check signature verification
 - Review Razorpay logs
 
 **Image upload fails:**
+
 - Verify Cloudinary credentials
 - Check file size limits
 - Review upload permissions
@@ -330,6 +317,7 @@ npm run build         # Build (if applicable)
 ## Environment Variables
 
 ### Development
+
 ```env
 NODE_ENV=development
 JWT_SECRET=dev_secret_minimum_32_characters
@@ -337,6 +325,7 @@ RAZORPAY_KEY_ID=rzp_test_xxxxx
 ```
 
 ### Production
+
 ```env
 NODE_ENV=production
 JWT_SECRET=use_strong_random_string_minimum_32_chars
