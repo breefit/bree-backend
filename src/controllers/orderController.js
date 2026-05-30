@@ -749,10 +749,26 @@ export const getOrderTracking = async (req, res) => {
     );
 
     const tracking = timelineSteps.map((step, index) => {
-      const timestamp = statusTimestamps[step.key] || null;
+      let timestamp = statusTimestamps[step.key] || null;
       const isFinalStatus = index === timelineSteps.length - 1;
       const isCurrentStatus = index === currentStepIndex;
       const isBeforeCurrent = currentStepIndex >= 0 && index < currentStepIndex;
+
+      // Mark step as completed if it should be (before current or current is final)
+      const shouldBeCompleted =
+        isBeforeCurrent ||
+        (currentStepIndex === timelineSteps.length - 1 &&
+          index <= currentStepIndex);
+
+      // If completed but missing timestamp, infer from next available timestamp
+      if (shouldBeCompleted && !timestamp) {
+        for (let i = index + 1; i < timelineSteps.length; i++) {
+          if (statusTimestamps[timelineSteps[i].key]) {
+            timestamp = statusTimestamps[timelineSteps[i].key];
+            break;
+          }
+        }
+      }
 
       if (
         currentStepIndex === timelineSteps.length - 1 &&
