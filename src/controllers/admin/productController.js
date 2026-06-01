@@ -1,4 +1,5 @@
 import { query } from "../../config/database.js";
+import { randomUUID } from "crypto";
 import { cloudinary } from "../../config/cloudinary.js";
 import cache from "../../utils/cache.js";
 
@@ -170,12 +171,15 @@ export const createProduct = async (req, res) => {
   const stockQuantity = parseInt(stockQty || 0, 10);
   const productStatus = resolveProductStatus(stockQuantity, status);
 
+  const productId = randomUUID();
+
   await query(
     `INSERT INTO products
-       (name, slug, category, description, price, mrp, quantity,
+       (id, name, slug, category, description, price, mrp, quantity,
         stock_qty, image, features, popular, status, display_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      productId,
       name,
       slug,
       category,
@@ -192,10 +196,9 @@ export const createProduct = async (req, res) => {
     ],
   );
 
-  const { rows } = await query(
-    `SELECT * FROM products WHERE slug = ? LIMIT 1`,
-    [slug],
-  );
+  const { rows } = await query(`SELECT * FROM products WHERE id = ? LIMIT 1`, [
+    productId,
+  ]);
   invalidateProductCache();
   emitProductEvent(req, "created", rows[0]);
   res.status(201).json(rows[0]);
