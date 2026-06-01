@@ -78,7 +78,7 @@ export const getProducts = async (req, res) => {
       ${PRODUCT_SELECT}
       WHERE p.is_active = 1
       ${hasCategory ? "AND p.category = ?" : ""}
-      ORDER BY p.popular DESC, p.created_at ASC
+      ORDER BY p.display_order ASC, p.created_at ASC
     `;
     const params = hasCategory ? [category] : [];
 
@@ -185,7 +185,7 @@ export const getHomeProducts = async (req, res) => {
       const { rows } = await query(`
         ${PRODUCT_SELECT}
         WHERE p.is_active = 1
-        ORDER BY p.popular DESC, p.created_at ASC
+        ORDER BY p.display_order ASC, p.created_at ASC
         LIMIT 2
       `);
       cache.set(cacheKey, rows, PRODUCT_LIST_TTL);
