@@ -175,9 +175,10 @@ export const createProduct = async (req, res) => {
 
   await query(
     `INSERT INTO products
-       (id, name, slug, category, description, price, mrp, quantity,
-        stock_qty, image, features, popular, status, display_order)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+     (id, name, slug, category, description, price, mrp, quantity,
+      stock_qty, image, features, popular, status, display_order,
+      recommended_product_ids)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       productId,
       name,
@@ -193,6 +194,7 @@ export const createProduct = async (req, res) => {
       popular === "true" || popular === true,
       productStatus,
       displayOrder !== undefined ? parseInt(displayOrder, 10) : 0,
+      JSON.stringify([]),
     ],
   );
 
