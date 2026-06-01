@@ -118,8 +118,8 @@ export const getProducts = async (req, res) => {
   const [productsRes, countRes] = await Promise.all([
     query(
       `SELECT id, name, slug, category, description, price, mrp,
-              quantity, stock_qty, image, features, popular, status, is_active, created_at
-       FROM products ${where} ORDER BY created_at DESC
+              quantity, stock_qty, image, features, popular, display_order, status, is_active, created_at
+       FROM products ${where} ORDER BY display_order ASC, created_at DESC
        LIMIT ? OFFSET ?`,
       params,
     ),
@@ -154,6 +154,7 @@ export const createProduct = async (req, res) => {
     popular,
     status,
     stockQty,
+    displayOrder,
   } = req.body;
   const image =
     req.file?.path ||
@@ -172,8 +173,8 @@ export const createProduct = async (req, res) => {
   await query(
     `INSERT INTO products
        (name, slug, category, description, price, mrp, quantity,
-        stock_qty, image, features, popular, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        stock_qty, image, features, popular, status, display_order)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       name,
       slug,
@@ -187,6 +188,7 @@ export const createProduct = async (req, res) => {
       featuresValue,
       popular === "true" || popular === true,
       productStatus,
+      displayOrder !== undefined ? parseInt(displayOrder, 10) : 0,
     ],
   );
 
@@ -214,6 +216,7 @@ export const updateProduct = async (req, res) => {
       status,
       stockQty,
       isActive,
+      displayOrder,
     } = req.body;
 
     const updates = ["updated_at = now()"];
@@ -235,6 +238,8 @@ export const updateProduct = async (req, res) => {
     if (quantity !== undefined) add("quantity", parseInt(quantity));
     if (popular !== undefined)
       add("popular", popular === "true" || popular === true);
+    if (displayOrder !== undefined)
+      add("display_order", parseInt(displayOrder, 10));
     if (isActive !== undefined)
       add("is_active", isActive === "true" || isActive === true);
     if (req.file) {
