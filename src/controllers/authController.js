@@ -1,4 +1,5 @@
 import bcrypt from "bcryptjs";
+import { randomUUID } from "crypto";
 import { query } from "../config/database.js";
 import firebaseAuth from "../config/firebaseAdmin.js";
 import {
@@ -63,29 +64,55 @@ export const register = async (req, res, next) => {
   try {
     const { name, email, password } = req.body;
 
-    const existing = await query("SELECT id FROM users WHERE email = ?", [
-      email.toLowerCase(),
-    ]);
+    const existing = await query(
+      "SELECT id FROM users WHERE email = ?",
+      [email.toLowerCase()]
+    );
+
     if (existing.rows.length) {
-      return res.status(409).json({ message: "Email already in use" });
+      return res.status(409).json({
+        message: "Email already in use",
+      });
     }
 
+    const userId = randomUUID();
     const hashed = await bcrypt.hash(password, SALT_ROUNDS);
+
     await query(
-      `INSERT INTO users (name, email, password, provider)
-       VALUES (?, ?, ?, 'email')`,
-      [name.trim(), email.toLowerCase(), hashed],
+      `INSERT INTO users (
+        id,
+        name,
+        email,
+        password,
+        provider
+      ) VALUES (?, ?, ?, ?, 'email')`,
+      [
+        userId,
+        name.trim(),
+        email.toLowerCase(),
+        hashed,
+      ]
     );
 
     const { rows } = await query(
       `SELECT id, name, email, phone, picture, provider, role
-       FROM users WHERE email = ?`,
-      [email.toLowerCase()],
+       FROM users
+       WHERE id = ?`,
+      [userId]
     );
 
     const user = rows[0];
-    const accessToken = await setAuthCookies(res, user.id, req);
-    res.status(201).json({ ...safeUser(user), accessToken });
+
+    const accessToken = await setAuthCookies(
+      res,
+      user.id,
+      req
+    );
+
+    return res.status(201).json({
+      ...safeUser(user),
+      accessToken,
+    });
   } catch (error) {
     next(error);
   }
@@ -151,18 +178,25 @@ export const googleSignIn = async (req, res) => {
 
   const name = decodedToken.name || email.split("@")[0];
   const picture = decodedToken.picture || null;
-
+  const userId = randomUUID();
+  
   try {
-    await query(
-      `INSERT INTO users (name, email, picture, provider)
-       VALUES (?, ?, ?, 'google')
-       ON DUPLICATE KEY UPDATE
-         name = VALUES(name),
-         picture = VALUES(picture),
-         provider = 'google',
-         updated_at = CURRENT_TIMESTAMP`,
-      [name.trim(), email, picture],
-    );
+   await query(
+  `INSERT INTO users (
+      id,
+      name,
+      email,
+      picture,
+      provider
+   )
+   VALUES (?, ?, ?, ?, 'google')
+   ON DUPLICATE KEY UPDATE
+     name = VALUES(name),
+     picture = VALUES(picture),
+     provider = 'google',
+     updated_at = CURRENT_TIMESTAMP`,
+  [userId, name.trim(), email, picture]
+);
 
     const { rows } = await query(
       `SELECT id, name, email, phone, picture, provider, role
