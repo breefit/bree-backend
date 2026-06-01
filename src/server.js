@@ -23,7 +23,7 @@ const PORT = process.env.PORT || 4000;
 const startServer = async () => {
   try {
     const { default: app } = await import("./app.js");
-
+    app.set("trust proxy", 1);
     const httpServer = createServer(app);
 
     const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
