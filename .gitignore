@@ -17,6 +17,8 @@ pnpm-lock.yaml
 .env.test.local
 .env.production.local
 
+serviceAccountKey.json
+
 # =========================
 # Generated Files
 # =========================
@@ -114,4 +116,6 @@ Desktop.ini
 *.gz
 *.zip
 *.tar
-*.bak
+*.bakbree-wellness-firebase-adminsdk-fbsvc-4d942ae88f.json
+serviceAccountKey.json
+*.json

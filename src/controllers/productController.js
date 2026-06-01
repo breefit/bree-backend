@@ -303,7 +303,6 @@ export const getRecommendations = async (req, res) => {
     const cacheKey = `products:${prodId}:recommendations`;
     const cached = cache.get(cacheKey);
     if (cached) {
-
       return res.json(cached);
     }
 
@@ -319,10 +318,12 @@ export const getRecommendations = async (req, res) => {
     );
 
     if (!prodRows.length) {
-      console.log("❌ Product not found:", prodId);
-      return res.status(404).json({
-        message: "Product not found",
-      });
+      console.log(
+        "⚠️ Product not found, returning empty recommendations:",
+        prodId,
+      );
+      cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
+      return res.json([]);
     }
 
     let recommendedIds = prodRows[0].recommended_product_ids || [];
@@ -339,7 +340,6 @@ export const getRecommendations = async (req, res) => {
         recommendedIds = [];
       }
     }
-
 
     if (!Array.isArray(recommendedIds) || !recommendedIds.length) {
       console.log("⚠️  No recommendations found for product:", prodId);
@@ -371,7 +371,6 @@ export const getRecommendations = async (req, res) => {
       [...recommendedIds, ...recommendedIds],
     );
 
-
     // Format response
     const formattedRecommendations = rows.map((prod) => ({
       id: prod.id,
@@ -381,7 +380,6 @@ export const getRecommendations = async (req, res) => {
       mrp: parseFloat(prod.mrp),
       quantity: prod.quantity,
     }));
-
 
     cache.set(cacheKey, formattedRecommendations, RECOMMENDATIONS_TTL);
     res.json(formattedRecommendations);
