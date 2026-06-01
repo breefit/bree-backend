@@ -13,8 +13,8 @@ export const getAddresses = async (req, res) => {
 export const addAddress = async (req, res) => {
   const {
     label = "Home",
-    line1,
-    line2,
+    address_line1,
+    address_line2,
     city,
     state,
     pincode,
@@ -22,26 +22,34 @@ export const addAddress = async (req, res) => {
     isDefault = false,
   } = req.body;
 
+  // Check if this is the first address — make it default automatically
+  const { rows: existingAddrs } = await query(
+    "SELECT COUNT(*) as count FROM addresses WHERE user_id = ?",
+    [req.user.id],
+  );
+  const isFirstAddress = parseInt(existingAddrs[0].count) === 0;
+  const shouldBeDefault = isDefault || isFirstAddress;
+
   // If marking default, clear other defaults first
-  if (isDefault) {
+  if (shouldBeDefault) {
     await query("UPDATE addresses SET is_default = false WHERE user_id = ?", [
       req.user.id,
     ]);
   }
 
   await query(
-    `INSERT INTO addresses (user_id, label, line1, line2, city, state, pincode, country, is_default)
+    `INSERT INTO addresses (user_id, label, address_line1, address_line2, city, state, pincode, country, is_default)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       req.user.id,
       label,
-      line1,
-      line2 || null,
+      address_line1,
+      address_line2 || null,
       city,
       state,
       pincode,
       country,
-      isDefault,
+      shouldBeDefault,
     ],
   );
 
@@ -54,8 +62,16 @@ export const addAddress = async (req, res) => {
 
 // PUT /api/addresses/:id
 export const updateAddress = async (req, res) => {
-  const { label, line1, line2, city, state, pincode, country, isDefault } =
-    req.body;
+  const {
+    label,
+    address_line1,
+    address_line2,
+    city,
+    state,
+    pincode,
+    country,
+    isDefault,
+  } = req.body;
 
   // Verify ownership
   const existing = await query(
@@ -72,12 +88,12 @@ export const updateAddress = async (req, res) => {
   }
 
   await query(
-    `UPDATE addresses SET label = ?, line1 = ?, line2 = ?, city = ?, state = ?,
+    `UPDATE addresses SET label = ?, address_line1 = ?, address_line2 = ?, city = ?, state = ?,
        pincode = ?, country = ?, is_default = ? WHERE id = ?`,
     [
       label,
-      line1,
-      line2 || null,
+      address_line1,
+      address_line2 || null,
       city,
       state,
       pincode,
@@ -106,6 +122,18 @@ export const deleteAddress = async (req, res) => {
     req.params.id,
     req.user.id,
   ]);
+
+  // If deleted address was default, set next address as default
+  const { rows: remaining } = await query(
+    "SELECT id FROM addresses WHERE user_id = ? ORDER BY created_at ASC LIMIT 1",
+    [req.user.id],
+  );
+  if (remaining.length) {
+    await query("UPDATE addresses SET is_default = 1 WHERE id = ?", [
+      remaining[0].id,
+    ]);
+  }
+
   res.json({ message: "Address deleted" });
 };
 
@@ -124,6 +152,7 @@ export const setDefault = async (req, res) => {
   await query("UPDATE addresses SET is_default = 1 WHERE id = ?", [
     req.params.id,
   ]);
+
   const { rows } = await query("SELECT * FROM addresses WHERE id = ? LIMIT 1", [
     req.params.id,
   ]);
