@@ -31,7 +31,15 @@ app.use("/images", express.static(path.join(__dirname, "../public/images")));
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
+// ── Trust proxy (Render / Railway / Heroku sit behind a load balancer) ────────
+// Required so req.ip resolves correctly AND so express-rate-limit doesn't
+// throttle everyone under the same proxy IP.
+app.set("trust proxy", 1);
+
 // ── CORS ──────────────────────────────────────────────────────────────────────
+// FRONTEND_URL can be a comma-separated list, e.g.:
+//   FRONTEND_URL=https://bree-frontend.vercel.app,https://www.bree.fit
+// Always includes localhost origins for local development.
 const frontendUrls = (process.env.FRONTEND_URL || "http://localhost:3000")
   .split(",")
   .map((url) => url.trim())
@@ -45,8 +53,13 @@ const allowedOrigins = [
   ]),
 ].map((origin) => origin.replace(/\/$/, ""));
 
+if (process.env.NODE_ENV === "production") {
+  console.log("✅ CORS allowed origins:", allowedOrigins);
+}
+
 const corsOptions = {
   origin: (origin, callback) => {
+    // Allow server-to-server requests (no Origin header)
     if (!origin) {
       return callback(null, true);
     }
@@ -56,6 +69,7 @@ const corsOptions = {
       return callback(null, true);
     }
 
+    console.warn(`🚫 CORS blocked origin: ${origin}`);
     return callback(
       new Error(`CORS policy: Origin not allowed - ${origin}`),
       false,
