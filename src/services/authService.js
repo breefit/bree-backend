@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { randomUUID } from "crypto";
 import { query } from "../config/database.js";
 
 const HASH_ALGORITHM = "sha256";
@@ -22,13 +23,18 @@ export const createRefreshToken = async (
     Date.now() + DEFAULT_REFRESH_DAYS * 24 * 60 * 60 * 1000,
   );
 
-  // MySQL DATETIME format
-  const expiresAt = expiresDate.toISOString().slice(0, 19).replace("T", " ");
+  const expiresAt = expiresDate
+    .toISOString()
+    .slice(0, 19)
+    .replace("T", " ");
+
+  const tokenId = randomUUID();
 
   await query(
     `
     INSERT INTO refresh_tokens
     (
+      id,
       user_id,
       token_hash,
       user_agent,
@@ -41,10 +47,12 @@ export const createRefreshToken = async (
       ?,
       ?,
       ?,
+      ?,
       ?
     )
     `,
     [
+      tokenId,
       userId,
       tokenHash,
       userAgent?.slice(0, 255) || null,
@@ -53,18 +61,8 @@ export const createRefreshToken = async (
     ],
   );
 
-  const { rows } = await query(
-    `
-    SELECT id
-    FROM refresh_tokens
-    WHERE token_hash = ?
-    LIMIT 1
-    `,
-    [tokenHash],
-  );
-
   return {
-    id: rows[0]?.id,
+    id: tokenId,
     refreshToken,
     expiresAt,
   };
