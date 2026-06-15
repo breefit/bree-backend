@@ -43,9 +43,25 @@ export const getOrders = async (req, res) => {
   const transactionExpr = schemaInfo.isNewOrderSchema
     ? "o.razorpay_payment_id"
     : "o.transaction_id";
-  const shippingAddressExpr = schemaInfo.isNewOrderSchema
-    ? "COALESCE(o.address_id, '')"
-    : "COALESCE(o.shipping_address, '')";
+  const userAddressSnapshot = `CONCAT_WS(", ",
+      ua.full_name,
+      ua.address_line_1,
+      ua.address_line_2,
+      ua.city,
+      ua.state,
+      ua.pincode,
+      ua.country
+    )`;
+  const legacyAddressSnapshot = `CONCAT_WS(", ",
+      la.label,
+      la.address_line1,
+      la.address_line2,
+      la.city,
+      la.state,
+      la.pincode,
+      la.country
+    )`;
+  const shippingAddressExpr = `COALESCE(o.shipping_address, ${userAddressSnapshot}, ${legacyAddressSnapshot}, '')`;
   const notesExpr = schemaInfo.hasOrderNotes ? "o.notes" : "''";
   // After MySQL migration, `order_items` uses `product_name`/`product_price`.
   // Use those columns to avoid referencing legacy `name`/`price` which no longer exist.
@@ -137,6 +153,8 @@ export const getOrders = async (req, res) => {
               COALESCE(${firstItemSubquery}, '') AS product_name,
               ${itemsSubquery}                    AS items
        FROM orders o
+       LEFT JOIN user_addresses ua ON ua.id = o.address_id
+       LEFT JOIN addresses la ON la.id = o.address_id
        ${where}
        ORDER BY ${sortColumn} ${safeDir}
        LIMIT ? OFFSET ?`;
@@ -169,6 +187,25 @@ export const getOrder = async (req, res) => {
   const transactionExpr = schemaInfo.isNewOrderSchema
     ? "o.razorpay_payment_id"
     : "o.transaction_id";
+  const userAddressSnapshot = `CONCAT_WS(", ",
+      ua.full_name,
+      ua.address_line_1,
+      ua.address_line_2,
+      ua.city,
+      ua.state,
+      ua.pincode,
+      ua.country
+    )`;
+  const legacyAddressSnapshot = `CONCAT_WS(", ",
+      la.label,
+      la.address_line1,
+      la.address_line2,
+      la.city,
+      la.state,
+      la.pincode,
+      la.country
+    )`;
+  const shippingAddressExpr = `COALESCE(o.shipping_address, ${userAddressSnapshot}, ${legacyAddressSnapshot}, '')`;
   const notesExpr = schemaInfo.hasOrderNotes ? "o.notes" : "''";
   // Use new product_name/product_price in detail query as well.
   const itemNameExpr = "oi.product_name";
@@ -202,6 +239,7 @@ export const getOrder = async (req, res) => {
             ${customerNameExpr}         AS customer_name,
             ${emailExpr}                AS email,
             ${phoneExpr}                AS mobile_number,
+            ${shippingAddressExpr}      AS shipping_address,
             ${amountExpr}               AS amount,
             o.order_status,
             o.payment_status,
@@ -211,6 +249,8 @@ export const getOrder = async (req, res) => {
             COALESCE(${firstItemSubqueryDetail}, '') AS product_name,
             ${itemsSubqueryDetail}                    AS items
      FROM orders o
+     LEFT JOIN user_addresses ua ON ua.id = o.address_id
+     LEFT JOIN addresses la ON la.id = o.address_id
      WHERE o.id = ?`,
     [req.params.id],
   );

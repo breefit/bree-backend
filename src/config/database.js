@@ -164,7 +164,7 @@ if (databaseUrlRaw) {
 if (!poolConfig) {
   if (!dbHost || !dbUser || !dbName) {
     throw new Error(
-      "Database configuration is missing. Provide a valid DATABASE_URL or DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME."
+      "Database configuration is missing. Provide a valid DATABASE_URL or DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME.",
     );
   }
 
@@ -186,6 +186,9 @@ const pool = mysql.createPool({
   supportBigNumbers: true,
   bigNumberStrings: true,
   charset: "utf8mb4_unicode_ci",
+
+  // ⭐ Fix timezone
+  timezone: "+05:30",
 });
 
 const normalizeResult = (result) => {
@@ -264,6 +267,8 @@ export const query = async (text, params = []) => {
 
 export const getClient = async () => {
   const connection = await pool.getConnection();
+
+  await connection.query("SET time_zone = '+05:30'");
 
   connection._originalQuery = connection.query.bind(connection);
 

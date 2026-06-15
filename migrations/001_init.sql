@@ -1,2 +1,0 @@
--- Legacy PostgreSQL migration file. The BREE backend now uses MySQL.
--- Use migrations/mysql-migrate.js with mysql-schema.sql to create the current schema.

@@ -21,7 +21,10 @@ const getFrontendUrl = () =>
   (process.env.FRONTEND_URL || "http://localhost:3000").replace(/\/$/, "");
 
 const sendEmail = async ({ to, subject, html }) => {
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS || !to) return;
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS || !to) {
+    console.log("[EMAIL] Skipping — SMTP not configured or missing recipient");
+    return;
+  }
 
   await createTransporter().sendMail({
     from: getFromAddress(),
@@ -57,13 +60,44 @@ const formatOrderItems = (items = []) => {
 const getOrderTrackingLink = (orderId) =>
   `${getFrontendUrl()}/order/${orderId}/tracking`;
 
+/**
+ * Format a shipping address block for email display.
+ * Returns an HTML string if address is available, or empty string.
+ *
+ * FIX: Uses order.shipping_address as primary source.
+ * Falls back to passed address object only if shipping_address is empty.
+ */
+const formatAddressBlock = (shippingAddress) => {
+  if (!shippingAddress || !shippingAddress.trim()) return "";
+  return `
+    <div style="margin-top:8px;padding:10px 14px;background:#f9fafb;border-radius:6px;color:#374151;font-size:14px;">
+      <strong>Shipping To:</strong><br/>
+      ${shippingAddress.replace(/,\s*/g, "<br/>")}
+    </div>
+  `;
+};
+
 export const sendOrderConfirmationEmail = async ({
   to,
   name,
   orderId,
   amount,
   items,
+  shippingAddress, // FIX: now explicitly passed from paymentController
 }) => {
+  console.log(
+    "[EMAIL] sendOrderConfirmationEmail orderId:",
+    orderId,
+    "to:",
+    to,
+    "address present:",
+    !!shippingAddress,
+  );
+
+  // FIX: Use shippingAddress directly — do NOT fall back to "Address Not Found"
+  // If it's empty we simply omit the address block rather than showing a bad message
+  const addressBlock = formatAddressBlock(shippingAddress || "");
+
   await sendEmail({
     to,
     subject: `Order Confirmed — BREE #${String(orderId).slice(-8).toUpperCase()}`,
@@ -73,6 +107,7 @@ export const sendOrderConfirmationEmail = async ({
         <p>Order ID: <strong>#${String(orderId).slice(-8).toUpperCase()}</strong></p>
         ${formatOrderItems(items)}
         <p style="font-weight:700;margin-top:16px;">Total: ₹${Number(amount || 0).toLocaleString()}</p>
+        ${addressBlock}
         <p style="margin-top:24px;">Track your order anytime: <a href="${getOrderTrackingLink(orderId)}">${getOrderTrackingLink(orderId)}</a></p>
         <p style="color:#6b7280;font-size:13px;margin-top:28px;">Thanks for choosing BREE Wellness.</p>
       </div>
@@ -129,6 +164,94 @@ export const sendOrderCancelledEmail = async ({ to, name, orderId, notes }) => {
         ${notes ? `<p><strong>Reason:</strong> ${notes}</p>` : ""}
         <p>If you would like help placing a replacement order, we are here to support you.</p>
         <p style="color:#6b7280;font-size:13px;margin-top:28px;">Sincerely, BREE Wellness.</p>
+      </div>
+    `,
+  });
+};
+
+export const sendSubscriptionChargeReceiptEmail = async ({
+  to,
+  name,
+  orderId,
+  amount,
+  subscriptionId,
+}) => {
+  await sendEmail({
+    to,
+    subject: `Subscription Renewal Received — BREE #${String(orderId).slice(-8).toUpperCase()}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
+        <p>We received your subscription payment successfully for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong>.</p>
+        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
+        <p><strong>Amount charged:</strong> ₹${Number(amount || 0).toLocaleString()}</p>
+        <p>Thank you for continuing your wellness journey with BREE.</p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
+      </div>
+    `,
+  });
+};
+
+export const sendSubscriptionFailedEmail = async ({
+  to,
+  name,
+  orderId,
+  subscriptionId,
+  notes,
+}) => {
+  await sendEmail({
+    to,
+    subject: `Subscription Payment Failed — BREE #${String(orderId).slice(-8).toUpperCase()}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#d97706;">Hi ${name || "there"},</h2>
+        <p>Your subscription payment for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> could not be processed.</p>
+        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
+        ${notes ? `<p><strong>Details:</strong> ${notes}</p>` : ""}
+        <p>Please update your payment details or contact support to avoid interruption.</p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
+      </div>
+    `,
+  });
+};
+
+export const sendSubscriptionCancellationEmail = async ({
+  to,
+  name,
+  orderId,
+  subscriptionId,
+}) => {
+  await sendEmail({
+    to,
+    subject: `Subscription Cancelled — BREE #${String(orderId).slice(-8).toUpperCase()}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#b91c1c;">Hi ${name || "there"},</h2>
+        <p>Your subscription for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> has been cancelled.</p>
+        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
+        <p>If you wish to restart your plan, you can subscribe again anytime from your account.</p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
+      </div>
+    `,
+  });
+};
+
+export const sendSubscriptionResumeEmail = async ({
+  to,
+  name,
+  orderId,
+  subscriptionId,
+}) => {
+  await sendEmail({
+    to,
+    subject: `Subscription Resumed — BREE #${String(orderId).slice(-8).toUpperCase()}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
+        <p>Your subscription for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> has been resumed.</p>
+        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
+        <p>We will continue delivering your monthly wellness plan as scheduled.</p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
       </div>
     `,
   });

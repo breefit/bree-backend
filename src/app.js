@@ -12,6 +12,7 @@ import {
   productRouter,
   orderRouter,
   paymentRouter,
+  subscriptionRouter,
   profileRouter,
   addressRouter,
   contactRouter,
@@ -19,7 +20,7 @@ import {
 } from "./routes/index.js";
 import adminRouter from "./routes/admin/index.js";
 import errorHandler from "./middleware/errorHandler.js";
-
+import bulkRouter from "./routes/bulkRoutes.js";
 // console.log("STEP 2 - App file loaded");
 
 const app = express();
@@ -133,12 +134,13 @@ try {
   app.use("/api/products", productRouter);
   app.use("/api/orders", orderRouter);
   app.use("/api/payment", paymentRouter);
+  app.use("/api/subscriptions", subscriptionRouter);
   app.use("/api/profile", profileRouter);
   app.use("/api/addresses", addressRouter);
+  app.use("/api/bulk-bookings", bulkRouter);
   app.use("/api/contact", contactRouter);
   app.use("/api/testimonials", testimonialRouter);
   app.use("/api/admin", adminRouter);
-
   // console.log("STEP 7 - Routes loaded");
 } catch (err) {
   console.error("❌ App route setup failed:", err);

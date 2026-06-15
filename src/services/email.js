@@ -51,3 +51,36 @@ export const sendContactAck = async ({ to, name }) => {
     html: `<p>Hi ${name},<br>Thanks for reaching out! We'll get back to you within 24 hours.<br><br>— The BREE Team</p>`,
   });
 };
+
+
+
+export const sendBulkBookingNotification = async ({
+  companyName,
+  contactPerson,
+  email,
+  mobileNumber,
+  location,
+  quantity,
+  requirements,
+}) => {
+  if (!process.env.SMTP_USER) return;
+
+  await createTransporter().sendMail({
+    from: `"BREE Wellness" <${process.env.SMTP_USER}>`,
+    to: "bree.fit.india@gmail.com",
+    subject: "New Bulk Booking Request",
+    html: `
+      <h2>New Bulk Booking Request</h2>
+
+      <p><strong>Company:</strong> ${companyName}</p>
+      <p><strong>Contact Person:</strong> ${contactPerson}</p>
+      <p><strong>Email:</strong> ${email}</p>
+      <p><strong>Mobile:</strong> ${mobileNumber}</p>
+      <p><strong>Location:</strong> ${location || "-"}</p>
+      <p><strong>Quantity:</strong> ${quantity || "-"}</p>
+      <p><strong>Requirements:</strong> ${requirements || "-"}</p>
+    `,
+  });
+};
+
+export default createTransporter();

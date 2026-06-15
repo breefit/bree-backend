@@ -18,9 +18,18 @@ import { validateCart } from "../controllers/cartController.js";
 import {
   createOrder,
   verifyPayment,
+  getShippingInfo,
+  getPromotions,
   handleWebhook,
   getPaymentStatus,
 } from "../controllers/paymentController.js";
+import {
+  createSubscription,
+  getMySubscriptions,
+  cancelSubscription,
+  pauseSubscription,
+  resumeSubscription,
+} from "../controllers/subscriptionController.js";
 import {
   getProfile,
   updateProfile,
@@ -67,7 +76,17 @@ export const paymentRouter = Router();
 paymentRouter.post("/webhook", handleWebhook);
 paymentRouter.get("/status/:paymentId", getPaymentStatus);
 paymentRouter.post("/create-order", optionalAuth, createOrder);
+paymentRouter.post("/shipping-info", optionalAuth, getShippingInfo);
+paymentRouter.post("/promotions", optionalAuth, getPromotions);
 paymentRouter.post("/verify", optionalAuth, verifyPayment);
+
+// ── Subscriptions (authenticated) ──────────────────────────────────────────────
+export const subscriptionRouter = Router();
+subscriptionRouter.post("/create", auth, createSubscription);
+subscriptionRouter.get("/my", auth, getMySubscriptions);
+subscriptionRouter.post("/:id/cancel", auth, cancelSubscription);
+subscriptionRouter.post("/:id/pause", auth, pauseSubscription);
+subscriptionRouter.post("/:id/resume", auth, resumeSubscription);
 
 // ── Profile (authenticated) ───────────────────────────────────────────────────
 export const profileRouter = Router();

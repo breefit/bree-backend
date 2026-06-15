@@ -32,6 +32,7 @@ const safeUser = (u) => ({
 });
 
 const setAuthCookies = async (res, userId, req) => {
+  console.log("[authController] setAuthCookies called with userId:", userId);
   const accessToken = signUserToken(userId);
   const refreshToken = await createRefreshToken(userId, {
     userAgent: req.get("User-Agent"),
@@ -64,10 +65,9 @@ export const register = async (req, res, next) => {
   try {
     const { name, email, password } = req.body;
 
-    const existing = await query(
-      "SELECT id FROM users WHERE email = ?",
-      [email.toLowerCase()]
-    );
+    const existing = await query("SELECT id FROM users WHERE email = ?", [
+      email.toLowerCase(),
+    ]);
 
     if (existing.rows.length) {
       return res.status(409).json({
@@ -86,28 +86,20 @@ export const register = async (req, res, next) => {
         password,
         provider
       ) VALUES (?, ?, ?, ?, 'email')`,
-      [
-        userId,
-        name.trim(),
-        email.toLowerCase(),
-        hashed,
-      ]
+      [userId, name.trim(), email.toLowerCase(), hashed],
     );
 
     const { rows } = await query(
       `SELECT id, name, email, phone, picture, provider, role
        FROM users
        WHERE id = ?`,
-      [userId]
+      [userId],
     );
 
     const user = rows[0];
+    console.log("[authController] register created user row:", user);
 
-    const accessToken = await setAuthCookies(
-      res,
-      user.id,
-      req
-    );
+    const accessToken = await setAuthCookies(res, user.id, req);
 
     return res.status(201).json({
       ...safeUser(user),
@@ -133,6 +125,7 @@ export const login = async (req, res, next) => {
     }
 
     const user = rows[0];
+    console.log("[authController] login found user row:", user);
     if (!user.password) {
       return res.status(400).json({
         message:
@@ -179,10 +172,10 @@ export const googleSignIn = async (req, res) => {
   const name = decodedToken.name || email.split("@")[0];
   const picture = decodedToken.picture || null;
   const userId = randomUUID();
-  
+
   try {
-   await query(
-  `INSERT INTO users (
+    await query(
+      `INSERT INTO users (
       id,
       name,
       email,
@@ -195,8 +188,8 @@ export const googleSignIn = async (req, res) => {
      picture = VALUES(picture),
      provider = 'google',
      updated_at = CURRENT_TIMESTAMP`,
-  [userId, name.trim(), email, picture]
-);
+      [userId, name.trim(), email, picture],
+    );
 
     const { rows } = await query(
       `SELECT id, name, email, phone, picture, provider, role
@@ -205,6 +198,7 @@ export const googleSignIn = async (req, res) => {
     );
 
     const user = rows[0];
+    console.log("[authController] googleSignIn created/loaded user row:", user);
     const accessToken = await setAuthCookies(res, user.id, req);
     return res.json({ ...safeUser(user), accessToken });
   } catch (error) {

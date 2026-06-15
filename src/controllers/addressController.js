@@ -1,4 +1,6 @@
+import { randomUUID } from "crypto";
 import { query } from "../config/database.js";
+import crypto from "crypto";
 
 // GET /api/addresses
 export const getAddresses = async (req, res) => {
@@ -9,8 +11,17 @@ export const getAddresses = async (req, res) => {
   res.json(rows);
 };
 
+const addressId = crypto.randomUUID();
+
 // POST /api/addresses
 export const addAddress = async (req, res) => {
+  console.log("[addAddress] req.user:", req.user);
+  console.log("[addAddress] req.userId:", req.userId);
+  console.log("[addAddress] req.body:", req.body);
+  const resolvedUserId = req.user?.id || req.userId || null;
+  console.log("[addAddress] resolved userId:", resolvedUserId);
+  const addressId = randomUUID();
+
   const {
     label = "Home",
     address_line1,
@@ -37,10 +48,14 @@ export const addAddress = async (req, res) => {
     ]);
   }
 
+  console.log("req.user =", req.user);
+  console.log("req.user.id =", req.user?.id);
+
   await query(
-    `INSERT INTO addresses (user_id, label, address_line1, address_line2, city, state, pincode, country, is_default)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO addresses (id, user_id, label, address_line1, address_line2, city, state, pincode, country, is_default)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
+      addressId,
       req.user.id,
       label,
       address_line1,

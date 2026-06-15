@@ -10,6 +10,7 @@ export const getDashboardStats = async (req, res) => {
     const cacheKey = "admin:dashboard";
 
     const cached = cache.get(cacheKey);
+
     if (cached) {
       return res.json(cached);
     }
@@ -36,6 +37,7 @@ export const getDashboardStats = async (req, res) => {
       revenueRes,
       customersRes,
       pendingRes,
+      bulkBookingsRes,
       monthlyRevRes,
       weeklyOrdersRes,
       recentOrdersRes,
@@ -60,6 +62,11 @@ export const getDashboardStats = async (req, res) => {
         SELECT COUNT(*) AS total
         FROM orders
         WHERE order_status = 'pending'
+      `),
+
+      query(`
+        SELECT COUNT(*) AS total
+        FROM bulk_bookings
       `),
 
       query(
@@ -98,11 +105,19 @@ export const getDashboardStats = async (req, res) => {
 
     const payload = {
       total_orders: Number(ordersRes.rows?.[0]?.total || 0),
+
       total_revenue: Number(revenueRes.rows?.[0]?.total || 0),
+
       total_customers: Number(customersRes.rows?.[0]?.total || 0),
+
       pending_orders: Number(pendingRes.rows?.[0]?.total || 0),
+
+      total_bulk_bookings: Number(bulkBookingsRes.rows?.[0]?.total || 0),
+
       revenue_this_month: Number(monthlyRevRes.rows?.[0]?.total || 0),
+
       orders_this_week: Number(weeklyOrdersRes.rows?.[0]?.total || 0),
+
       recent_orders: recentOrdersRes.rows || [],
     };
 
@@ -111,6 +126,7 @@ export const getDashboardStats = async (req, res) => {
     return res.json(payload);
   } catch (error) {
     console.error("Dashboard Error:", error);
+
     return res.status(500).json({
       success: false,
       message: "Failed to load dashboard statistics",
