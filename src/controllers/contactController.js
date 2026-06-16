@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { query } from "../config/database.js";
 import { sendContactAck } from "../services/email.js";
 
@@ -5,15 +6,13 @@ import { sendContactAck } from "../services/email.js";
 export const submitInquiry = async (req, res) => {
   const { name, email, phone, message } = req.body;
 
-  await query(
-    `INSERT INTO contact_inquiries (name, email, phone, message)
-     VALUES (?, ?, ?, ?)`,
-    [name.trim(), email.toLowerCase(), phone || null, message.trim()],
-  );
+  const id = randomUUID();
 
-  const { rows } = await query(
-    `SELECT id FROM contact_inquiries WHERE email = ? AND message = ? ORDER BY created_at DESC LIMIT 1`,
-    [email.toLowerCase(), message.trim()],
+  await query(
+    `INSERT INTO contact_inquiries
+     (id, name, email, phone, message)
+     VALUES (?, ?, ?, ?, ?)`,
+    [id, name.trim(), email.toLowerCase(), phone || null, message.trim()],
   );
 
   // Send ack email (non-blocking)
@@ -21,7 +20,7 @@ export const submitInquiry = async (req, res) => {
 
   res.status(201).json({
     message: "Thank you! We will get back to you within 24 hours.",
-    id: rows[0]?.id,
+    id,
   });
 };
 

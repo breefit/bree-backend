@@ -52,12 +52,15 @@ const router = Router();
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: {
     message: "Too many admin login attempts. Try again in 15 minutes.",
   },
 });
+
 router.post("/login", loginLimiter, adminLogin);
-router.post("/logout", adminLogout);
+router.post("/logout", adminAuth, adminLogout);
 
 // ── All routes below require admin token ──────────────────────────────────────
 router.use(adminAuth);

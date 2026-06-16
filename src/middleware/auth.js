@@ -19,8 +19,8 @@ const auth = async (req, res, next) => {
     "tokenPresent:",
     !!token,
   );
-  console.log("[auth] req.user before auth:", req.user);
-  console.log("[auth] req.userId before auth:", req.userId);
+  // console.log("[auth] req.user before auth:", req.user);
+  // console.log("[auth] req.userId before auth:", req.userId);
   if (!token) {
     return res.status(401).json({ success: false, message: "Unauthorized" });
   }
@@ -28,9 +28,9 @@ const auth = async (req, res, next) => {
   let decoded;
   try {
     decoded = verifyUserToken(token);
-    console.log("[auth] decoded token:", decoded);
+    // console.log("[auth] decoded token:", decoded);
   } catch (err) {
-    console.log("[auth] token verification failed:", err?.message || err);
+    // console.log("[auth] token verification failed:", err?.message || err);
     return res.status(401).json({ success: false, message: "Unauthorized" });
   }
 
@@ -38,16 +38,16 @@ const auth = async (req, res, next) => {
     "SELECT id, name, email, phone, picture, provider, role FROM users WHERE id = ?",
     [decoded.userId],
   );
-  console.log("[auth] user lookup rows:", rows.length, rows[0]);
+  // console.log("[auth] user lookup rows:", rows.length, rows[0]);
 
   if (!rows.length) {
-    console.log("[auth] no user found for decoded.userId:", decoded.userId);
+    // console.log("[auth] no user found for decoded.userId:", decoded.userId);
     return res.status(401).json({ success: false, message: "Unauthorized" });
   }
 
   req.user = rows[0];
-  console.log("[auth] req.user after auth:", req.user);
-  console.log("[auth] req.userId after auth:", req.userId);
+  // console.log("[auth] req.user after auth:", req.user);
+  // console.log("[auth] req.userId after auth:", req.userId);
   next();
 };
 

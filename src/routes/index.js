@@ -74,7 +74,7 @@ orderRouter.put("/:id/payment-status", auth, updatePaymentStatus);
 export const paymentRouter = Router();
 // Webhook must use raw body — mount before express.json() in app, handled here as JSON since we JSON.stringify in verify
 paymentRouter.post("/webhook", handleWebhook);
-paymentRouter.get("/status/:paymentId", getPaymentStatus);
+paymentRouter.get("/status/:paymentId", optionalAuth, getPaymentStatus);
 paymentRouter.post("/create-order", optionalAuth, createOrder);
 paymentRouter.post("/shipping-info", optionalAuth, getShippingInfo);
 paymentRouter.post("/promotions", optionalAuth, getPromotions);

@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { query } from "../config/database.js";
 
 export const getApprovedTestimonials = async () => {
@@ -24,19 +25,20 @@ export const createTestimonial = async ({
   );
   if (dup.rows.length) return null;
 
+  const id = randomUUID();
+
   await query(
-    `INSERT INTO testimonials (user_id, name, role, text, rating, approved, status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, 0, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-    [userId, name, role, text, rating],
+    `INSERT INTO testimonials (id, user_id, name, role, text, rating, approved, status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
+    [id, userId, name, role, text, rating],
   );
 
   const { rows } = await query(
     `SELECT id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at
      FROM testimonials
-     WHERE user_id = ? AND name = ? AND text = ?
-     ORDER BY created_at DESC
+     WHERE id = ?
      LIMIT 1`,
-    [userId, name, text],
+    [id],
   );
 
   return rows[0];

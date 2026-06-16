@@ -152,7 +152,7 @@ export const getSubscriptionDetails = async (req, res) => {
          ua.address_type
        FROM orders o
        LEFT JOIN users u ON u.id = o.user_id
-       LEFT JOIN user_addresses ua ON ua.id = o.address_id
+       LEFT JOIN addresses ua ON ua.id = o.address_id
        WHERE o.id = ? AND o.is_subscription = 1
        LIMIT 1`,
       [id],
@@ -229,7 +229,10 @@ export const getSubscriptionDetails = async (req, res) => {
       "[ADMIN SUBSCRIPTIONS] Failed to load subscription details",
       error,
     );
-    res.status(500).json({ message: "Failed to load subscription details" });
+
+    return res.status(500).json({
+      message: "Failed to load subscription details",
+    });
   }
 };
 
@@ -295,15 +298,24 @@ export const pauseSubscription = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id FROM orders WHERE id = ? AND is_subscription = 1",
+      "SELECT id, razorpay_subscription_id, subscription_status FROM orders WHERE id = ? AND is_subscription = 1",
       [id],
     );
 
     if (!rows.length) {
-      return res.status(404).json({ message: "Subscription not found" });
+      return res.status(404).json({
+        message: "Subscription not found",
+      });
     }
 
     const order = rows[0];
+
+    if (order.subscription_status === "cancelled") {
+      return res.status(400).json({
+        message: "Cancelled subscriptions cannot be modified.",
+      });
+    }
+
     const rzp = getRazorpay();
     const response = await rzp.subscriptions.pause(
       order.razorpay_subscription_id,
@@ -322,7 +334,12 @@ export const pauseSubscription = async (req, res) => {
     res.json({ success: true, subscription_status: response.status });
   } catch (error) {
     console.error("[ADMIN SUBSCRIPTIONS] Pause failed", error);
-    res.status(500).json({ message: "Failed to pause subscription" });
+    res.status(500).json({
+      message:
+        error?.error?.description ||
+        error?.message ||
+        "Failed to pause subscription",
+    });
   }
 };
 

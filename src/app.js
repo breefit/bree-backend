@@ -30,7 +30,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 app.use("/images", express.static(path.join(__dirname, "../public/images")));
 
 // ── Security headers ──────────────────────────────────────────────────────────
-app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: "cross-origin",
+    },
+    contentSecurityPolicy: false,
+  }),
+);
 
 // ── Trust proxy (Render / Railway / Heroku sit behind a load balancer) ────────
 // Required so req.ip resolves correctly AND so express-rate-limit doesn't
@@ -54,6 +61,8 @@ const allowedOrigins = [
   ]),
 ].map((origin) => origin.replace(/\/$/, ""));
 
+
+// debug log for CORS allowed origins ------------------------------------------
 if (process.env.NODE_ENV === "production") {
   console.log("✅ CORS allowed origins:", allowedOrigins);
 }
@@ -70,7 +79,9 @@ const corsOptions = {
       return callback(null, true);
     }
 
-    console.warn(`🚫 CORS blocked origin: ${origin}`);
+    if (process.env.NODE_ENV !== "production") {
+      console.warn(`🚫 CORS blocked origin: ${origin}`);
+    }
     return callback(
       new Error(`CORS policy: Origin not allowed - ${origin}`),
       false,
@@ -122,11 +133,41 @@ app.use(
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { message: "Too many auth attempts. Try again in 15 minutes." },
 });
 app.use("/api/auth/register", authLimiter);
 app.use("/api/auth/login", authLimiter);
 app.use("/api/auth/change-password", authLimiter);
+
+// ── Payment rate limiter ───────────────────────────────────────────────────────
+// Applied ONLY to the two mutating payment endpoints. Deliberately excluded:
+//   • POST /api/payment/webhook   — Razorpay calls this; we never rate-limit it.
+//   • GET  /api/payment/status/*  — read-only, low risk.
+//   • POST /api/subscriptions/*   — separate router, separate concern.
+//
+// 20 requests per 15 minutes per IP is generous for a real user:
+//   a single checkout = 2 calls (create-order + verify). That's 10 checkouts
+//   per window — far above any legitimate use case.
+//
+// Behind Render / Railway (trust proxy = 1 is already set above), req.ip
+// resolves to the real client IP from the X-Forwarded-For header, so all
+// users behind the same proxy are NOT bucketed together.
+const paymentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  standardHeaders: true, // Sends RateLimit-* headers (RFC 6585 draft)
+  legacyHeaders: false, // Suppresses deprecated X-RateLimit-* headers
+  // Return JSON — not an HTML page — so the frontend can display it cleanly.
+  message: { message: "Too many payment requests. Please try again later." },
+  // Skip OPTIONS pre-flight (Razorpay Magic Checkout fires one before POST).
+  skip: (req) => req.method === "OPTIONS",
+});
+
+// Register before the route handlers so the limiter runs first on these paths.
+app.use("/api/payment/create-order", paymentLimiter);
+app.use("/api/payment/verify", paymentLimiter);
 
 // ── API Routes ────────────────────────────────────────────────────────────────
 try {
@@ -149,7 +190,10 @@ try {
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) =>
-  res.json({ status: "ok", env: process.env.NODE_ENV }),
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+  }),
 );
 
 // ── 404 ───────────────────────────────────────────────────────────────────────

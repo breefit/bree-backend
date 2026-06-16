@@ -59,10 +59,12 @@ export const getInquiries = async (req, res) => {
 };
 
 export const markContacted = async (req, res) => {
-  const { notes } = req.body;
+  const { notes, contacted } = req.body;
+  const contactedValue = contacted !== undefined ? (contacted ? 1 : 0) : 1;
+
   const result = await query(
-    "UPDATE contact_inquiries SET contacted = 1, notes = ? WHERE id = ?",
-    [notes || null, req.params.id],
+    "UPDATE contact_inquiries SET contacted = ?, notes = ? WHERE id = ?",
+    [contactedValue, notes || null, req.params.id],
   );
   if (!result.rowCount)
     return res.status(404).json({ message: "Inquiry not found" });

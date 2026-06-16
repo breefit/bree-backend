@@ -18,7 +18,7 @@ import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 // shippingAddress upfront — still supported for backward compat.
 // ─────────────────────────────────────────────────────────────────────────────
 export const createOrder = async (req, res) => {
-  console.log("[CREATE_ORDER] Received request", {
+  console.info("[CREATE_ORDER] Received request", {
     userId: req.user?.id,
     itemCount: req.body?.items?.length,
   });
@@ -143,7 +143,7 @@ export const createOrder = async (req, res) => {
       }
 
       if (rzpOrderStillValid) {
-        console.log("[CREATE_ORDER] Returning verified pending order", {
+        console.info("[CREATE_ORDER] Returning verified pending order", {
           orderId: existing.id,
           razorpayOrderId: existing.razorpay_order_id,
         });
@@ -158,7 +158,7 @@ export const createOrder = async (req, res) => {
       }
 
       // Stale or unverifiable — fall through to create a new Razorpay order
-      console.log(
+      console.info(
         "[CREATE_ORDER] Existing Razorpay order no longer valid — creating fresh",
         {
           orderId: existing.id,
@@ -267,7 +267,7 @@ export const createOrder = async (req, res) => {
 
     await client.query("COMMIT");
 
-    console.log("[CREATE_ORDER] Complete", {
+    console.info("[CREATE_ORDER] Complete", {
       orderId,
       razorpayOrderId: rzpOrder.id,
       amount: rzpOrder.amount,
@@ -325,7 +325,7 @@ export const verifyPayment = async (req, res) => {
     shippingAddress,
   } = req.body;
 
-  console.log("[VERIFY_PAYMENT] Request received", {
+  console.info("[VERIFY_PAYMENT] Request received", {
     razorpay_order_id,
     razorpay_subscription_id,
     razorpay_payment_id,
@@ -623,7 +623,7 @@ export const verifyPayment = async (req, res) => {
 
     await client.query("COMMIT");
 
-    console.log("[VERIFY_PAYMENT] Order finalised", {
+    console.info("[VERIFY_PAYMENT] Order finalised", {
       orderId: order.id,
       razorpay_payment_id,
     });
@@ -784,6 +784,7 @@ export const getPaymentStatus = async (req, res) => {
   const { rows } = await query(
     `SELECT
        o.id AS order_id,
+       o.user_id,
        COALESCE(o.total, o.amount) AS amount,
        o.order_status,
        o.payment_status,
@@ -802,6 +803,14 @@ export const getPaymentStatus = async (req, res) => {
   }
 
   const order = rows[0];
+
+  // ── PII guard ───────────────────────────────────────────────────────────
+  // This endpoint is publicly accessible (Razorpay Magic Checkout redirects
+  // here without a session). PII is only returned to the order owner or admin.
+  const isAuthorized =
+    (req.user?.id && req.user.id === order.user_id) ||
+    req.user?.role === "admin";
+
   const { rows: items } = await query(
     `SELECT product_name AS name, quantity, product_price AS price, subtotal
      FROM order_items WHERE order_id = ?`,
@@ -819,9 +828,9 @@ export const getPaymentStatus = async (req, res) => {
       quantity,
     },
     order_id: order.order_id,
-    customer_name: order.contact_name,
-    email: order.contact_email,
-    mobile_number: order.contact_phone,
+    customer_name: isAuthorized ? order.contact_name : null,
+    email: isAuthorized ? order.contact_email : null,
+    mobile_number: isAuthorized ? order.contact_phone : null,
   });
 };
 
@@ -854,7 +863,7 @@ export const handleWebhook = async (req, res) => {
   }
 
   const { event, payload: eventPayload } = payload;
-  console.log("[WEBHOOK] Event:", event);
+  console.info("[WEBHOOK] Event:", event);
 
   const paymentEntity = eventPayload?.payment?.entity;
   const subscriptionEntity = eventPayload?.subscription?.entity;
@@ -1002,10 +1011,10 @@ export const handleWebhook = async (req, res) => {
           await addHistory(
             order.id,
             order.order_status,
-            "payment_failed",
+            "failed",
             "Payment failed via webhook",
           );
-          emitUpdate(order.id, "payment_failed");
+          emitUpdate(order.id, "failed");
         }
       }
       break;
@@ -1020,14 +1029,14 @@ export const handleWebhook = async (req, res) => {
     case "subscription.halted":
     case "subscription.resumed":
     case "subscription.cancelled":
-      console.log(
+      console.info(
         "[WEBHOOK] Subscription event forwarded to subscription handler:",
         event,
       );
       break;
 
     default:
-      console.log("[WEBHOOK] Unhandled event:", event);
+      console.info("[WEBHOOK] Unhandled event:", event);
   }
 
   return res.json({ status: "ok" });
