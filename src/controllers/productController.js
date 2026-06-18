@@ -1,32 +1,37 @@
 import { query } from "../config/database.js";
 import cache from "../utils/cache.js";
 
-const PRODUCT_LIST_TTL = 300; // 5 minutes
-const PRODUCT_DETAIL_TTL = 600; // 10 minutes
-const CATEGORY_LIST_TTL = 600; // 10 minutes
-const HOME_DATA_TTL = 600; // 10 minutes
-const RECOMMENDATIONS_TTL = 300; // 5 minutes
+const PRODUCT_LIST_TTL = 300;
+const PRODUCT_DETAIL_TTL = 600;
+const CATEGORY_LIST_TTL = 600;
+const HOME_DATA_TTL = 600;
+const RECOMMENDATIONS_TTL = 300;
 
-// ========================================
+// ============================================================
 // COMMON PRODUCT SELECT
-// ========================================
+// ============================================================
 
+// is_subscription is included here so every endpoint that uses PRODUCT_SELECT
+// returns the field. ProductCard reads it to decide "Subscribe Now" vs
+// "Add to Cart". Previously it was present in this query but missing from
+// the getRecommendations inline SELECT further below — fixed there too.
 const PRODUCT_SELECT = `
-  SELECT 
-    p.id,
-    p.name,
-    p.slug,
-    p.category,
-    p.description,
-    p.price,
-    p.mrp,
-    p.quantity,
-    p.stock_qty,
-    p.image,
-    p.features,
-    p.popular,
-    p.status,
-    p.recommended_product_ids,
+ SELECT
+  p.id,
+  p.name,
+  p.slug,
+  p.category,
+  p.description,
+  p.price,
+  p.mrp,
+  p.quantity,
+  p.stock_qty,
+  p.image,
+  p.features,
+  p.popular,
+  p.status,
+  p.is_subscription,
+  p.recommended_product_ids,
 
     COALESCE(
       (
@@ -44,7 +49,8 @@ const PRODUCT_SELECT = `
             'image', rp.image,
             'features', rp.features,
             'popular', rp.popular,
-            'status', rp.status
+            'status', rp.status,
+            'is_subscription', rp.is_subscription
           )
         )
         FROM products rp
@@ -57,9 +63,9 @@ const PRODUCT_SELECT = `
   FROM products p
 `;
 
-// ========================================
+// ============================================================
 // GET ALL PRODUCTS
-// ========================================
+// ============================================================
 
 export const getProducts = async (req, res) => {
   try {
@@ -88,16 +94,13 @@ export const getProducts = async (req, res) => {
     res.json(rows);
   } catch (error) {
     console.error("Error fetching products:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch products",
-    });
+    res.status(500).json({ message: "Failed to fetch products" });
   }
 };
 
-// ========================================
+// ============================================================
 // GET SINGLE PRODUCT
-// ========================================
+// ============================================================
 
 export const getProduct = async (req, res) => {
   try {
@@ -114,13 +117,11 @@ export const getProduct = async (req, res) => {
       AND p.is_active = 1
       LIMIT 1
       `,
-      [req.params.id],
+      [req.params.id, req.params.id],
     );
 
     if (!rows.length) {
-      return res.status(404).json({
-        message: "Product not found",
-      });
+      return res.status(404).json({ message: "Product not found" });
     }
 
     const product = rows[0];
@@ -135,16 +136,13 @@ export const getProduct = async (req, res) => {
     res.json(product);
   } catch (error) {
     console.error("Error fetching product:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch product",
-    });
+    res.status(500).json({ message: "Failed to fetch product" });
   }
 };
 
-// ========================================
+// ============================================================
 // GET HOME PRODUCTS
-// ========================================
+// ============================================================
 
 export const getHomeProducts = async (req, res) => {
   try {
@@ -196,16 +194,13 @@ export const getHomeProducts = async (req, res) => {
     res.json(results);
   } catch (error) {
     console.error("Error fetching home products:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch home products",
-    });
+    res.status(500).json({ message: "Failed to fetch home products" });
   }
 };
 
-// ========================================
-// HOME DATA
-// ========================================
+// ============================================================
+// CATEGORIES
+// ============================================================
 
 export const getCategories = async (req, res) => {
   try {
@@ -227,6 +222,10 @@ export const getCategories = async (req, res) => {
     res.status(500).json({ message: "Failed to fetch categories" });
   }
 };
+
+// ============================================================
+// HOME DATA
+// ============================================================
 
 export const getHomeData = async (req, res) => {
   try {
@@ -254,27 +253,27 @@ export const getHomeData = async (req, res) => {
     const [featuredRes, popularRes, categoriesRes, testimonialsRes] =
       await Promise.all([
         query(`
-        ${PRODUCT_SELECT}
-        WHERE p.is_active = 1
-        AND p.quantity = 7
-        LIMIT 1
-      `),
+          ${PRODUCT_SELECT}
+          WHERE p.is_active = 1
+          AND p.quantity = 7
+          LIMIT 1
+        `),
         query(`
-        ${PRODUCT_SELECT}
-        WHERE p.is_active = 1
-        AND p.popular = 1
-        LIMIT 4
-      `),
+          ${PRODUCT_SELECT}
+          WHERE p.is_active = 1
+          AND p.popular = 1
+          LIMIT 4
+        `),
         query(
           `SELECT DISTINCT category FROM products WHERE is_active = 1 AND category IS NOT NULL ORDER BY category ASC`,
         ),
         query(`
-        SELECT id, user_id, name, role, avatar, text, rating, created_at, updated_at
-        FROM testimonials
-        WHERE status = 'approved'
-        ORDER BY created_at DESC
-        LIMIT 10
-      `),
+          SELECT id, user_id, name, role, avatar, text, rating, created_at, updated_at
+          FROM testimonials
+          WHERE status = 'approved'
+          ORDER BY created_at DESC
+          LIMIT 10
+        `),
       ]);
 
     const data = {
@@ -293,9 +292,9 @@ export const getHomeData = async (req, res) => {
   }
 };
 
-// ========================================
+// ============================================================
 // GET PRODUCT RECOMMENDATIONS
-// ========================================
+// ============================================================
 
 export const getRecommendations = async (req, res) => {
   try {
@@ -328,7 +327,6 @@ export const getRecommendations = async (req, res) => {
 
     let recommendedIds = prodRows[0].recommended_product_ids || [];
 
-    // Parse JSON if it's a string (shouldn't happen with mysql2 but just in case)
     if (typeof recommendedIds === "string") {
       try {
         recommendedIds = JSON.parse(recommendedIds);
@@ -349,6 +347,9 @@ export const getRecommendations = async (req, res) => {
 
     const placeholders = recommendedIds.map(() => "?").join(",");
     const { rows } = await query(
+      // BUG FIX 5: is_subscription was missing from this SELECT, so any
+      // product shown as a recommendation would always display "Add to Cart"
+      // even when is_subscription = 1 in the DB.
       `SELECT
          id,
          name,
@@ -362,7 +363,8 @@ export const getRecommendations = async (req, res) => {
          image,
          features,
          popular,
-         status
+         status,
+         is_subscription
        FROM products
        WHERE id IN (${placeholders})
        AND is_active = 1
@@ -371,7 +373,6 @@ export const getRecommendations = async (req, res) => {
       [...recommendedIds, ...recommendedIds],
     );
 
-    // Format response
     const formattedRecommendations = rows.map((prod) => ({
       id: prod.id,
       name: prod.name,
@@ -379,15 +380,13 @@ export const getRecommendations = async (req, res) => {
       price: parseFloat(prod.price),
       mrp: parseFloat(prod.mrp),
       quantity: prod.quantity,
+      is_subscription: prod.is_subscription, // included so ProductCard renders correctly
     }));
 
     cache.set(cacheKey, formattedRecommendations, RECOMMENDATIONS_TTL);
     res.json(formattedRecommendations);
   } catch (error) {
     console.error("❌ Error fetching recommendations:", error);
-
-    res.status(500).json({
-      message: "Failed to fetch recommendations",
-    });
+    res.status(500).json({ message: "Failed to fetch recommendations" });
   }
 };

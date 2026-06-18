@@ -77,6 +77,7 @@ const normalizeProductFeaturesForResponse = (features) => {
   }
   return [];
 };
+
 const normalizeProductStatus = (status) =>
   VALID_PRODUCT_STATUSES.includes(status) ? status : "In Stock";
 
@@ -88,12 +89,24 @@ const resolveProductStatus = (stockQty, status) => {
   return status !== undefined ? normalizeProductStatus(status) : "In Stock";
 };
 
+// BUG FIX 3 & 4 — shared helper so normalisation is identical in create and
+// update. Accepts the raw req.body value which can be:
+//   boolean true/false  (from JSON body)
+//   string "true"/"false"  (from multipart form)
+//   integer 1/0  (from a future GET→edit round-trip)
+// Returns 1 or 0 for the MySQL TINYINT(1) column.
+const normalizeIsSubscription = (value) => {
+  if (value === true || value === 1 || value === "true" || value === "1") {
+    return 1;
+  }
+  return 0;
+};
+
 const invalidateProductCache = () => {
   cache.delPrefix("products:");
   cache.del("home:data");
 };
 
-// Helper to emit Socket.IO event
 const emitProductEvent = (req, eventType, product) => {
   try {
     const io = req.app.locals.io;
@@ -106,7 +119,9 @@ const emitProductEvent = (req, eventType, product) => {
   }
 };
 
+// ============================================================
 // GET /api/admin/products
+// ============================================================
 export const getProducts = async (req, res) => {
   const { page = 1, limit = 20, search = "" } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
@@ -118,8 +133,11 @@ export const getProducts = async (req, res) => {
 
   const [productsRes, countRes] = await Promise.all([
     query(
+      // is_subscription included so the admin table can show the flag and
+      // so reopening the edit modal always receives the correct value.
       `SELECT id, name, slug, category, description, price, mrp,
-              quantity, stock_qty, image, features, popular, display_order, status, is_active, created_at
+              quantity, stock_qty, image, features, popular, display_order,
+              status, is_active, is_subscription, created_at
        FROM products ${where} ORDER BY display_order ASC, created_at DESC
        LIMIT ? OFFSET ?`,
       params,
@@ -142,8 +160,13 @@ export const getProducts = async (req, res) => {
   });
 };
 
+// ============================================================
 // POST /api/admin/products
+// ============================================================
 export const createProduct = async (req, res) => {
+  // DEBUG — remove after confirming is_subscription saves correctly
+  console.log("CREATE PRODUCT BODY", req.body);
+
   const {
     name,
     category,
@@ -156,7 +179,9 @@ export const createProduct = async (req, res) => {
     status,
     stockQty,
     displayOrder,
+    is_subscription, // snake_case from frontend payload
   } = req.body;
+
   const image =
     req.file?.path ||
     req.file?.secure_url ||
@@ -171,14 +196,19 @@ export const createProduct = async (req, res) => {
   const stockQuantity = parseInt(stockQty || 0, 10);
   const productStatus = resolveProductStatus(stockQuantity, status);
 
+  // BUG FIX 3: Previous code used `=== true || === "true"` which silently
+  // failed when the value was integer 1 (possible after a round-trip through
+  // the edit form). normalizeIsSubscription() handles all four shapes.
+  const isSubscriptionValue = normalizeIsSubscription(is_subscription);
+
   const productId = randomUUID();
 
   await query(
     `INSERT INTO products
      (id, name, slug, category, description, price, mrp, quantity,
       stock_qty, image, features, popular, status, display_order,
-      recommended_product_ids)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      recommended_product_ids, is_subscription)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       productId,
       name,
@@ -191,10 +221,11 @@ export const createProduct = async (req, res) => {
       stockQuantity,
       image,
       featuresValue,
-      popular === "true" || popular === true,
+      popular === "true" || popular === true ? 1 : 0,
       productStatus,
       displayOrder !== undefined ? parseInt(displayOrder, 10) : 0,
       JSON.stringify([]),
+      isSubscriptionValue,
     ],
   );
 
@@ -206,9 +237,16 @@ export const createProduct = async (req, res) => {
   res.status(201).json(rows[0]);
 };
 
+// ============================================================
 // PUT /api/admin/products/:id
+// ============================================================
 export const updateProduct = async (req, res) => {
   try {
+    // DEBUG — remove after confirming is_subscription saves correctly
+    // console.log("================================");
+    // console.log("UPDATE PRODUCT BODY", req.body);
+    // console.log("================================");
+
     const {
       name,
       category,
@@ -222,6 +260,7 @@ export const updateProduct = async (req, res) => {
       stockQty,
       isActive,
       displayOrder,
+      is_subscription, // snake_case from frontend payload
     } = req.body;
 
     const updates = ["updated_at = now()"];
@@ -242,11 +281,11 @@ export const updateProduct = async (req, res) => {
     if (mrp !== undefined) add("mrp", parseFloat(mrp));
     if (quantity !== undefined) add("quantity", parseInt(quantity));
     if (popular !== undefined)
-      add("popular", popular === "true" || popular === true);
+      add("popular", popular === "true" || popular === true ? 1 : 0);
     if (displayOrder !== undefined)
       add("display_order", parseInt(displayOrder, 10));
     if (isActive !== undefined)
-      add("is_active", isActive === "true" || isActive === true);
+      add("is_active", isActive === "true" || isActive === true ? 1 : 0);
     if (req.file) {
       const imagePath =
         req.file.path ||
@@ -259,6 +298,16 @@ export const updateProduct = async (req, res) => {
     if (features !== undefined) {
       const normalizedFeatures = normalizeFeaturesInput(features);
       add("features", JSON.stringify(normalizedFeatures));
+    }
+
+    // BUG FIX 4: Previous code had a typo — "is_Subscription" (capital S)
+    // inside the normalisation expression. JavaScript treated it as a new
+    // undefined variable, so the expression always evaluated to false and
+    // is_subscription was always written as 0 regardless of the checkbox.
+    // Fixed by using normalizeIsSubscription() which uses the correct
+    // lowercase variable name "is_subscription" throughout.
+    if (is_subscription !== undefined) {
+      add("is_subscription", normalizeIsSubscription(is_subscription));
     }
 
     const parsedStockQty =
@@ -295,8 +344,7 @@ export const updateProduct = async (req, res) => {
     params.push(req.params.id);
 
     const sql = `UPDATE products SET ${updates.join(", ")} WHERE id = ?`;
-
-    const updateResult = await query(sql, params);
+    await query(sql, params);
 
     const { rows } = await query(
       `SELECT * FROM products WHERE id = ? LIMIT 1`,
@@ -320,7 +368,9 @@ export const updateProduct = async (req, res) => {
   }
 };
 
-// DELETE /api/admin/products/:id  — soft delete to preserve order history
+// ============================================================
+// DELETE /api/admin/products/:id  — soft delete
+// ============================================================
 export const deleteProduct = async (req, res) => {
   await query(
     "UPDATE products SET is_active = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -337,33 +387,31 @@ export const deleteProduct = async (req, res) => {
   invalidateProductCache();
   emitProductEvent(req, "deleted", { id: rows[0].id });
 
-  // Optionally delete from Cloudinary
   if (rows[0].image?.includes("cloudinary.com")) {
     const publicId = rows[0].image.split("/").pop().split(".")[0];
     cloudinary.uploader
       .destroy(
         `${process.env.CLOUDINARY_UPLOAD_FOLDER || "bree-products"}/${publicId}`,
       )
-      .catch(() => {}); // non-blocking
+      .catch(() => {});
   }
 
   res.json({ message: "Product deactivated" });
 };
 
+// ============================================================
 // POST /api/admin/products/:id/relations
-// Body: [{ related_product_id, relation_type, weight }, ...]
+// ============================================================
 export const setProductRelations = async (req, res) => {
   const productId = req.params.id;
   const relations = Array.isArray(req.body.relations) ? req.body.relations : [];
 
-  // Validate product exists
   const { rows: p } = await query(
     "SELECT id FROM products WHERE id = ? LIMIT 1",
     [productId],
   );
   if (!p.length) return res.status(404).json({ message: "Product not found" });
 
-  // Delete existing relations for product, then insert new ones (simple replace semantics)
   await query("DELETE FROM product_relations WHERE product_id = ?", [
     productId,
   ]);
@@ -373,7 +421,7 @@ export const setProductRelations = async (req, res) => {
     return res.json({ message: "Relations cleared" });
   }
 
-  const inserts = relations.map((r, i) => {
+  const inserts = relations.map((r) => {
     const relId = r.related_product_id;
     const type = r.relation_type || "recommend";
     const weight = parseInt(r.weight || 0);
@@ -388,7 +436,9 @@ export const setProductRelations = async (req, res) => {
   res.json({ message: "Relations set" });
 };
 
+// ============================================================
 // DELETE /api/admin/products/:id/relations/:relId
+// ============================================================
 export const deleteProductRelation = async (req, res) => {
   const { id, relId } = req.params;
   const { rows } = await query(
@@ -406,7 +456,9 @@ export const deleteProductRelation = async (req, res) => {
   res.json({ message: "Relation deleted" });
 };
 
+// ============================================================
 // GET /api/admin/products/:id/relations
+// ============================================================
 export const getProductRelations = async (req, res) => {
   const productId = req.params.id;
 
