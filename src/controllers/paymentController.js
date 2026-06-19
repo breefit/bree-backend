@@ -325,6 +325,11 @@ export const verifyPayment = async (req, res) => {
     shippingAddress,
   } = req.body;
 
+  console.log("================================");
+  console.log("VERIFY PAYMENT HIT");
+  console.log(req.body);
+  console.log("================================");
+
   console.info("[VERIFY_PAYMENT] Request received", {
     razorpay_order_id,
     razorpay_subscription_id,
@@ -375,6 +380,9 @@ export const verifyPayment = async (req, res) => {
         orderId: alreadyProcessed[0].id,
       },
     );
+    console.log("VERIFY STARTED");
+    console.log("subscription id:", razorpay_subscription_id);
+    console.log("payment id:", razorpay_payment_id);
     return res.json({
       success: true,
       order_id: alreadyProcessed[0].id,
@@ -661,10 +669,49 @@ export const verifyPayment = async (req, res) => {
     console.error("[EMAIL] Confirmation email failed:", err?.message || err);
   });
 
+  // ── For subscriptions: fetch charge_at from Razorpay and write
+  // next_billing_date so SubscriptionSuccess and MySubscriptions pages can
+  // display it immediately without waiting for a webhook.
+  let nextBillingDate = null;
+  if (isSubscriptionOrder && razorpay_subscription_id) {
+    try {
+      const rzpForBilling = getRazorpay();
+      const liveSub = await rzpForBilling.subscriptions.fetch(
+        razorpay_subscription_id,
+      );
+      if (liveSub?.charge_at) {
+        // charge_at is a Unix timestamp — convert to MySQL-compatible datetime
+        nextBillingDate = new Date(liveSub.charge_at * 1000).toLocaleString(
+          "sv-SE",
+          { timeZone: "Asia/Kolkata" },
+        );
+        await query(
+          `UPDATE orders SET next_billing_date = ?, updated_at = NOW()
+           WHERE id = ?`,
+          [nextBillingDate, order.id],
+        );
+        console.info("[VERIFY_PAYMENT] next_billing_date written", {
+          orderId: order.id,
+          nextBillingDate,
+        });
+      }
+    } catch (billingErr) {
+      // Non-blocking — the webhook (subscription.charged) will sync it later.
+      console.warn(
+        "[VERIFY_PAYMENT] Could not fetch charge_at from Razorpay",
+        billingErr?.message || billingErr,
+      );
+    }
+  }
+
   return res.json({
     success: true,
     order_id: order.id,
     payment_id: razorpay_payment_id,
+    ...(isSubscriptionOrder && {
+      subscription_status: "active",
+      next_billing_date: nextBillingDate,
+    }),
   });
 };
 
@@ -1020,20 +1067,191 @@ export const handleWebhook = async (req, res) => {
       break;
     }
 
-    // Subscription lifecycle events — do not modify subscription-related
-    // logic; these are handled by subscriptionController.js
-    case "subscription.activated":
-    case "subscription.created":
-    case "subscription.charged":
-    case "subscription.paused":
-    case "subscription.halted":
-    case "subscription.resumed":
-    case "subscription.cancelled":
-      console.info(
-        "[WEBHOOK] Subscription event forwarded to subscription handler:",
-        event,
-      );
+    // ── Subscription lifecycle events ────────────────────────────────────────
+    // These were previously no-ops. They now update the DB so subscription
+    // status stays consistent even when the frontend verifyPayment call
+    // is missed (e.g. popup closed early, network failure).
+
+    case "subscription.activated": {
+      const order = await loadBySubscription();
+      if (order) {
+        const chargeAt = subscriptionEntity?.charge_at;
+        const nextBilling = chargeAt
+          ? new Date(chargeAt * 1000).toLocaleString("sv-SE", {
+              timeZone: "Asia/Kolkata",
+            })
+          : null;
+        await query(
+          `UPDATE orders SET
+             subscription_status = 'active',
+             payment_status = 'paid',
+             order_status = 'active',
+             next_billing_date = COALESCE(?, next_billing_date),
+             updated_at = NOW()
+           WHERE id = ?`,
+          [nextBilling, order.id],
+        );
+        await addHistory(
+          order.id,
+          order.subscription_status,
+          "active",
+          "Subscription activated via webhook",
+        );
+        emitUpdate(order.id, "active");
+      }
       break;
+    }
+
+    case "subscription.created": {
+      // Razorpay fires this when the subscription object is first created.
+      // We already write status='created' at createSubscription time; nothing to do.
+      console.info("[WEBHOOK] subscription.created — no DB action needed");
+      break;
+    }
+
+    case "subscription.charged": {
+      // Fired after each successful recurring charge.
+      const order = await loadBySubscription();
+      if (order) {
+        const chargeAt = subscriptionEntity?.charge_at;
+        const nextBilling = chargeAt
+          ? new Date(chargeAt * 1000).toLocaleString("sv-SE", {
+              timeZone: "Asia/Kolkata",
+            })
+          : null;
+        await query(
+          `UPDATE orders SET
+             subscription_status = 'active',
+             payment_status = 'paid',
+             order_status = 'active',
+             next_billing_date = COALESCE(?, next_billing_date),
+             updated_at = NOW()
+           WHERE id = ?`,
+          [nextBilling, order.id],
+        );
+        await addHistory(
+          order.id,
+          order.subscription_status,
+          "active",
+          "Subscription charged via webhook",
+        );
+        emitUpdate(order.id, "active");
+        // Trigger renewal receipt email (non-blocking)
+        const { sendSubscriptionChargeReceiptEmail } =
+          await import("../services/orderEmailService.js").catch(() => ({}));
+        if (sendSubscriptionChargeReceiptEmail) {
+          sendSubscriptionChargeReceiptEmail({
+            to: order.contact_email,
+            name: order.contact_name,
+            orderId: order.id,
+            subscriptionId: rzpSubscriptionId,
+            amount: amount,
+          }).catch((e) =>
+            console.error("[WEBHOOK] Charge receipt email failed", e),
+          );
+        }
+      }
+      break;
+    }
+
+    case "subscription.paused": {
+      const order = await loadBySubscription();
+      if (order) {
+        await query(
+          `UPDATE orders SET
+             subscription_status = 'paused',
+             next_billing_date = NULL,
+             updated_at = NOW()
+           WHERE id = ?`,
+          [order.id],
+        );
+        await addHistory(
+          order.id,
+          order.subscription_status,
+          "paused",
+          "Subscription paused via webhook",
+        );
+        emitUpdate(order.id, "paused");
+      }
+      break;
+    }
+
+    case "subscription.resumed": {
+      const order = await loadBySubscription();
+      if (order) {
+        const chargeAt = subscriptionEntity?.charge_at;
+        const nextBilling = chargeAt
+          ? new Date(chargeAt * 1000).toLocaleString("sv-SE", {
+              timeZone: "Asia/Kolkata",
+            })
+          : null;
+        await query(
+          `UPDATE orders SET
+             subscription_status = 'active',
+             order_status = 'active',
+             next_billing_date = COALESCE(?, next_billing_date),
+             updated_at = NOW()
+           WHERE id = ?`,
+          [nextBilling, order.id],
+        );
+        await addHistory(
+          order.id,
+          order.subscription_status,
+          "active",
+          "Subscription resumed via webhook",
+        );
+        emitUpdate(order.id, "active");
+      }
+      break;
+    }
+
+    case "subscription.halted": {
+      const order = await loadBySubscription();
+      if (order) {
+        await query(
+          `UPDATE orders SET
+             subscription_status = 'halted',
+             payment_status = 'failed',
+             updated_at = NOW()
+           WHERE id = ?`,
+          [order.id],
+        );
+        await addHistory(
+          order.id,
+          order.subscription_status,
+          "halted",
+          "Subscription halted via webhook (payment failures)",
+        );
+        emitUpdate(order.id, "halted");
+      }
+      break;
+    }
+
+    case "subscription.cancelled": {
+      const order = await loadBySubscription();
+      if (order) {
+        // Only update if not already marked cancelled — preserves idempotency.
+        if (order.subscription_status !== "cancelled") {
+          await query(
+            `UPDATE orders SET
+               subscription_status = 'cancelled',
+               order_status = 'cancelled',
+               next_billing_date = NULL,
+               updated_at = NOW()
+             WHERE id = ?`,
+            [order.id],
+          );
+          await addHistory(
+            order.id,
+            order.subscription_status,
+            "cancelled",
+            "Subscription cancelled via webhook",
+          );
+          emitUpdate(order.id, "cancelled");
+        }
+      }
+      break;
+    }
 
     default:
       console.info("[WEBHOOK] Unhandled event:", event);

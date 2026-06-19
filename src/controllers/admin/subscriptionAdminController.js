@@ -133,105 +133,219 @@ export const getSubscriptions = async (req, res) => {
 };
 
 export const getSubscriptionDetails = async (req, res) => {
+  // ── Production-grade logging (requirement §4 / §8) ─────────────────────────
+  console.log("[DETAILS PARAM]", req.params.id);
+
   try {
     const { id } = req.params;
+
+    // ── QUERY 1: Main order + user + address ──────────────────────────────────
+    //
+    // ROOT CAUSE OF THE 500 (was):
+    //   LEFT JOIN addresses ua ON ua.id = o.address_id
+    //   + SELECT ua.full_name, ua.phone, ua.address_line_1, ua.address_line_2,
+    //            ua.address_type
+    //
+    // The `addresses` table schema is:
+    //   id, user_id, label, address_line1, address_line2, city, state,
+    //   pincode, country, is_default, created_at
+    //   → NO full_name, NO phone, NO address_type
+    //
+    // The `user_addresses` table has all of those columns:
+    //   full_name, phone, address_line_1, address_line_2, address_type
+    //
+    // The FK constraint is: orders.address_id → addresses.id
+    // BUT the orders row for this subscription has address_id =
+    // '73d087a0-3b0d-487b-b74f-85b2c250d769' which is a row in `addresses`.
+    //
+    // FIX:
+    //   1) Join BOTH tables with separate aliases.
+    //   2) Use COALESCE to prefer user_addresses fields where they exist,
+    //      falling back to addresses fields and finally to order contact fields.
+    //   This makes the query resilient regardless of which table was used.
+    //
+    // users.phone ✅ exists.
+    // orders.*   ✅ all columns (cancel_reason, cancelled_by, cancelled_at,
+    //                razorpay_subscription_id, razorpay_plan_id, etc.) ✅
+    console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
+
     const { rows } = await query(
       `SELECT
-         o.*, 
-         u.name AS user_name,
+         o.*,
+         u.name  AS user_name,
          u.email AS user_email,
          u.phone AS user_phone,
-         ua.full_name AS address_name,
-         ua.phone AS address_phone,
-         ua.address_line_1,
-         ua.address_line_2,
-         ua.city,
-         ua.state,
-         ua.pincode,
-         ua.country,
-         ua.address_type
+
+         -- user_addresses columns (preferred — richer data)
+         ua2.full_name      AS ua2_full_name,
+         ua2.phone          AS ua2_phone,
+         ua2.address_line_1 AS ua2_line1,
+         ua2.address_line_2 AS ua2_line2,
+         ua2.city           AS ua2_city,
+         ua2.state          AS ua2_state,
+         ua2.pincode        AS ua2_pincode,
+         ua2.country        AS ua2_country,
+         ua2.address_type   AS ua2_address_type,
+
+         -- addresses columns (fallback — FK target)
+         a1.label           AS a1_label,
+         a1.address_line1   AS a1_line1,
+         a1.address_line2   AS a1_line2,
+         a1.city            AS a1_city,
+         a1.state           AS a1_state,
+         a1.pincode         AS a1_pincode,
+         a1.country         AS a1_country
+
        FROM orders o
-       LEFT JOIN users u ON u.id = o.user_id
-       LEFT JOIN addresses ua ON ua.id = o.address_id
+       LEFT JOIN users u        ON u.id   = o.user_id
+       LEFT JOIN addresses a1   ON a1.id  = o.address_id
+       LEFT JOIN user_addresses ua2 ON ua2.id = o.address_id
        WHERE o.id = ? AND o.is_subscription = 1
        LIMIT 1`,
       [id],
     );
 
+    console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
+    console.log("[MAIN QUERY RESULT]", rows);
+
     if (!rows.length) {
       return res.status(404).json({ message: "Subscription not found" });
     }
 
-    const subscription = rows[0];
+    const s = rows[0];
+
+    // ── QUERY 2: order_items ──────────────────────────────────────────────────
+    // order_items columns verified: id, product_name, product_image,
+    // product_price, quantity, subtotal ✅ all exist in schema.
+    console.log("[SUB DETAILS] QUERY START items", { orderId: id });
 
     const itemsResult = await query(
-      `SELECT id, product_name, product_image, product_price, quantity, subtotal FROM order_items WHERE order_id = ?`,
+      `SELECT id, product_name, product_image, product_price, quantity, subtotal
+       FROM order_items
+       WHERE order_id = ?`,
       [id],
     );
+    console.log("[ITEMS RESULT]", itemsResult.rows);
 
-    const billingResult = await query(
-      `SELECT id, order_id, razorpay_payment_id, amount, currency, status, created_at, updated_at
-       FROM payments
-       WHERE razorpay_subscription_id = ?
-       ORDER BY updated_at DESC`,
-      [subscription.razorpay_subscription_id],
-    );
+    // ── QUERY 3: payments billing history ────────────────────────────────────
+    // Guard: if razorpay_subscription_id is null (edge case), skip the query
+    // and return an empty array rather than passing NULL into the WHERE clause
+    // (which would match nothing but is semantically misleading).
+    // payments columns verified: id, order_id, razorpay_payment_id, amount,
+    // currency, status, created_at, updated_at ✅ all exist.
+    console.log("[SUB DETAILS] QUERY START payments", {
+      razorpaySubscriptionId: s.razorpay_subscription_id,
+    });
 
-    const renewalOrdersResult = await query(
-      `SELECT id, total, order_status, payment_status, razorpay_order_id, razorpay_payment_id, created_at
-       FROM orders
-       WHERE razorpay_subscription_id = ?
-       ORDER BY created_at DESC`,
-      [subscription.razorpay_subscription_id],
-    );
+    let billingRows = [];
+    if (s.razorpay_subscription_id) {
+      const billingResult = await query(
+        `SELECT id, order_id, razorpay_payment_id, amount, currency,
+                status, created_at, updated_at
+         FROM payments
+         WHERE razorpay_subscription_id = ?
+         ORDER BY updated_at DESC`,
+        [s.razorpay_subscription_id],
+      );
+      billingRows = billingResult.rows;
+    }
+    console.log("[PAYMENTS RESULT]", billingRows);
 
-    res.json({
+    // ── QUERY 4: renewal orders ───────────────────────────────────────────────
+    // orders columns verified: id, total, order_status, payment_status,
+    // razorpay_order_id, razorpay_payment_id, created_at ✅ all exist.
+    console.log("[SUB DETAILS] QUERY START renewals", {
+      razorpaySubscriptionId: s.razorpay_subscription_id,
+    });
+
+    let renewalRows = [];
+    if (s.razorpay_subscription_id) {
+      const renewalResult = await query(
+        `SELECT id, total, order_status, payment_status,
+                razorpay_order_id, razorpay_payment_id, created_at
+         FROM orders
+         WHERE razorpay_subscription_id = ?
+         ORDER BY created_at DESC`,
+        [s.razorpay_subscription_id],
+      );
+      renewalRows = renewalResult.rows;
+    }
+    console.log("[RENEWALS RESULT]", renewalRows);
+
+    // ── Resolve address fields from whichever table was actually populated ────
+    // Priority: user_addresses > addresses > order contact fields
+    const addressName = s.ua2_full_name || s.contact_name || null;
+    const addressPhone = s.ua2_phone || s.contact_phone || null;
+    const addressLine1 = s.ua2_line1 || s.a1_line1 || null;
+    const addressLine2 = s.ua2_line2 || s.a1_line2 || null;
+    const addressCity = s.ua2_city || s.a1_city || null;
+    const addressState = s.ua2_state || s.a1_state || null;
+    const addressPincode = s.ua2_pincode || s.a1_pincode || null;
+    const addressCountry = s.ua2_country || s.a1_country || null;
+    const addressType = s.ua2_address_type || null;
+
+    // Determine lastRenewal from billing rows (resilient — empty array safe)
+    const lastRenewal =
+      billingRows.find(
+        (p) =>
+          String(p.status).toLowerCase() === "captured" ||
+          String(p.status).toLowerCase() === "paid",
+      )?.updated_at ?? null;
+
+    return res.json({
       subscription: {
-        id: subscription.id,
-        customerName: subscription.contact_name,
-        email: subscription.email,
-        phone: subscription.contact_phone,
-        subscriptionStatus: subscription.subscription_status,
-        paymentStatus: subscription.payment_status,
-        razorpaySubscriptionId: subscription.razorpay_subscription_id,
-        razorpayPlanId: subscription.razorpay_plan_id,
-        amount: Number(subscription.total || 0),
-        startDate: subscription.created_at,
-        nextBillingDate: subscription.next_billing_date,
-        lastRenewal: billingResult.rows.find(
-          (payment) =>
-            String(payment.status).toLowerCase() === "captured" ||
-            String(payment.status).toLowerCase() === "paid",
-        )?.updated_at,
+        id: s.id,
+        customerName: s.contact_name,
+        email: s.email,
+        phone: s.contact_phone,
+        subscriptionStatus: s.subscription_status,
+        orderStatus: s.order_status,
+        paymentStatus: s.payment_status,
+        razorpaySubscriptionId: s.razorpay_subscription_id,
+        razorpayPlanId: s.razorpay_plan_id,
+        amount: Number(s.total || 0),
+        startDate: s.created_at,
+        nextBillingDate: s.next_billing_date,
+        lastRenewal,
         productItems: itemsResult.rows,
+        // Address — always an object, never throws even if all fields are null
         address: {
-          fullName: subscription.address_name || subscription.contact_name,
-          phone: subscription.address_phone || subscription.contact_phone,
-          line1: subscription.address_line_1,
-          line2: subscription.address_line_2,
-          city: subscription.city,
-          state: subscription.state,
-          pincode: subscription.pincode,
-          country: subscription.country,
-          addressType: subscription.address_type,
-          raw: subscription.shipping_address,
+          fullName: addressName,
+          phone: addressPhone,
+          line1: addressLine1,
+          line2: addressLine2,
+          city: addressCity,
+          state: addressState,
+          pincode: addressPincode,
+          country: addressCountry,
+          addressType: addressType,
+          raw: s.shipping_address || null,
         },
-        razorpayOrderId: subscription.razorpay_order_id,
-        cancelReason: subscription.cancel_reason || null,
-        cancelledBy: subscription.cancelled_by || null,
-        cancelledAt: subscription.cancelled_at || null,
+        razorpayOrderId: s.razorpay_order_id || null,
+        cancelReason: s.cancel_reason || null,
+        cancelledBy: s.cancelled_by || null,
+        cancelledAt: s.cancelled_at || null,
       },
-      billingHistory: billingResult.rows,
-      renewalOrders: renewalOrdersResult.rows,
+      // Always arrays — never null — so frontend .map() never throws
+      billingHistory: billingRows,
+      renewalOrders: renewalRows,
     });
   } catch (error) {
-    console.error(
-      "[ADMIN SUBSCRIPTIONS] Failed to load subscription details",
-      error,
-    );
-
+    // ── Production error logging (requirement §5) ──────────────────────────
+    console.error("================================");
+    console.error("[SUB DETAILS ERROR]");
+    console.error("MESSAGE:", error.message);
+    console.error("SQL MESSAGE:", error.sqlMessage);
+    console.error("SQL STATE:", error.sqlState);
+    console.error("SQL CODE:", error.code);
+    console.error("SQL:", error.sql);
+    console.error(error.stack);
+    console.error("================================");
     return res.status(500).json({
-      message: "Failed to load subscription details",
+      success: false,
+      message: error.message,
+      sqlMessage: error.sqlMessage || null,
+      code: error.code || null,
     });
   }
 };

@@ -2,6 +2,7 @@ import { query } from "../../config/database.js";
 import { randomUUID } from "crypto";
 import { cloudinary } from "../../config/cloudinary.js";
 import cache from "../../utils/cache.js";
+import { getRazorpay } from "../../config/razorpay.js";
 
 const slugify = (name) =>
   name
@@ -228,6 +229,48 @@ export const createProduct = async (req, res) => {
       isSubscriptionValue,
     ],
   );
+  if (isSubscriptionValue === 1) {
+    try {
+      console.log("[PLAN] Creating Razorpay plan for:", name);
+
+      const razorpay = getRazorpay();
+
+      const plan = await razorpay.plans.create({
+        period: "monthly",
+        interval: 1,
+        item: {
+          name,
+          amount: Math.round(Number(price) * 100),
+          currency: "INR",
+          description: description || name,
+        },
+        notes: {
+          product_id: productId,
+          source: "admin-product-create",
+        },
+      });
+
+      console.log("[PLAN] Razorpay Plan Created:", plan.id);
+
+      await query(
+        `
+      UPDATE products
+      SET razorpay_plan_id = ?
+      WHERE id = ?
+      `,
+        [plan.id, productId],
+      );
+
+      console.log("[PLAN] Saved Plan ID:", plan.id);
+    } catch (error) {
+      console.error("[RAZORPAY PLAN CREATE FAILED]", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create Razorpay subscription plan",
+      });
+    }
+  }
 
   const { rows } = await query(`SELECT * FROM products WHERE id = ? LIMIT 1`, [
     productId,
@@ -262,6 +305,31 @@ export const updateProduct = async (req, res) => {
       displayOrder,
       is_subscription, // snake_case from frontend payload
     } = req.body;
+
+    const { rows: existingRows } = await query(
+      `
+  SELECT
+    id,
+    name,
+    description,
+    price,
+    is_subscription,
+    razorpay_plan_id
+  FROM products
+  WHERE id = ?
+  LIMIT 1
+  `,
+      [req.params.id],
+    );
+
+    if (!existingRows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Product not found",
+      });
+    }
+
+    const existingProduct = existingRows[0];
 
     const updates = ["updated_at = now()"];
     const params = [];
@@ -345,6 +413,69 @@ export const updateProduct = async (req, res) => {
 
     const sql = `UPDATE products SET ${updates.join(", ")} WHERE id = ?`;
     await query(sql, params);
+    const oldSubscription = Number(existingProduct.is_subscription);
+
+    const newSubscription =
+      is_subscription !== undefined
+        ? normalizeIsSubscription(is_subscription)
+        : oldSubscription;
+
+    const oldPrice = Number(existingProduct.price);
+
+    const newPrice = price !== undefined ? Number(price) : oldPrice;
+
+    const shouldCreatePlan =
+      (oldSubscription === 0 && newSubscription === 1) ||
+      (oldSubscription === 1 && newSubscription === 1 && oldPrice !== newPrice);
+
+    if (shouldCreatePlan) {
+      try {
+        console.log(
+          "[PLAN] Creating Razorpay plan for:",
+          name || existingProduct.name,
+        );
+
+        const razorpay = getRazorpay();
+
+        const plan = await razorpay.plans.create({
+          period: "monthly",
+          interval: 1,
+          item: {
+            name: name || existingProduct.name,
+            amount: Math.round(newPrice * 100),
+            currency: "INR",
+            description:
+              description ||
+              existingProduct.description ||
+              existingProduct.name,
+          },
+          notes: {
+            product_id: req.params.id,
+            source: "admin-product-update",
+          },
+        });
+
+        console.log("[PLAN] Razorpay Plan Created:", plan.id);
+
+        await query(
+          `
+      UPDATE products
+      SET razorpay_plan_id = ?
+      WHERE id = ?
+      `,
+          [plan.id, req.params.id],
+        );
+
+        console.log("[PLAN] Saved Plan ID:", plan.id);
+      } catch (error) {
+        console.error("[RAZORPAY PLAN CREATE FAILED]", error);
+
+        return res.status(500).json({
+          success: false,
+          message: "Failed to create Razorpay subscription plan",
+        });
+      }
+    }
 
     const { rows } = await query(
       `SELECT * FROM products WHERE id = ? LIMIT 1`,

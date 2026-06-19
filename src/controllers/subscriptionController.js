@@ -27,13 +27,10 @@ const toMySQLDateTime = (date) => {
 };
 
 export const createSubscription = async (req, res) => {
-  // ── FIX: use req.user.id throughout — req.userId is never set by auth middleware ──
-  // The auth middleware populates req.user = { id, name, email }.
-  // req.userId does not exist and is always undefined.
   const userId = req.user?.id || null;
 
   console.log("[SUBSCRIPTION] createSubscription called", {
-    userId, // FIX: was req.userId (always undefined)
+    userId,
     email: req.body?.email,
     itemCount: req.body?.items?.length,
     hasCustomerName: !!req.body?.customerName,
@@ -50,7 +47,6 @@ export const createSubscription = async (req, res) => {
     addressId,
   } = req.body;
 
-  // ── Guard 1: items array ────────────────────────────────────────────────────
   if (!Array.isArray(items) || items.length === 0) {
     console.warn("[SUBSCRIPTION] Rejected: items missing or empty", {
       items,
@@ -61,8 +57,6 @@ export const createSubscription = async (req, res) => {
       .json({ message: "Subscription requires at least one item" });
   }
 
-  // ── Guard 2: required customer fields ────────────────────────────────────────
-  // Log exactly which field is missing so the 400 reason is visible in server logs.
   if (!customerName || !email || !mobileNumber || !shippingAddress) {
     console.warn("[SUBSCRIPTION] Rejected: missing required fields", {
       hasCustomerName: !!customerName,
@@ -89,7 +83,6 @@ export const createSubscription = async (req, res) => {
         .json({ message: "Invalid subscription item provided" });
     }
 
-    // ── FIX: wrap each DB query in try/catch so failures surface immediately ──
     let productRows;
     try {
       const result = await query(
@@ -143,7 +136,60 @@ export const createSubscription = async (req, res) => {
     });
   }
 
-  // ── Razorpay calls — wrapped individually so failures are logged precisely ──
+  // ── Duplicate active-subscription guard ─────────────────────────────────
+  // A user may not start a second subscription for the same product while
+  // an existing one is still active/authenticated/pending/paused. They may
+  // re-subscribe once the prior one is cancelled/expired/completed.
+  // This MUST run before getRazorpay()/plan lookup/subscriptions.create()
+  // so that a duplicate request never creates a Razorpay subscription, an
+  // order, an order_item, or a payment record.
+  try {
+    const duplicateProductId = validatedItems[0].product_id;
+
+    const { rows: existingSubRows } = await query(
+      `SELECT o.id,
+              o.subscription_status,
+              oi.product_id
+       FROM orders o
+       JOIN order_items oi
+         ON oi.order_id = o.id
+       WHERE o.user_id = ?
+         AND oi.product_id = ?
+         AND o.is_subscription = 1
+         AND o.subscription_status IN (
+             'active',
+             'authenticated',
+             'pending',
+             'paused',
+             'cancellation_requested'
+         )
+       LIMIT 1`,
+      [userId, duplicateProductId],
+    );
+
+    if (existingSubRows.length) {
+      console.warn("[SUBSCRIPTION] Rejected: duplicate active subscription", {
+        userId,
+        productId: duplicateProductId,
+        existingOrderId: existingSubRows[0].id,
+        existingStatus: existingSubRows[0].subscription_status,
+      });
+      return res.status(409).json({
+        success: false,
+        message:
+          "You already have an active subscription for this product. Please manage it from My Subscriptions.",
+      });
+    }
+  } catch (dupErr) {
+    console.error("[SUBSCRIPTION] Duplicate-check query failed", {
+      message: dupErr?.message || String(dupErr),
+      stack: dupErr?.stack,
+    });
+    return res
+      .status(500)
+      .json({ message: "Failed to validate existing subscriptions" });
+  }
+
   let rzp;
   try {
     rzp = getRazorpay();
@@ -164,53 +210,49 @@ export const createSubscription = async (req, res) => {
 
   const amountInPaise = Math.round(serverTotal * 100);
 
-  // ── Plan reuse logic ────────────────────────────────────────────────────────
+  // ── Use product-level Razorpay plan ─────────────────────────────
   let razorpayPlanId;
+
   try {
-    const { rows: existingPlans } = await query(
-      `SELECT razorpay_plan_id FROM razorpay_plans
-       WHERE amount_paise = ? AND period = 'monthly' AND interval_val = 1
-       LIMIT 1`,
-      [amountInPaise],
+    if (validatedItems.length !== 1) {
+      return res.status(400).json({
+        message: "Only one subscription product is allowed",
+      });
+    }
+
+    const productId = validatedItems[0].product_id;
+
+    const { rows: productRows } = await query(
+      `SELECT id, name, razorpay_plan_id, is_subscription
+       FROM products WHERE id = ? LIMIT 1`,
+      [productId],
     );
 
-    if (existingPlans.length > 0) {
-      razorpayPlanId = existingPlans[0].razorpay_plan_id;
-      console.log("[SUBSCRIPTION] Reusing plan:", razorpayPlanId);
-    } else {
-      const newPlan = await rzp.plans.create({
-        period: "monthly",
-        interval: 1,
-        item: {
-          name: planName,
-          amount: amountInPaise,
-          currency: "INR",
-          description: "30-day recurring wellness subscription",
-        },
-      });
-      razorpayPlanId = newPlan.id;
-
-      await query(
-        `INSERT INTO razorpay_plans
-         (id, razorpay_plan_id, amount_paise, period, interval_val, plan_name)
-         VALUES (?, ?, ?, 'monthly', 1, ?)`,
-        [randomUUID(), razorpayPlanId, amountInPaise, planName],
-      );
-      console.log("[SUBSCRIPTION] Created new plan:", razorpayPlanId);
+    if (!productRows.length) {
+      return res.status(404).json({ message: "Product not found" });
     }
-  } catch (planErr) {
-    // Surface the real error — Razorpay returns plain objects, not Error instances,
-    // so log both the object and message/stack if present.
-    console.error("[SUBSCRIPTION] Plan create/fetch failed", {
-      message:
-        planErr?.message || planErr?.error?.description || String(planErr),
-      statusCode: planErr?.statusCode,
-      error: planErr?.error || planErr,
-      stack: planErr?.stack,
-    });
+
+    const product = productRows[0];
+
+    if (!product.is_subscription) {
+      return res.status(400).json({
+        message: "Selected product is not a subscription product",
+      });
+    }
+
+    if (!product.razorpay_plan_id) {
+      return res.status(400).json({
+        message: "Subscription plan not configured for this product",
+      });
+    }
+
+    razorpayPlanId = product.razorpay_plan_id;
+    console.log("[SUBSCRIPTION] Using Product Plan:", razorpayPlanId);
+  } catch (error) {
+    console.error("[SUBSCRIPTION] Failed to load product plan", error);
     return res
       .status(500)
-      .json({ message: "Failed to create subscription plan" });
+      .json({ message: "Failed to load subscription plan" });
   }
 
   // ── Create Razorpay subscription ────────────────────────────────────────────
@@ -218,7 +260,10 @@ export const createSubscription = async (req, res) => {
   try {
     subscription = await rzp.subscriptions.create({
       plan_id: razorpayPlanId,
-      total_count: 120,
+      // 12 billing cycles = 1 year. The subscription auto-halts after 12 charges
+      // unless renewed. Razorpay does not enforce this on the gateway side for
+      // all plan types — treat it as a soft cap and handle renewal in the webhook.
+      total_count: 12,
       quantity: 1,
       customer_notify: 1,
       notes: {
@@ -239,9 +284,10 @@ export const createSubscription = async (req, res) => {
       .json({ message: "Failed to create Razorpay subscription" });
   }
 
-  const nextBillingDate = subscription.current_end
-    ? toMySQLDateTime(subscription.current_end * 1000)
-    : null;
+  // next_billing_date is null at creation — Razorpay only populates current_end
+  // after the first payment is captured. The webhook (subscription.activated)
+  // writes the real value once the subscription goes live.
+  const nextBillingDate = null;
 
   // ── DB transaction ───────────────────────────────────────────────────────────
   const client = await getClient();
@@ -252,7 +298,7 @@ export const createSubscription = async (req, res) => {
 
     console.log("[SUBSCRIPTION] Inserting order", {
       orderId,
-      userId, // FIX: was req.userId (always undefined)
+      userId,
       subscriptionId: subscription.id,
       planId: razorpayPlanId,
       amount: serverTotal,
@@ -274,7 +320,7 @@ export const createSubscription = async (req, res) => {
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?)`,
       [
         orderId,
-        userId, // FIX: was req.userId (always undefined) — now req.user?.id
+        userId,
         addressId || null,
         customerName,
         email,
@@ -325,13 +371,7 @@ export const createSubscription = async (req, res) => {
       `INSERT INTO order_status_history (
         order_id, previous_status, new_status, changed_by, notes
       ) VALUES (?, ?, ?, ?, ?)`,
-      [
-        orderId,
-        null,
-        "pending",
-        userId, // FIX: was req.userId (always undefined) — now req.user?.id
-        "Subscription order created",
-      ],
+      [orderId, null, "pending", userId, "Subscription order created"],
     );
 
     await client.query("COMMIT");
@@ -361,9 +401,6 @@ export const createSubscription = async (req, res) => {
     });
   } catch (err) {
     await client.query("ROLLBACK");
-    // FIX: log full error details before re-throwing so the failure is
-    // always visible in server logs, even when Express error handler
-    // swallows the detail.
     console.error("[SUBSCRIPTION] DB transaction failed", {
       message: err?.message || String(err),
       code: err?.code,
@@ -379,7 +416,6 @@ export const createSubscription = async (req, res) => {
 
 export const getMySubscriptions = async (req, res) => {
   try {
-    // FIX: use req.user.id — req.userId is never set by auth middleware
     const userId = req.user?.id;
 
     const { rows } = await query(
@@ -440,6 +476,64 @@ export const getMySubscriptions = async (req, res) => {
       return acc;
     }, []);
 
+    const rzp = getRazorpay();
+
+    for (const sub of subscriptions) {
+      if (!sub.razorpay_subscription_id) continue;
+
+      try {
+        const liveSub = await rzp.subscriptions.fetch(
+          sub.razorpay_subscription_id,
+        );
+
+        if (!liveSub) {
+          console.warn(
+            "[SUBSCRIPTION FETCH] Empty response",
+            sub.razorpay_subscription_id,
+          );
+          continue;
+        }
+
+        const { rows: currentRows } = await query(
+          `SELECT subscription_status
+   FROM orders
+   WHERE razorpay_subscription_id = ?`,
+          [sub.razorpay_subscription_id],
+        );
+
+        const currentStatus = currentRows[0]?.subscription_status;
+
+        const finalStatus =
+          currentStatus === "cancellation_requested"
+            ? "cancellation_requested"
+            : liveSub.status;
+        console.log("[SYNC STATUS]", {
+          currentStatus,
+          razorpayStatus: liveSub.status,
+          finalStatus,
+        });
+
+        sub.subscription_status = finalStatus;
+
+        if (liveSub.charge_at) {
+          sub.next_billing_date = new Date(liveSub.charge_at * 1000);
+        }
+
+        await query(
+          `UPDATE orders
+   SET subscription_status = ?, next_billing_date = ?
+   WHERE razorpay_subscription_id = ?`,
+          [finalStatus, sub.next_billing_date, sub.razorpay_subscription_id],
+        );
+      } catch (err) {
+        console.error(
+          "[SUBSCRIPTION SYNC FAILED]",
+          sub.razorpay_subscription_id,
+          err.message,
+        );
+      }
+    }
+
     res.json(subscriptions);
   } catch (error) {
     console.error("[SUBSCRIPTION] Failed to load subscriptions", {
@@ -450,85 +544,158 @@ export const getMySubscriptions = async (req, res) => {
   }
 };
 
+// ── Shared DB update helper ─────────────────────────────────────────────────
+// Builds a dynamic UPDATE so callers only specify the fields that change.
+// Always writes updated_at and appends a history row.
+
 const updateSubscriptionOrder = async ({
   orderId,
   subscriptionStatus,
   orderStatus,
+  paymentStatus,
   nextBillingDate,
   notes,
 }) => {
   const updates = [];
   const params = [];
-  if (subscriptionStatus) {
+
+  if (subscriptionStatus !== undefined) {
     updates.push("subscription_status = ?");
     params.push(subscriptionStatus);
   }
-  if (orderStatus) {
+  if (orderStatus !== undefined) {
     updates.push("order_status = ?");
     params.push(orderStatus);
   }
+  if (paymentStatus !== undefined) {
+    updates.push("payment_status = ?");
+    params.push(paymentStatus);
+  }
+  // nextBillingDate uses explicit undefined check so callers can pass null
+  // to clear the field (null !== undefined).
   if (nextBillingDate !== undefined) {
     updates.push("next_billing_date = ?");
     params.push(nextBillingDate);
   }
+
   if (!updates.length) return;
 
   params.push(orderId);
   await query(
-    `UPDATE orders SET ${updates.join(", ")}, updated_at = now() WHERE id = ?`,
+    `UPDATE orders SET ${updates.join(", ")}, updated_at = NOW() WHERE id = ?`,
     params,
   );
 
   await query(
-    `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes)
+    `INSERT INTO order_status_history
+       (order_id, previous_status, new_status, changed_by, notes)
      VALUES (?, ?, ?, ?, ?)`,
     [
       orderId,
       null,
-      orderStatus || subscriptionStatus || "updated",
+      orderStatus ?? subscriptionStatus ?? "updated",
       null,
-      notes || null,
+      notes ?? null,
     ],
   );
 };
 
+// ── cancelSubscription ──────────────────────────────────────────────────────
+// The frontend passes the Razorpay subscription ID (e.g. sub_T2yIPEmAk4nnTn),
+// NOT the internal orders.id. The lookup must use razorpay_subscription_id.
+
 export const cancelSubscription = async (req, res) => {
-  const { id } = req.params;
-  // FIX: use req.user.id — req.userId is never set by auth middleware
+  // req.params.id = Razorpay subscription ID sent by the frontend
+  const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
 
   try {
+    // ── Look up order by Razorpay subscription ID ──────────────────────────
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id, order_status, contact_email, contact_name FROM orders WHERE id = ? AND user_id = ? AND is_subscription = 1",
-      [id, userId],
+      `SELECT id, razorpay_subscription_id, order_status, contact_email, contact_name
+       FROM orders
+       WHERE razorpay_subscription_id = ?
+         AND user_id = ?
+         AND is_subscription = 1`,
+      [razorpaySubscriptionId, userId],
     );
 
     if (!rows.length) {
+      console.warn("[CANCEL] Subscription not found", {
+        razorpaySubscriptionId,
+        userId,
+      });
       return res.status(404).json({ message: "Subscription not found" });
     }
 
     const order = rows[0];
-    if (!order.razorpay_subscription_id) {
-      return res.status(400).json({
-        message: "Subscription does not have a Razorpay subscription ID",
+
+    // Debug log after order is confirmed to exist
+    console.log("[CANCEL]", {
+      routeId: razorpaySubscriptionId,
+      dbSubscriptionId: order.razorpay_subscription_id,
+      orderId: order.id,
+      currentStatus: order.order_status,
+    });
+
+    // ── Cancel on Razorpay ─────────────────────────────────────────────────
+    // cancel_at_cycle_end: 1 → subscription stays active until the end of the
+    //   current billing period, then cancels automatically. The customer gets
+    //   the service they already paid for.
+    // cancel_at_cycle_end: 0 → immediate cancellation with no refund for the
+    //   remaining days. Use only when explicitly requested or for fraud/abuse.
+    const rzp = getRazorpay();
+    let response;
+    try {
+      response = await rzp.subscriptions.cancel(
+        order.razorpay_subscription_id,
+        {
+          cancel_at_cycle_end: 1,
+          customer_notify: 1,
+        },
+      );
+    } catch (rzpErr) {
+      console.error("[CANCEL] Razorpay API call failed", {
+        razorpaySubscriptionId: order.razorpay_subscription_id,
+        message:
+          rzpErr?.message || rzpErr?.error?.description || String(rzpErr),
+        statusCode: rzpErr?.statusCode,
+        error: rzpErr?.error || rzpErr,
+      });
+      return res.status(502).json({
+        message:
+          "Failed to cancel subscription with the payment gateway. Please try again.",
       });
     }
 
-    const rzp = getRazorpay();
-    const response = await rzp.subscriptions.cancel(
-      order.razorpay_subscription_id,
-      {
-        cancel_at_cycle_end: 1,
-        customer_notify: 1,
-      },
-    );
-
-    await updateSubscriptionOrder({
-      orderId: order.id,
-      subscriptionStatus: response.status || "cancelled",
-      orderStatus: "cancelled",
-      notes: "Subscription cancellation requested",
+    console.log("[RAZORPAY CANCEL RESPONSE]", {
+      subscriptionId: order.razorpay_subscription_id,
+      status: response.status,
+      cancelAt: response.cancel_at,
+      endAt: response.end_at,
     });
+
+    // ── Update DB ──────────────────────────────────────────────────────────
+    // When cancel_at_cycle_end: 1, Razorpay returns status "active" (not
+    // "cancelled") until the cycle ends. We write the Razorpay status as-is
+    // so the DB reflects reality; the webhook (subscription.cancelled) will
+    // set it to "cancelled" when the cycle actually ends.
+    try {
+      await updateSubscriptionOrder({
+        orderId: order.id,
+        subscriptionStatus: "cancellation_requested",
+        orderStatus: "active",
+        notes: "Subscription cancellation requested by user",
+      });
+    } catch (dbErr) {
+      // Razorpay already cancelled — log and continue so the response still
+      // reaches the client. The webhook will sync the DB as a fallback.
+      console.error("[CANCEL] DB update failed after Razorpay cancel", {
+        orderId: order.id,
+        message: dbErr?.message || String(dbErr),
+        stack: dbErr?.stack,
+      });
+    }
 
     sendSubscriptionCancellationEmail({
       to: order.contact_email,
@@ -537,104 +704,203 @@ export const cancelSubscription = async (req, res) => {
       subscriptionId: order.razorpay_subscription_id,
     }).catch((err) => console.error("[EMAIL] Cancellation email failed", err));
 
-    res.json({ success: true, subscription_status: response.status });
+    return res.json({ success: true, subscription_status: response.status });
   } catch (error) {
-    console.error("[SUBSCRIPTION] cancelSubscription failed", {
-      message: error?.message || error?.error?.description || String(error),
-      statusCode: error?.statusCode,
+    console.error("[CANCEL] Unexpected error", {
+      razorpaySubscriptionId,
+      message: error?.message || String(error),
+      stack: error?.stack,
     });
-    res.status(502).json({
-      message:
-        "Failed to cancel subscription with the payment gateway. Please try again.",
+    return res.status(500).json({
+      message: "An unexpected error occurred. Please try again.",
     });
   }
 };
+
+// ── pauseSubscription ───────────────────────────────────────────────────────
+// The frontend passes the Razorpay subscription ID, not orders.id.
 
 export const pauseSubscription = async (req, res) => {
-  const { id } = req.params;
-  // FIX: use req.user.id — req.userId is never set by auth middleware
+  const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
 
   try {
+    // ── FIX: look up by razorpay_subscription_id, not orders.id ───────────
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id FROM orders WHERE id = ? AND user_id = ? AND is_subscription = 1",
-      [id, userId],
+      `SELECT id, razorpay_subscription_id
+       FROM orders
+       WHERE razorpay_subscription_id = ?
+         AND user_id = ?
+         AND is_subscription = 1`,
+      [razorpaySubscriptionId, userId],
     );
 
     if (!rows.length) {
+      console.warn("[PAUSE] Subscription not found", {
+        razorpaySubscriptionId,
+        userId,
+      });
       return res.status(404).json({ message: "Subscription not found" });
     }
 
     const order = rows[0];
-    if (!order.razorpay_subscription_id) {
-      return res.status(400).json({
-        message: "Subscription does not have a Razorpay subscription ID",
+
+    console.log("[PAUSE]", {
+      razorpaySubscriptionId: order.razorpay_subscription_id,
+      orderId: order.id,
+    });
+
+    // ── Pause on Razorpay ──────────────────────────────────────────────────
+    // pause_at_cycle_end: 0 → pause takes effect immediately.
+    // pause_at_cycle_end: 1 → pause at end of current billing cycle.
+    const rzp = getRazorpay();
+    console.log("RAZORPAY VERSION TEST");
+    console.log("subscriptions:", rzp.subscriptions);
+    console.log("pause method:", typeof rzp.subscriptions.pause);
+    console.log("resume method:", typeof rzp.subscriptions.resume);
+    let response;
+    try {
+      console.log("PAUSING SUB:", order.razorpay_subscription_id);
+
+      response = await rzp.subscriptions.pause(order.razorpay_subscription_id, {
+        pause_at_cycle_end: 0,
+        customer_notify: 1,
+      });
+
+      console.log("PAUSE RAW RESPONSE:", response);
+    } catch (rzpErr) {
+      console.error("[PAUSE] Razorpay API call failed", {
+        razorpaySubscriptionId: order.razorpay_subscription_id,
+        message:
+          rzpErr?.message || rzpErr?.error?.description || String(rzpErr),
+        statusCode: rzpErr?.statusCode,
+        error: rzpErr?.error || rzpErr,
+      });
+      return res.status(502).json({
+        message:
+          "Failed to pause subscription with the payment gateway. Please try again.",
       });
     }
 
-    const rzp = getRazorpay();
-    const response = await rzp.subscriptions.pause(
-      order.razorpay_subscription_id,
-      {
-        pause_at_cycle_end: 0,
-        customer_notify: 1,
-      },
-    );
-
-    await updateSubscriptionOrder({
-      orderId: order.id,
-      subscriptionStatus: response.status || "paused",
-      notes: "Subscription paused",
+    console.log("[RAZORPAY PAUSE RESPONSE]", {
+      subscriptionId: order.razorpay_subscription_id,
+      status: response.status,
     });
 
-    res.json({ success: true, subscription_status: response.status });
+    // ── Update DB ──────────────────────────────────────────────────────────
+    // Pausing clears the next charge date — set next_billing_date to null
+    // so the UI doesn't show a stale date. The webhook (subscription.charged)
+    // will populate it again when the subscription resumes and charges.
+    try {
+      await updateSubscriptionOrder({
+        orderId: order.id,
+        subscriptionStatus: "paused",
+        orderStatus: "active",
+        notes: "Subscription paused by user",
+      });
+    } catch (dbErr) {
+      console.error("[PAUSE] DB update failed after Razorpay pause", {
+        orderId: order.id,
+        message: dbErr?.message || String(dbErr),
+        stack: dbErr?.stack,
+      });
+    }
+
+    return res.json({ success: true, subscription_status: response.status });
   } catch (error) {
-    console.error("[SUBSCRIPTION] pauseSubscription failed", {
-      message: error?.message || error?.error?.description || String(error),
-      statusCode: error?.statusCode,
+    console.error("[PAUSE] Unexpected error", {
+      razorpaySubscriptionId,
+      message: error?.message || String(error),
+      stack: error?.stack,
     });
-    res.status(502).json({
-      message:
-        "Failed to pause subscription with the payment gateway. Please try again.",
+    return res.status(500).json({
+      message: "An unexpected error occurred. Please try again.",
     });
   }
 };
 
+// ── resumeSubscription ──────────────────────────────────────────────────────
+// The frontend passes the Razorpay subscription ID, not orders.id.
+
 export const resumeSubscription = async (req, res) => {
-  const { id } = req.params;
-  // FIX: use req.user.id — req.userId is never set by auth middleware
+  const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
 
   try {
+    // ── FIX: look up by razorpay_subscription_id, not orders.id ───────────
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id, contact_email, contact_name FROM orders WHERE id = ? AND user_id = ? AND is_subscription = 1",
-      [id, userId],
+      `SELECT id, razorpay_subscription_id, contact_email, contact_name
+       FROM orders
+       WHERE razorpay_subscription_id = ?
+         AND user_id = ?
+         AND is_subscription = 1`,
+      [razorpaySubscriptionId, userId],
     );
 
     if (!rows.length) {
+      console.warn("[RESUME] Subscription not found", {
+        razorpaySubscriptionId,
+        userId,
+      });
       return res.status(404).json({ message: "Subscription not found" });
     }
 
     const order = rows[0];
-    if (!order.razorpay_subscription_id) {
-      return res.status(400).json({
-        message: "Subscription does not have a Razorpay subscription ID",
+
+    console.log("[RESUME]", {
+      razorpaySubscriptionId: order.razorpay_subscription_id,
+      orderId: order.id,
+    });
+
+    // ── Resume on Razorpay ─────────────────────────────────────────────────
+    const rzp = getRazorpay();
+    let response;
+    try {
+      response = await rzp.subscriptions.resume(
+        order.razorpay_subscription_id,
+        { customer_notify: 1 },
+      );
+    } catch (rzpErr) {
+      console.error("[RESUME] Razorpay API call failed", {
+        razorpaySubscriptionId: order.razorpay_subscription_id,
+        message:
+          rzpErr?.message || rzpErr?.error?.description || String(rzpErr),
+        statusCode: rzpErr?.statusCode,
+        error: rzpErr?.error || rzpErr,
+      });
+      return res.status(502).json({
+        message:
+          "Failed to resume subscription with the payment gateway. Please try again.",
       });
     }
 
-    const rzp = getRazorpay();
-    const response = await rzp.subscriptions.resume(
-      order.razorpay_subscription_id,
-      {
-        customer_notify: 1,
-      },
-    );
-
-    await updateSubscriptionOrder({
-      orderId: order.id,
-      subscriptionStatus: response.status || "active",
-      notes: "Subscription resumed",
+    console.log("[RAZORPAY RESUME RESPONSE]", {
+      subscriptionId: order.razorpay_subscription_id,
+      status: response.status,
+      chargeAt: response.charge_at,
     });
+
+    // ── Update DB ──────────────────────────────────────────────────────────
+    // Razorpay returns charge_at (Unix timestamp) on resume — write it as the
+    // next_billing_date so the UI immediately shows when the next charge is.
+    const nextBillingDate = response.charge_at
+      ? toMySQLDateTime(response.charge_at * 1000)
+      : undefined; // undefined = don't touch the column if Razorpay didn't return it
+
+    try {
+      await updateSubscriptionOrder({
+        orderId: order.id,
+        subscriptionStatus: response.status || "active",
+        nextBillingDate,
+        notes: "Subscription resumed by user",
+      });
+    } catch (dbErr) {
+      console.error("[RESUME] DB update failed after Razorpay resume", {
+        orderId: order.id,
+        message: dbErr?.message || String(dbErr),
+        stack: dbErr?.stack,
+      });
+    }
 
     sendSubscriptionResumeEmail({
       to: order.contact_email,
@@ -643,15 +909,15 @@ export const resumeSubscription = async (req, res) => {
       subscriptionId: order.razorpay_subscription_id,
     }).catch((err) => console.error("[EMAIL] Resume email failed", err));
 
-    res.json({ success: true, subscription_status: response.status });
+    return res.json({ success: true, subscription_status: response.status });
   } catch (error) {
-    console.error("[SUBSCRIPTION] resumeSubscription failed", {
-      message: error?.message || error?.error?.description || String(error),
-      statusCode: error?.statusCode,
+    console.error("[RESUME] Unexpected error", {
+      razorpaySubscriptionId,
+      message: error?.message || String(error),
+      stack: error?.stack,
     });
-    res.status(502).json({
-      message:
-        "Failed to resume subscription with the payment gateway. Please try again.",
+    return res.status(500).json({
+      message: "An unexpected error occurred. Please try again.",
     });
   }
 };
