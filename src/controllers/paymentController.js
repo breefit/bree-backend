@@ -8,11 +8,36 @@ import { query, getClient } from "../config/database.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Build Razorpay Magic Checkout line_items from server-validated cart items
+// (DB-verified price/name/image from `validatedItems` — never the frontend's
+// own line_items, to stay consistent with this endpoint's existing "don't
+// trust frontend pricing" pattern).
+//
+// NOTE: variant_id is mandatory per Razorpay's docs. BREE's products table
+// has no distinct variant concept today, so this falls back to product id.
+// Update if/when real product variants are introduced.
+// ─────────────────────────────────────────────────────────────────────────────
+const buildLineItemsFromValidatedItems = (validatedItems) =>
+  validatedItems.map((item) => {
+    const unitPricePaise = Math.round(item.price * 100);
+    return {
+      sku: String(item.product_id),
+      variant_id: String(item.product_id),
+      name: item.name,
+      description: item.name,
+      image_url: item.image || "",
+      price: unitPricePaise,
+      offer_price: unitPricePaise, // no per-item discount applied currently
+      quantity: item.quantity,
+    };
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/create-order
 //
-// Magic Checkout flow: frontend sends only cart items (and optionally pre-fill
-// fields). Customer name/email/phone/address are collected inside the Razorpay
-// popup and returned after payment in the verify call.
+// Magic Checkout flow: frontend sends cart items plus line_items/
+// line_items_total. Customer name/email/phone/address are collected inside
+// the Razorpay popup and returned after payment in the verify call.
 //
 // Legacy flow (non-Magic): frontend sends customerName, email, mobileNumber,
 // shippingAddress upfront — still supported for backward compat.
@@ -32,6 +57,7 @@ export const createOrder = async (req, res) => {
     mobileNumber,
     shippingAddress,
     addressId,
+    line_items, // NEW — presence/non-empty signals a Magic Checkout request
   } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -86,6 +112,12 @@ export const createOrder = async (req, res) => {
       price: itemPrice,
     });
   }
+
+  // NEW — presence of a non-empty line_items array from the frontend signals
+  // this is a Magic Checkout request. The values themselves are NOT trusted;
+  // see buildLineItemsFromValidatedItems above.
+  const isMagicCheckout = Array.isArray(line_items) && line_items.length > 0;
+  console.info("[CREATE_ORDER] isMagicCheckout:", isMagicCheckout);
 
   // If frontend supplied an amount, sanity-check it (allow ₹1 tolerance for
   // floating-point rounding). If absent (Magic Checkout), skip the check.
@@ -172,11 +204,23 @@ export const createOrder = async (req, res) => {
   let rzpOrder;
   try {
     const rzp = getRazorpay();
-    rzpOrder = await rzp.orders.create({
+
+    const orderPayload = {
       amount: Math.round(serverTotal * 100), // paise
       currency: "INR",
       receipt: `bree_${Date.now()}`,
-    });
+    };
+
+    // NEW — Magic Checkout requires line_items + line_items_total on the
+    // actual Razorpay order, or Razorpay silently serves Standard Checkout
+    // instead, regardless of any client-side option.
+    if (isMagicCheckout) {
+      orderPayload.line_items =
+        buildLineItemsFromValidatedItems(validatedItems);
+      orderPayload.line_items_total = orderPayload.amount;
+    }
+
+    rzpOrder = await rzp.orders.create(orderPayload);
   } catch (err) {
     console.error("[CREATE_ORDER] Razorpay order creation failed:", err);
     return res.status(502).json({
@@ -301,6 +345,29 @@ export const createOrder = async (req, res) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Format a Razorpay Magic Checkout `customer_details.shipping_address` object
+// into the single-string format this codebase's `orders.shipping_address`
+// column already expects (matches the comma-joined snapshot format used
+// elsewhere in the orders controller).
+// ─────────────────────────────────────────────────────────────────────────────
+const formatRazorpayShippingAddress = (addr) => {
+  if (!addr) return null;
+  return (
+    [
+      addr.name,
+      addr.line1,
+      addr.line2,
+      addr.city,
+      addr.state,
+      addr.zipcode,
+      addr.country,
+    ]
+      .filter(Boolean)
+      .join(", ") || null
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/verify
 //
 // Called by frontend after Razorpay Magic Checkout popup closes successfully.
@@ -308,9 +375,9 @@ export const createOrder = async (req, res) => {
 //   razorpay_payment_id, razorpay_order_id, razorpay_signature
 //   (and optionally) razorpay_subscription_id
 //
-// After verification the customer details supplied inside the Razorpay popup
-// (name, email, contact, shipping address) are passed by the frontend in the
-// same request body — these are written back to the pending order row.
+// For one-time (non-subscription) orders, customer/address details are
+// fetched directly from Razorpay's Order API as the source of truth — see
+// the new block below — rather than trusted from the frontend request body.
 // ─────────────────────────────────────────────────────────────────────────────
 export const verifyPayment = async (req, res) => {
   const {
@@ -414,9 +481,12 @@ export const verifyPayment = async (req, res) => {
   const dbTotal = Number(order.total ?? order.amount ?? 0);
   const isSubscriptionOrder = Boolean(order.is_subscription);
 
-  // ── Verify payment amount against Razorpay API ────────────────────────────────────
+  // ── Verify payment amount against Razorpay API ────────────────────────────
   // Fetches the authoritative amount from Razorpay to prevent tampering.
   // Skipped for subscription orders (amount is set by the plan, not order total).
+  // FIX 3: If the Razorpay API call fails due to a transient network/API issue,
+  // log the error and continue — the HMAC signature above already proves the
+  // payment is authentic. Do not return 502 and block a confirmed payment.
   if (!isSubscriptionOrder) {
     try {
       const rzp = getRazorpay();
@@ -433,17 +503,41 @@ export const verifyPayment = async (req, res) => {
         });
       }
     } catch (err) {
+      // Transient Razorpay API failure — HMAC signature already verified above.
+      // Do NOT block the customer. Log for ops follow-up; webhook will reconcile.
       console.error(
-        "[VERIFY_PAYMENT] Razorpay payment fetch failed:",
+        "[VERIFY_PAYMENT] Razorpay payment fetch failed — continuing on HMAC trust:",
         err?.message || err,
       );
-      return res.status(502).json({
-        success: false,
-        message:
-          "Could not verify payment with Razorpay. Please contact support.",
-      });
+      // Fall through; amount check skipped on API error only.
     }
   }
+
+  // ── NEW: Fetch authoritative customer/address details from Razorpay ───────
+  // Magic Checkout (One-time orders only)
+  //
+  // Only applicable to one-time orders. For legacy/Standard Checkout orders,
+  // Razorpay's Fetch Order response simply won't contain `customer_details`,
+  // so this stays null and every downstream fallback below behaves exactly
+  // as it did before this change. Intentionally non-fatal: a failure here
+  // must not block payment confirmation — the payment is already verified
+  // by signature + amount above.
+  let razorpayCustomerDetails = null;
+  if (!isSubscriptionOrder && razorpay_order_id) {
+    try {
+      const rzp = getRazorpay();
+      const rzpOrderDetails = await rzp.orders.fetch(razorpay_order_id);
+      if (rzpOrderDetails?.customer_details) {
+        razorpayCustomerDetails = rzpOrderDetails.customer_details;
+      }
+    } catch (err) {
+      console.warn(
+        "[VERIFY_PAYMENT] Could not fetch Razorpay order for customer_details — continuing without it",
+        err?.message || err,
+      );
+    }
+  }
+
   // ── Already paid? ─────────────────────────────────────────────────────────
   if (order.payment_status === "paid") {
     if (order.razorpay_payment_id === razorpay_payment_id) {
@@ -464,6 +558,14 @@ export const verifyPayment = async (req, res) => {
       message: "Order already processed with a different payment id",
     });
   }
+
+  // FIX 2: Hoist resolved customer detail variables outside the transaction
+  // block so they are accessible when sending the confirmation email below.
+  // These are populated inside the transaction and used after it commits.
+  let resolvedName;
+  let resolvedEmail;
+  let resolvedPhone;
+  let resolvedAddress;
 
   // ── Transaction: confirm order, reduce stock, record payment history ──────
   const client = await getClient();
@@ -487,16 +589,36 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    // Merge customer details: prefer Magic Checkout values from this request,
-    // fall back to whatever was stored at create-order time.
-    const resolvedName =
-      customerName || lockedOrder.customer_name || lockedOrder.contact_name;
-    const resolvedEmail =
-      email || lockedOrder.email || lockedOrder.contact_email;
-    const resolvedPhone =
-      mobileNumber || lockedOrder.mobile_number || lockedOrder.contact_phone;
-    const resolvedAddress =
-      shippingAddress || lockedOrder.shipping_address || null;
+    // CHANGED — Merge customer details with new priority order:
+    // 1. Razorpay's customer_details (Magic Checkout) — source of truth
+    // 2. Frontend-supplied values from this request (legacy/Standard Checkout)
+    // 3. Whatever was stored at create-order time — final fallback
+    const razorpayShippingAddress = formatRazorpayShippingAddress(
+      razorpayCustomerDetails?.shipping_address,
+    );
+
+    // FIX 2: Assign to hoisted variables (not const) so they are visible
+    // outside this try block when the confirmation email is sent.
+    resolvedName =
+      razorpayCustomerDetails?.shipping_address?.name ||
+      customerName ||
+      lockedOrder.customer_name ||
+      lockedOrder.contact_name;
+    resolvedEmail =
+      razorpayCustomerDetails?.email ||
+      email ||
+      lockedOrder.email ||
+      lockedOrder.contact_email;
+    resolvedPhone =
+      razorpayCustomerDetails?.contact ||
+      mobileNumber ||
+      lockedOrder.mobile_number ||
+      lockedOrder.contact_phone;
+    resolvedAddress =
+      razorpayShippingAddress ||
+      shippingAddress ||
+      lockedOrder.shipping_address ||
+      null;
 
     // Validate email format if present
     if (resolvedEmail && !/^\S+@\S+\.\S+$/.test(resolvedEmail)) {
@@ -582,43 +704,50 @@ export const verifyPayment = async (req, res) => {
     }
 
     // ── Reduce stock ────────────────────────────────────────────────────────
-    // IMPORTANT — webhook safety note:
-    // Stock reduction currently happens here inside verifyPayment(), which is
-    // called synchronously by the frontend after the Razorpay popup closes.
-    //
-    // If the architecture ever shifts so that the Razorpay webhook becomes the
-    // authoritative source of truth for payment confirmation (i.e. stock is
-    // also reduced inside handleWebhook → payment.captured), you MUST ensure
-    // stock is only reduced once per order. Recommended approach:
-    //   - Add a column `stock_deducted TINYINT(1) DEFAULT 0` on orders, OR
-    //   - Check `order_status = 'confirmed'` before deducting inside the webhook
-    //     (verifyPayment sets it to 'confirmed' first; webhook sees it already done).
-    // Do NOT reduce stock in both places without that guard.
-    const { rows: items } = await client.query(
-      "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+    // FIX (audit Section 2 / Fix 2): guarded by `stock_deducted` so this can
+    // never double-deduct against the payment.captured webhook (or itself,
+    // on a retried request) — whichever of the two paths processes the order
+    // first flips the flag atomically inside this same row-locked
+    // transaction; the other sees stockGuardAffected === 0 and skips.
+    const stockGuard = await client.query(
+      `UPDATE orders SET stock_deducted = 1 WHERE id = ? AND stock_deducted = 0`,
       [order.id],
     );
+    const stockGuardAffected =
+      stockGuard.affectedRows || stockGuard.rowCount || 0;
 
-    for (const item of items) {
-      const stockResult = await client.query(
-        `UPDATE products
-         SET stock_qty = stock_qty - ?
-         WHERE id = ? AND stock_qty >= ?`,
-        [item.quantity, item.product_id, item.quantity],
+    if (stockGuardAffected > 0) {
+      const { rows: items } = await client.query(
+        "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+        [order.id],
       );
 
-      if (!stockResult.affectedRows && !stockResult.rowCount) {
-        await client.query("ROLLBACK");
-        console.warn("[VERIFY_PAYMENT] Stock insufficient — rolling back", {
-          orderId: order.id,
-          productId: item.product_id,
-        });
-        return res.status(400).json({
-          success: false,
-          message:
-            "Unable to finalise the order: one or more products ran out of stock. Please contact support.",
-        });
+      for (const item of items) {
+        const stockResult = await client.query(
+          `UPDATE products
+           SET stock_qty = stock_qty - ?
+           WHERE id = ? AND stock_qty >= ?`,
+          [item.quantity, item.product_id, item.quantity],
+        );
+
+        if (!stockResult.affectedRows && !stockResult.rowCount) {
+          await client.query("ROLLBACK");
+          console.warn("[VERIFY_PAYMENT] Stock insufficient — rolling back", {
+            orderId: order.id,
+            productId: item.product_id,
+          });
+          return res.status(400).json({
+            success: false,
+            message:
+              "Unable to finalise the order: one or more products ran out of stock. Please contact support.",
+          });
+        }
       }
+    } else {
+      console.info(
+        "[VERIFY_PAYMENT] Stock already deducted (webhook or prior request) — skipping",
+        { orderId: order.id },
+      );
     }
 
     // ── Order status history ────────────────────────────────────────────────
@@ -652,6 +781,9 @@ export const verifyPayment = async (req, res) => {
   }
 
   // ── Send confirmation email (non-blocking) ────────────────────────────────
+  // FIX 2: Use the resolved variables populated during the transaction.
+  // These correctly reflect Magic Checkout customer_details from Razorpay
+  // (or legacy/DB fallbacks), not the stale pre-transaction order snapshot.
   const { rows: itemRows } = await query(
     `SELECT product_name AS name, quantity, product_price AS price, subtotal
      FROM order_items WHERE order_id = ?`,
@@ -659,12 +791,12 @@ export const verifyPayment = async (req, res) => {
   );
 
   sendOrderConfirmationEmail({
-    to: email || order.email || order.contact_email,
-    name: customerName || order.customer_name || order.contact_name,
+    to: resolvedEmail,
+    name: resolvedName,
     orderId: order.id,
     amount: dbTotal,
     items: itemRows,
-    shippingAddress: shippingAddress || order.shipping_address || null,
+    shippingAddress: resolvedAddress,
   }).catch((err) => {
     console.error("[EMAIL] Confirmation email failed:", err?.message || err);
   });
@@ -984,11 +1116,23 @@ export const handleWebhook = async (req, res) => {
           return res.json({ status: "already_processed" });
         }
         if (order && order.payment_status !== "paid") {
-          // FIX: wrap in transaction so orders, payments, and history are
-          // updated atomically. Prevents partial writes if any query fails.
+          // FIX 1: Wrap in a transaction with a FOR UPDATE row lock so that
+          // concurrent webhook deliveries (Razorpay retries) cannot both pass
+          // the payment_status check and write duplicate history rows.
           const whClient = await getClient();
           try {
             await whClient.query("BEGIN");
+
+            // Re-read with row lock — prevents duplicate concurrent processing
+            const { rows: lockedWh } = await whClient.query(
+              "SELECT payment_status, order_status FROM orders WHERE id = ? FOR UPDATE",
+              [order.id],
+            );
+            if (lockedWh[0]?.payment_status === "paid") {
+              // Already processed (by verifyPayment or a concurrent webhook)
+              await whClient.query("COMMIT");
+              break;
+            }
 
             await whClient.query(
               `UPDATE orders SET
@@ -997,7 +1141,7 @@ export const handleWebhook = async (req, res) => {
               [order.id],
             );
 
-            // FIX: keep payments table in sync with orders table
+            // Keep payments table in sync with orders table
             await whClient.query(
               `UPDATE payments
                SET status = 'captured', razorpay_payment_id = ?, updated_at = NOW()
@@ -1005,11 +1149,54 @@ export const handleWebhook = async (req, res) => {
               [rzpPaymentId, rzpOrderId],
             );
 
+            // FIX (audit Section 2 / Fix 2): deduct stock here too, guarded
+            // by `stock_deducted` so this can never double-deduct against
+            // verifyPayment() (or a concurrent webhook retry) — whichever
+            // path reaches this row first under FOR UPDATE wins the flag;
+            // the other sees 0 affected rows and skips deduction entirely.
+            const whStockGuard = await whClient.query(
+              `UPDATE orders SET stock_deducted = 1 WHERE id = ? AND stock_deducted = 0`,
+              [order.id],
+            );
+            const whStockGuardAffected =
+              whStockGuard.affectedRows || whStockGuard.rowCount || 0;
+
+            if (whStockGuardAffected > 0) {
+              const { rows: whItems } = await whClient.query(
+                "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+                [order.id],
+              );
+
+              for (const item of whItems) {
+                // Note: unlike verifyPayment, the webhook cannot reject the
+                // payment if stock is insufficient (Razorpay already
+                // captured the charge). Clamp at 0 instead of blocking, and
+                // log loudly for manual reconciliation.
+                const whStockResult = await whClient.query(
+                  `UPDATE products
+                   SET stock_qty = GREATEST(stock_qty - ?, 0)
+                   WHERE id = ?`,
+                  [item.quantity, item.product_id],
+                );
+                if (!whStockResult.affectedRows && !whStockResult.rowCount) {
+                  console.error(
+                    "[WEBHOOK] Stock deduction found no matching product row",
+                    { orderId: order.id, productId: item.product_id },
+                  );
+                }
+              }
+            } else {
+              console.info(
+                "[WEBHOOK] Stock already deducted (verifyPayment or prior webhook) — skipping",
+                { orderId: order.id },
+              );
+            }
+
             await whClient.query(
               `INSERT INTO order_status_history
                  (order_id, previous_status, new_status, changed_by, notes)
                VALUES (?, ?, 'confirmed', NULL, 'Payment captured via webhook')`,
-              [order.id, order.order_status],
+              [order.id, lockedWh[0].order_status],
             );
 
             await whClient.query("COMMIT");

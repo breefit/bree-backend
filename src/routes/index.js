@@ -64,7 +64,18 @@ orderRouter.get("/:id/tracking", auth, getOrderTracking);
 orderRouter.get("/:id/history", auth, getOrderHistory);
 orderRouter.get("/", auth, getMyOrders);
 orderRouter.get("/:id/success", auth, getOrderSuccess);
-orderRouter.get("/:id", auth, getOrder);
+// FIX (audit Section 2 / Fix 1): switched from `auth` to `optionalAuth`.
+// CheckoutSuccess.js calls this endpoint right after payment for BOTH
+// logged-in users and guest checkouts, and Magic Checkout's popup can stay
+// open up to `timeout: 900` (15 min), so a session cookie can legitimately
+// expire mid-checkout. `auth` returned a hard 401 in both cases even though
+// getOrder's own SQL (`user_id = ? OR user_id IS NULL`) already supports
+// guest orders. optionalAuth populates req.user when a valid session exists
+// and simply proceeds as unauthenticated otherwise — security is unchanged
+// because the SQL's `user_id = ?` clause still only matches when the
+// authenticated user owns the order; non-guest orders remain inaccessible
+// without a valid session.
+orderRouter.get("/:id", optionalAuth, getOrder);
 // Checkout flow endpoints
 orderRouter.post("/validate-cart", optionalAuth, validateCart);
 orderRouter.post("/create", auth, createOrderCheckout);

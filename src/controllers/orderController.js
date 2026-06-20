@@ -387,7 +387,12 @@ export const createOrder = async (req, res) => {
 // ========================================
 export const getOrder = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    // FIX (audit Section 2 / Fix 1): route now uses optionalAuth, so
+    // req.user may be undefined for guest/expired sessions. Coerce to null
+    // (mysql2 rejects `undefined` bind params) — the existing
+    // `user_id = ? OR user_id IS NULL` clause below is unchanged, so a
+    // non-guest order still requires a matching, authenticated user_id.
+    const userId = req.user?.id || null;
     const { id } = req.params;
 
     const schemaInfo = await getOrderSchemaInfo();

@@ -261,6 +261,40 @@ try {
   // console.log("⚠️ Continuing startup without DB");
 }
 
+// FIX (audit Section 2 / Fix 2): ensure the `stock_deducted` guard column
+// exists on `orders`. This column lets verifyPayment() and the
+// payment.captured webhook safely race each other without double-deducting
+// stock. Uses the same information_schema lookup pattern as
+// utils/orderSchema.js, so it's safe to run on every boot regardless of
+// which migration tooling (if any) manages the rest of the schema.
+const ensureStockDeductedColumn = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders' AND column_name = 'stock_deducted'`,
+      [currentDb],
+    );
+
+    if (!cols.length) {
+      await pool.query(
+        "ALTER TABLE orders ADD COLUMN stock_deducted TINYINT(1) NOT NULL DEFAULT 0",
+      );
+      console.log("✅ Added orders.stock_deducted column");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure orders.stock_deducted column exists:",
+      err?.message || err,
+    );
+  }
+};
+
+await ensureStockDeductedColumn();
+
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);
 };
