@@ -646,8 +646,18 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    // Determine new statuses
-    const newOrderStatus = isSubscriptionOrder ? "active" : "confirmed";
+    // Determine new statuses.
+    // Both one-time and subscription orders move to order_status = 'confirmed'
+    // when payment is verified. 'confirmed' means payment received and the order
+    // is ready for fulfillment — it is NOT a billing concept.
+    //
+    // The original code set order_status = 'active' for subscription orders.
+    // 'active' is a subscription_status value, not a fulfillment status. That
+    // was the bug. The fix is to use 'confirmed' for both order types.
+    //
+    // subscription_status is updated separately (set to 'active' below via the
+    // conditional SQL fragment) and is the correct place for billing state.
+    const newOrderStatus = "confirmed";
     const newPaymentStatus = "paid";
 
     // Update order row — write back customer details from Magic Checkout popup
@@ -1108,23 +1118,28 @@ export const handleWebhook = async (req, res) => {
   switch (event) {
     case "payment.captured": {
       if (rzpSubscriptionId) {
-        // Subscription renewal — handled by subscription flow (do not touch)
+        // Subscription renewal — update billing/subscription fields ONLY.
+        // CRITICAL: order_status is a fulfillment field and must NEVER be
+        // overwritten by a billing event. The fulfillment team manages
+        // order_status independently (pending → confirmed → processing →
+        // dispatched → delivered).
         const order = await loadBySubscription();
         if (order) {
           await query(
             `UPDATE orders SET
-               payment_status = 'paid', order_status = 'active',
-               subscription_status = 'active', updated_at = NOW()
+               payment_status = 'paid',
+               subscription_status = 'active',
+               updated_at = NOW()
              WHERE id = ?`,
             [order.id],
           );
           await addHistory(
             order.id,
-            order.order_status,
+            order.subscription_status,
             "active",
             "Subscription payment captured",
           );
-          emitUpdate(order.id, "active");
+          emitUpdate(order.id, order.order_status);
         }
       } else if (rzpOrderId) {
         // One-time order fallback (Magic Checkout may also fire this)
@@ -1286,11 +1301,12 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
+        // CRITICAL: Only update subscription_status and billing fields.
+        // order_status is a fulfillment field — NEVER overwrite it here.
         await query(
           `UPDATE orders SET
              subscription_status = 'active',
              payment_status = 'paid',
-             order_status = 'active',
              next_billing_date = COALESCE(?, next_billing_date),
              updated_at = NOW()
            WHERE id = ?`,
@@ -1302,7 +1318,7 @@ export const handleWebhook = async (req, res) => {
           "active",
           "Subscription activated via webhook",
         );
-        emitUpdate(order.id, "active");
+        emitUpdate(order.id, order.order_status);
       }
       break;
     }
@@ -1324,11 +1340,13 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
+        // CRITICAL: Only update subscription_status and billing fields.
+        // order_status is a fulfillment field — NEVER overwrite it here.
+        // The fulfillment team manages order_status independently.
         await query(
           `UPDATE orders SET
              subscription_status = 'active',
              payment_status = 'paid',
-             order_status = 'active',
              next_billing_date = COALESCE(?, next_billing_date),
              updated_at = NOW()
            WHERE id = ?`,
@@ -1340,7 +1358,7 @@ export const handleWebhook = async (req, res) => {
           "active",
           "Subscription charged via webhook",
         );
-        emitUpdate(order.id, "active");
+        emitUpdate(order.id, order.order_status);
         // Trigger renewal receipt email (non-blocking)
         const { sendSubscriptionChargeReceiptEmail } =
           await import("../services/orderEmailService.js").catch(() => ({}));
@@ -1390,10 +1408,11 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
+        // CRITICAL: Only update subscription_status and billing fields.
+        // order_status is a fulfillment field — NEVER overwrite it here.
         await query(
           `UPDATE orders SET
              subscription_status = 'active',
-             order_status = 'active',
              next_billing_date = COALESCE(?, next_billing_date),
              updated_at = NOW()
            WHERE id = ?`,
@@ -1405,7 +1424,7 @@ export const handleWebhook = async (req, res) => {
           "active",
           "Subscription resumed via webhook",
         );
-        emitUpdate(order.id, "active");
+        emitUpdate(order.id, order.order_status);
       }
       break;
     }
@@ -1437,10 +1456,16 @@ export const handleWebhook = async (req, res) => {
       if (order) {
         // Only update if not already marked cancelled — preserves idempotency.
         if (order.subscription_status !== "cancelled") {
+          // CRITICAL: Only update subscription_status and billing fields.
+          // order_status is a fulfillment field — NEVER overwrite it here.
+          // The fulfillment team may have already progressed order_status to
+          // 'delivered' or 'dispatched' — that history must be preserved.
+          // Example of CORRECT end state:
+          //   subscription_status = 'cancelled'  (billing ended)
+          //   order_status        = 'delivered'  (fulfillment history intact)
           await query(
             `UPDATE orders SET
                subscription_status = 'cancelled',
-               order_status = 'cancelled',
                next_billing_date = NULL,
                updated_at = NOW()
              WHERE id = ?`,
@@ -1452,7 +1477,7 @@ export const handleWebhook = async (req, res) => {
             "cancelled",
             "Subscription cancelled via webhook",
           );
-          emitUpdate(order.id, "cancelled");
+          emitUpdate(order.id, order.order_status);
         }
       }
       break;

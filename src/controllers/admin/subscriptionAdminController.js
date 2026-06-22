@@ -498,10 +498,15 @@ export const cancelSubscription = async (req, res) => {
       },
     );
 
+    // CRITICAL: Only set subscription_status = 'cancellation_requested'.
+    // order_status is a fulfillment field and must NEVER be set to 'cancelled'
+    // here. The fulfillment team manages order_status independently.
+    // When Razorpay eventually fires the subscription.cancelled webhook (at
+    // billing cycle end), subscription_status will be flipped to 'cancelled'
+    // by the webhook handler — and order_status will still be untouched.
     await updateSubscriptionOrder({
       orderId: order.id,
       subscriptionStatus: "cancellation_requested",
-      orderStatus: "cancelled",
       notes: "Subscription cancelled by admin",
       cancelReason: reason || null,
       cancelledBy: admin?.email || admin?.id || null,

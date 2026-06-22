@@ -688,10 +688,12 @@ export const cancelSubscription = async (req, res) => {
     });
 
     try {
+      // CRITICAL: Only update subscription_status. order_status is a
+      // fulfillment field and must NEVER be overwritten by a billing/cancel
+      // event. The fulfillment team manages order_status independently.
       await updateSubscriptionOrder({
         orderId: order.id,
         subscriptionStatus: "cancellation_requested",
-        orderStatus: "active",
         notes: "Subscription cancellation requested by user",
       });
     } catch (dbErr) {
@@ -787,10 +789,11 @@ export const pauseSubscription = async (req, res) => {
     });
 
     try {
+      // CRITICAL: Only update subscription_status. order_status is a
+      // fulfillment field and must NEVER be overwritten by a billing event.
       await updateSubscriptionOrder({
         orderId: order.id,
         subscriptionStatus: "paused",
-        orderStatus: "active",
         notes: "Subscription paused by user",
       });
     } catch (dbErr) {
