@@ -1,4 +1,6 @@
 import { randomUUID } from "crypto";
+import { getNextOrderNumber } from "../utils/orderNumber.js";
+
 import { getRazorpay } from "../config/razorpay.js";
 import { query, getClient } from "../config/database.js";
 import {
@@ -25,6 +27,9 @@ const toMySQLDateTime = (date) => {
     timeZone: "Asia/Kolkata",
   });
 };
+
+// FIX (Requirement §1): Removed the global `const orderNumber = await getNextOrderNumber(client);`
+// statement that was crashing Node on import because `client` did not exist yet.
 
 export const createSubscription = async (req, res) => {
   const userId = req.user?.id || null;
@@ -137,17 +142,12 @@ export const createSubscription = async (req, res) => {
   }
 
   // ── Duplicate active-subscription guard ─────────────────────────────────
-  // A user may not start a second subscription for the same product while
-  // an existing one is still active/authenticated/pending/paused. They may
-  // re-subscribe once the prior one is cancelled/expired/completed.
-  // This MUST run before getRazorpay()/plan lookup/subscriptions.create()
-  // so that a duplicate request never creates a Razorpay subscription, an
-  // order, an order_item, or a payment record.
   try {
     const duplicateProductId = validatedItems[0].product_id;
 
     const { rows: existingSubRows } = await query(
       `SELECT o.id,
+              o.order_number,
               o.subscription_status,
               oi.product_id
        FROM orders o
@@ -260,9 +260,6 @@ export const createSubscription = async (req, res) => {
   try {
     subscription = await rzp.subscriptions.create({
       plan_id: razorpayPlanId,
-      // 12 billing cycles = 1 year. The subscription auto-halts after 12 charges
-      // unless renewed. Razorpay does not enforce this on the gateway side for
-      // all plan types — treat it as a soft cap and handle renewal in the webhook.
       total_count: 12,
       quantity: 1,
       customer_notify: 1,
@@ -284,9 +281,6 @@ export const createSubscription = async (req, res) => {
       .json({ message: "Failed to create Razorpay subscription" });
   }
 
-  // next_billing_date is null at creation — Razorpay only populates current_end
-  // after the first payment is captured. The webhook (subscription.activated)
-  // writes the real value once the subscription goes live.
   const nextBillingDate = null;
 
   // ── DB transaction ───────────────────────────────────────────────────────────
@@ -296,8 +290,12 @@ export const createSubscription = async (req, res) => {
 
     const orderId = randomUUID();
 
+    // FIX (Requirement §2): Generate order number here, after client exists
+    const orderNumber = await getNextOrderNumber(client);
+
     console.log("[SUBSCRIPTION] Inserting order", {
       orderId,
+      orderNumber,
       userId,
       subscriptionId: subscription.id,
       planId: razorpayPlanId,
@@ -305,21 +303,39 @@ export const createSubscription = async (req, res) => {
     });
 
     console.log("orderId:", orderId);
+    console.log("orderNumber:", orderNumber);
     console.log("userId:", userId);
     console.log("addressId:", addressId);
     console.log("subscriptionId:", subscription.id);
     console.log("planId:", razorpayPlanId);
 
+    // FIX (Requirements §3 & §4): Added order_number to INSERT columns and VALUES
     await client.query(
       `INSERT INTO orders (
-        id, user_id, address_id, customer_name, email, mobile_number,
-        shipping_address, contact_name, contact_email, contact_phone,
-        subtotal, total, order_status, payment_status,
-        is_subscription, razorpay_plan_id, razorpay_subscription_id,
-        subscription_status, next_billing_date
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?)`,
+          id,
+          order_number,
+          user_id,
+          address_id,
+          customer_name,
+          email,
+          mobile_number,
+          shipping_address,
+          contact_name,
+          contact_email,
+          contact_phone,
+          subtotal,
+          total,
+          order_status,
+          payment_status,
+          is_subscription,
+          razorpay_plan_id,
+          razorpay_subscription_id,
+          subscription_status,
+          next_billing_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?)`,
       [
         orderId,
+        orderNumber,
         userId,
         addressId || null,
         customerName,
@@ -378,6 +394,7 @@ export const createSubscription = async (req, res) => {
 
     console.log("[SUBSCRIPTION] Order committed successfully", {
       orderId,
+      orderNumber,
       subscriptionId: subscription.id,
     });
 
@@ -389,9 +406,11 @@ export const createSubscription = async (req, res) => {
       console.warn("[SUBSCRIPTION] Socket emit failed", e);
     }
 
+    // FIX (Requirement §5): Added order_number to response
     return res.json({
       success: true,
       order_db_id: orderId,
+      order_number: orderNumber,
       subscription_id: subscription.id,
       plan_id: razorpayPlanId,
       amount: Math.round(serverTotal * 100),
@@ -418,9 +437,11 @@ export const getMySubscriptions = async (req, res) => {
   try {
     const userId = req.user?.id;
 
+    // FIX (Requirement §6): Added o.order_number to SELECT
     const { rows } = await query(
       `SELECT
          o.id AS order_id,
+         o.order_number,
          o.contact_name,
          o.contact_email,
          o.contact_phone,
@@ -459,6 +480,7 @@ export const getMySubscriptions = async (req, res) => {
 
       acc.push({
         order_id: row.order_id,
+        order_number: row.order_number,
         contact_name: row.contact_name,
         contact_email: row.contact_email,
         contact_phone: row.contact_phone,
@@ -503,10 +525,17 @@ export const getMySubscriptions = async (req, res) => {
 
         const currentStatus = currentRows[0]?.subscription_status;
 
-        const finalStatus =
-          currentStatus === "cancellation_requested"
-            ? "cancellation_requested"
-            : liveSub.status;
+        // FIX: Admin cancellation sets subscription_status = "cancellation_requested"
+        // and order_status = "cancelled" in our DB. Razorpay keeps returning
+        // status = "active" until the billing cycle ends (cancel_at_cycle_end=1).
+        // We must NEVER overwrite a locally-set terminal/pending-cancel status
+        // with Razorpay's stale "active" value. Protect both states:
+        //   "cancellation_requested" — cancellation triggered, cycle still running
+        //   "cancelled"              — cycle ended, webhook flipped it
+        const PROTECTED_STATUSES = ["cancellation_requested", "cancelled"];
+        const finalStatus = PROTECTED_STATUSES.includes(currentStatus)
+          ? currentStatus
+          : liveSub.status;
         console.log("[SYNC STATUS]", {
           currentStatus,
           razorpayStatus: liveSub.status,
@@ -545,9 +574,6 @@ export const getMySubscriptions = async (req, res) => {
 };
 
 // ── Shared DB update helper ─────────────────────────────────────────────────
-// Builds a dynamic UPDATE so callers only specify the fields that change.
-// Always writes updated_at and appends a history row.
-
 const updateSubscriptionOrder = async ({
   orderId,
   subscriptionStatus,
@@ -571,8 +597,6 @@ const updateSubscriptionOrder = async ({
     updates.push("payment_status = ?");
     params.push(paymentStatus);
   }
-  // nextBillingDate uses explicit undefined check so callers can pass null
-  // to clear the field (null !== undefined).
   if (nextBillingDate !== undefined) {
     updates.push("next_billing_date = ?");
     params.push(nextBillingDate);
@@ -601,16 +625,11 @@ const updateSubscriptionOrder = async ({
 };
 
 // ── cancelSubscription ──────────────────────────────────────────────────────
-// The frontend passes the Razorpay subscription ID (e.g. sub_T2yIPEmAk4nnTn),
-// NOT the internal orders.id. The lookup must use razorpay_subscription_id.
-
 export const cancelSubscription = async (req, res) => {
-  // req.params.id = Razorpay subscription ID sent by the frontend
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
 
   try {
-    // ── Look up order by Razorpay subscription ID ──────────────────────────
     const { rows } = await query(
       `SELECT id, razorpay_subscription_id, order_status, contact_email, contact_name
        FROM orders
@@ -630,7 +649,6 @@ export const cancelSubscription = async (req, res) => {
 
     const order = rows[0];
 
-    // Debug log after order is confirmed to exist
     console.log("[CANCEL]", {
       routeId: razorpaySubscriptionId,
       dbSubscriptionId: order.razorpay_subscription_id,
@@ -638,12 +656,6 @@ export const cancelSubscription = async (req, res) => {
       currentStatus: order.order_status,
     });
 
-    // ── Cancel on Razorpay ─────────────────────────────────────────────────
-    // cancel_at_cycle_end: 1 → subscription stays active until the end of the
-    //   current billing period, then cancels automatically. The customer gets
-    //   the service they already paid for.
-    // cancel_at_cycle_end: 0 → immediate cancellation with no refund for the
-    //   remaining days. Use only when explicitly requested or for fraud/abuse.
     const rzp = getRazorpay();
     let response;
     try {
@@ -675,11 +687,6 @@ export const cancelSubscription = async (req, res) => {
       endAt: response.end_at,
     });
 
-    // ── Update DB ──────────────────────────────────────────────────────────
-    // When cancel_at_cycle_end: 1, Razorpay returns status "active" (not
-    // "cancelled") until the cycle ends. We write the Razorpay status as-is
-    // so the DB reflects reality; the webhook (subscription.cancelled) will
-    // set it to "cancelled" when the cycle actually ends.
     try {
       await updateSubscriptionOrder({
         orderId: order.id,
@@ -688,8 +695,6 @@ export const cancelSubscription = async (req, res) => {
         notes: "Subscription cancellation requested by user",
       });
     } catch (dbErr) {
-      // Razorpay already cancelled — log and continue so the response still
-      // reaches the client. The webhook will sync the DB as a fallback.
       console.error("[CANCEL] DB update failed after Razorpay cancel", {
         orderId: order.id,
         message: dbErr?.message || String(dbErr),
@@ -718,14 +723,11 @@ export const cancelSubscription = async (req, res) => {
 };
 
 // ── pauseSubscription ───────────────────────────────────────────────────────
-// The frontend passes the Razorpay subscription ID, not orders.id.
-
 export const pauseSubscription = async (req, res) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
 
   try {
-    // ── FIX: look up by razorpay_subscription_id, not orders.id ───────────
     const { rows } = await query(
       `SELECT id, razorpay_subscription_id
        FROM orders
@@ -750,9 +752,6 @@ export const pauseSubscription = async (req, res) => {
       orderId: order.id,
     });
 
-    // ── Pause on Razorpay ──────────────────────────────────────────────────
-    // pause_at_cycle_end: 0 → pause takes effect immediately.
-    // pause_at_cycle_end: 1 → pause at end of current billing cycle.
     const rzp = getRazorpay();
     console.log("RAZORPAY VERSION TEST");
     console.log("subscriptions:", rzp.subscriptions);
@@ -787,10 +786,6 @@ export const pauseSubscription = async (req, res) => {
       status: response.status,
     });
 
-    // ── Update DB ──────────────────────────────────────────────────────────
-    // Pausing clears the next charge date — set next_billing_date to null
-    // so the UI doesn't show a stale date. The webhook (subscription.charged)
-    // will populate it again when the subscription resumes and charges.
     try {
       await updateSubscriptionOrder({
         orderId: order.id,
@@ -820,14 +815,11 @@ export const pauseSubscription = async (req, res) => {
 };
 
 // ── resumeSubscription ──────────────────────────────────────────────────────
-// The frontend passes the Razorpay subscription ID, not orders.id.
-
 export const resumeSubscription = async (req, res) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
 
   try {
-    // ── FIX: look up by razorpay_subscription_id, not orders.id ───────────
     const { rows } = await query(
       `SELECT id, razorpay_subscription_id, contact_email, contact_name
        FROM orders
@@ -852,7 +844,6 @@ export const resumeSubscription = async (req, res) => {
       orderId: order.id,
     });
 
-    // ── Resume on Razorpay ─────────────────────────────────────────────────
     const rzp = getRazorpay();
     let response;
     try {
@@ -880,12 +871,9 @@ export const resumeSubscription = async (req, res) => {
       chargeAt: response.charge_at,
     });
 
-    // ── Update DB ──────────────────────────────────────────────────────────
-    // Razorpay returns charge_at (Unix timestamp) on resume — write it as the
-    // next_billing_date so the UI immediately shows when the next charge is.
     const nextBillingDate = response.charge_at
       ? toMySQLDateTime(response.charge_at * 1000)
-      : undefined; // undefined = don't touch the column if Razorpay didn't return it
+      : undefined;
 
     try {
       await updateSubscriptionOrder({

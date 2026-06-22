@@ -28,11 +28,19 @@ const buildSubscriptionFilters = ({
   const params = [];
 
   if (search) {
+    // FIX (Requirement §2): Added o.order_number to search conditions
     conditions.push(
-      `(o.id LIKE ? OR o.contact_name LIKE ? OR o.email LIKE ? OR o.contact_phone LIKE ? OR o.razorpay_subscription_id LIKE ?)`,
+      `(o.id LIKE ? OR o.order_number LIKE ? OR o.contact_name LIKE ? OR o.email LIKE ? OR o.contact_phone LIKE ? OR o.razorpay_subscription_id LIKE ?)`,
     );
     const searchTerm = `%${search}%`;
-    params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    params.push(
+      searchTerm,
+      searchTerm,
+      searchTerm,
+      searchTerm,
+      searchTerm,
+      searchTerm,
+    );
   }
 
   const normalizedStatus = normalizeStatusFilter(status);
@@ -86,6 +94,7 @@ export const getSubscriptions = async (req, res) => {
       query(
         `SELECT
            o.id,
+           o.order_number,
            o.contact_name AS customer_name,
            o.email,
            o.contact_phone AS phone,
@@ -93,6 +102,7 @@ export const getSubscriptions = async (req, res) => {
            o.razorpay_plan_id AS razorpay_plan_id,
            o.total AS amount,
            o.subscription_status AS status,
+           o.order_status AS order_status,
            o.created_at AS start_date,
            o.next_billing_date AS next_billing_date,
            COUNT(DISTINCT oi.id) AS item_count,
@@ -109,8 +119,10 @@ export const getSubscriptions = async (req, res) => {
       query(`SELECT COUNT(*) AS total FROM orders o ${where}`, params),
     ]);
 
+    // FIX (Requirement §1 & §5): Added orderNumber to every subscription object
     const subscriptions = rowsResult.rows.map((row) => ({
       id: row.id,
+      orderNumber: row.order_number,
       customerName: row.customer_name,
       email: row.email,
       phone: row.phone,
@@ -118,6 +130,7 @@ export const getSubscriptions = async (req, res) => {
       frequency: "Monthly",
       amount: Number(row.amount || 0),
       status: row.status,
+      orderStatus: row.order_status || null,
       startDate: row.start_date,
       nextBillingDate: row.next_billing_date,
       renewalCount: Number(row.renewal_count || 0),
@@ -133,40 +146,11 @@ export const getSubscriptions = async (req, res) => {
 };
 
 export const getSubscriptionDetails = async (req, res) => {
-  // ── Production-grade logging (requirement §4 / §8) ─────────────────────────
   console.log("[DETAILS PARAM]", req.params.id);
 
   try {
     const { id } = req.params;
 
-    // ── QUERY 1: Main order + user + address ──────────────────────────────────
-    //
-    // ROOT CAUSE OF THE 500 (was):
-    //   LEFT JOIN addresses ua ON ua.id = o.address_id
-    //   + SELECT ua.full_name, ua.phone, ua.address_line_1, ua.address_line_2,
-    //            ua.address_type
-    //
-    // The `addresses` table schema is:
-    //   id, user_id, label, address_line1, address_line2, city, state,
-    //   pincode, country, is_default, created_at
-    //   → NO full_name, NO phone, NO address_type
-    //
-    // The `user_addresses` table has all of those columns:
-    //   full_name, phone, address_line_1, address_line_2, address_type
-    //
-    // The FK constraint is: orders.address_id → addresses.id
-    // BUT the orders row for this subscription has address_id =
-    // '73d087a0-3b0d-487b-b74f-85b2c250d769' which is a row in `addresses`.
-    //
-    // FIX:
-    //   1) Join BOTH tables with separate aliases.
-    //   2) Use COALESCE to prefer user_addresses fields where they exist,
-    //      falling back to addresses fields and finally to order contact fields.
-    //   This makes the query resilient regardless of which table was used.
-    //
-    // users.phone ✅ exists.
-    // orders.*   ✅ all columns (cancel_reason, cancelled_by, cancelled_at,
-    //                razorpay_subscription_id, razorpay_plan_id, etc.) ✅
     console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
 
     const { rows } = await query(
@@ -214,9 +198,6 @@ export const getSubscriptionDetails = async (req, res) => {
 
     const s = rows[0];
 
-    // ── QUERY 2: order_items ──────────────────────────────────────────────────
-    // order_items columns verified: id, product_name, product_image,
-    // product_price, quantity, subtotal ✅ all exist in schema.
     console.log("[SUB DETAILS] QUERY START items", { orderId: id });
 
     const itemsResult = await query(
@@ -227,12 +208,6 @@ export const getSubscriptionDetails = async (req, res) => {
     );
     console.log("[ITEMS RESULT]", itemsResult.rows);
 
-    // ── QUERY 3: payments billing history ────────────────────────────────────
-    // Guard: if razorpay_subscription_id is null (edge case), skip the query
-    // and return an empty array rather than passing NULL into the WHERE clause
-    // (which would match nothing but is semantically misleading).
-    // payments columns verified: id, order_id, razorpay_payment_id, amount,
-    // currency, status, created_at, updated_at ✅ all exist.
     console.log("[SUB DETAILS] QUERY START payments", {
       razorpaySubscriptionId: s.razorpay_subscription_id,
     });
@@ -240,20 +215,20 @@ export const getSubscriptionDetails = async (req, res) => {
     let billingRows = [];
     if (s.razorpay_subscription_id) {
       const billingResult = await query(
-        `SELECT id, order_id, razorpay_payment_id, amount, currency,
-                status, created_at, updated_at
-         FROM payments
-         WHERE razorpay_subscription_id = ?
-         ORDER BY updated_at DESC`,
+        `SELECT p.id, p.order_id, p.razorpay_payment_id, p.amount, p.currency,
+                p.status, p.created_at, p.updated_at,
+                o.order_number AS order_number
+         FROM payments p
+         LEFT JOIN orders o ON o.id = p.order_id
+         WHERE p.razorpay_subscription_id = ?
+         ORDER BY p.updated_at DESC`,
         [s.razorpay_subscription_id],
       );
       billingRows = billingResult.rows;
     }
     console.log("[PAYMENTS RESULT]", billingRows);
 
-    // ── QUERY 4: renewal orders ───────────────────────────────────────────────
-    // orders columns verified: id, total, order_status, payment_status,
-    // razorpay_order_id, razorpay_payment_id, created_at ✅ all exist.
+    // FIX (Requirement §4): Added order_number to renewal orders query
     console.log("[SUB DETAILS] QUERY START renewals", {
       razorpaySubscriptionId: s.razorpay_subscription_id,
     });
@@ -261,19 +236,28 @@ export const getSubscriptionDetails = async (req, res) => {
     let renewalRows = [];
     if (s.razorpay_subscription_id) {
       const renewalResult = await query(
-        `SELECT id, total, order_status, payment_status,
+        `SELECT id, order_number, total, order_status, payment_status,
                 razorpay_order_id, razorpay_payment_id, created_at
          FROM orders
          WHERE razorpay_subscription_id = ?
          ORDER BY created_at DESC`,
         [s.razorpay_subscription_id],
       );
-      renewalRows = renewalResult.rows;
+      // FIX (Requirement §4): Map renewal rows to include orderNumber
+      renewalRows = renewalResult.rows.map((row) => ({
+        id: row.id,
+        orderNumber: row.order_number,
+        total: row.total,
+        order_status: row.order_status,
+        payment_status: row.payment_status,
+        razorpay_order_id: row.razorpay_order_id,
+        razorpay_payment_id: row.razorpay_payment_id,
+        created_at: row.created_at,
+      }));
     }
     console.log("[RENEWALS RESULT]", renewalRows);
 
-    // ── Resolve address fields from whichever table was actually populated ────
-    // Priority: user_addresses > addresses > order contact fields
+    // Resolve address fields from whichever table was actually populated
     const addressName = s.ua2_full_name || s.contact_name || null;
     const addressPhone = s.ua2_phone || s.contact_phone || null;
     const addressLine1 = s.ua2_line1 || s.a1_line1 || null;
@@ -284,7 +268,6 @@ export const getSubscriptionDetails = async (req, res) => {
     const addressCountry = s.ua2_country || s.a1_country || null;
     const addressType = s.ua2_address_type || null;
 
-    // Determine lastRenewal from billing rows (resilient — empty array safe)
     const lastRenewal =
       billingRows.find(
         (p) =>
@@ -295,6 +278,8 @@ export const getSubscriptionDetails = async (req, res) => {
     return res.json({
       subscription: {
         id: s.id,
+        // FIX (Requirement §3): Added orderNumber from o.* (already in SELECT)
+        orderNumber: s.order_number,
         customerName: s.contact_name,
         email: s.email,
         phone: s.contact_phone,
@@ -308,7 +293,6 @@ export const getSubscriptionDetails = async (req, res) => {
         nextBillingDate: s.next_billing_date,
         lastRenewal,
         productItems: itemsResult.rows,
-        // Address — always an object, never throws even if all fields are null
         address: {
           fullName: addressName,
           phone: addressPhone,
@@ -326,12 +310,10 @@ export const getSubscriptionDetails = async (req, res) => {
         cancelledBy: s.cancelled_by || null,
         cancelledAt: s.cancelled_at || null,
       },
-      // Always arrays — never null — so frontend .map() never throws
       billingHistory: billingRows,
       renewalOrders: renewalRows,
     });
   } catch (error) {
-    // ── Production error logging (requirement §5) ──────────────────────────
     console.error("================================");
     console.error("[SUB DETAILS ERROR]");
     console.error("MESSAGE:", error.message);
@@ -518,7 +500,7 @@ export const cancelSubscription = async (req, res) => {
 
     await updateSubscriptionOrder({
       orderId: order.id,
-      subscriptionStatus: response.status || "cancelled",
+      subscriptionStatus: "cancellation_requested",
       orderStatus: "cancelled",
       notes: "Subscription cancelled by admin",
       cancelReason: reason || null,
