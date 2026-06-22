@@ -12,7 +12,13 @@ import {
   sendOrderCancelledEmail,
 } from "../../services/orderEmailService.js";
 
-const VALID_SORTS = ["created_at", "amount", "customer_name", "order_status"];
+const VALID_SORTS = [
+  "created_at",
+  "amount",
+  "customer_name",
+  "order_status",
+  "order_number",
+];
 
 // GET /api/admin/orders
 export const getOrders = async (req, res) => {
@@ -43,6 +49,7 @@ export const getOrders = async (req, res) => {
   const transactionExpr = schemaInfo.isNewOrderSchema
     ? "o.razorpay_payment_id"
     : "o.transaction_id";
+
   const userAddressSnapshot = `CONCAT_WS(", ",
       ua.full_name,
       ua.address_line_1,
@@ -63,8 +70,8 @@ export const getOrders = async (req, res) => {
     )`;
   const shippingAddressExpr = `COALESCE(o.shipping_address, ${userAddressSnapshot}, ${legacyAddressSnapshot}, '')`;
   const notesExpr = schemaInfo.hasOrderNotes ? "o.notes" : "''";
+
   // After MySQL migration, `order_items` uses `product_name`/`product_price`.
-  // Use those columns to avoid referencing legacy `name`/`price` which no longer exist.
   const itemNameExpr = "oi.product_name";
   const itemPriceExpr = "oi.product_price";
 
@@ -73,21 +80,27 @@ export const getOrders = async (req, res) => {
     amount: amountExpr,
     customer_name: customerNameExpr,
     order_status: "o.order_status",
+    order_number: "o.order_number",
   };
 
   const conditions = [];
   const params = [];
-  let idx = 1;
 
   if (search) {
     conditions.push(`(
       ${customerNameExpr} LIKE ? OR
       ${emailExpr} LIKE ? OR
       ${phoneExpr} LIKE ? OR
+      o.order_number LIKE ? OR
       o.id LIKE ?
     )`);
-    params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
-    idx += 4;
+    params.push(
+      `%${search}%`,
+      `%${search}%`,
+      `%${search}%`,
+      `%${search}%`,
+      `%${search}%`,
+    );
   }
 
   if (order_status !== "all" && VALID_ORDER_STATUSES.includes(order_status)) {
@@ -113,17 +126,17 @@ export const getOrders = async (req, res) => {
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const sortColumn = sortExpressions[safeSort] || "o.created_at";
 
-  // Use a subquery for items so the outer query needs no GROUP BY and is
-  // fully compatible with MySQL's ONLY_FULL_GROUP_BY mode. The subquery
-  // also avoids the JSON_ARRAYAGG([null]) problem that occurs when a LEFT
-  // JOIN finds no matching order_items rows.
+  // Items subquery — returns full array with unit_price and total_price.
+  // Using a subquery avoids GROUP BY incompatibilities with ONLY_FULL_GROUP_BY.
+  // Also avoids JSON_ARRAYAGG([null]) when an order has no items.
   const itemsSubquery = `(
     SELECT COALESCE(
       JSON_ARRAYAGG(JSON_OBJECT(
-        'id',       oi2.id,
-        'name',     ${itemNameExpr.replace(/\boi\b/g, "oi2")},
-        'quantity', oi2.quantity,
-        'price',    ${itemPriceExpr.replace(/\boi\b/g, "oi2")}
+        'id',          oi2.id,
+        'product_name', ${itemNameExpr.replace(/\boi\b/g, "oi2")},
+        'quantity',    oi2.quantity,
+        'unit_price',  ${itemPriceExpr.replace(/\boi\b/g, "oi2")},
+        'total_price', (oi2.quantity * ${itemPriceExpr.replace(/\boi\b/g, "oi2")})
       )),
       JSON_ARRAY()
     )
@@ -131,15 +144,18 @@ export const getOrders = async (req, res) => {
     WHERE oi2.order_id = o.id
   )`;
 
-  const firstItemSubquery = `(
-    SELECT ${itemNameExpr.replace(/\boi\b/g, "oi3")}
-    FROM order_items oi3
-    WHERE oi3.order_id = o.id
-    ORDER BY oi3.created_at ASC
-    LIMIT 1
+  // Comma-separated product names for the list view column
+  const productNamesSubquery = `(
+    SELECT COALESCE(
+      GROUP_CONCAT(${itemNameExpr.replace(/\boi\b/g, "oi5")} ORDER BY oi5.created_at ASC SEPARATOR ', '),
+      ''
+    )
+    FROM order_items oi5
+    WHERE oi5.order_id = o.id
   )`;
 
   const ordersSql = `SELECT o.id,
+              o.order_number,
               ${customerNameExpr} AS customer_name,
               ${emailExpr}        AS email,
               ${phoneExpr}        AS mobile_number,
@@ -150,8 +166,13 @@ export const getOrders = async (req, res) => {
               ${transactionExpr}  AS transaction_id,
               ${notesExpr}        AS notes,
               o.created_at,
-              COALESCE(${firstItemSubquery}, '') AS product_name,
-              ${itemsSubquery}                    AS items
+              ${productNamesSubquery} AS product_names,
+              (
+                SELECT COALESCE(SUM(oi4.quantity), 0)
+                FROM order_items oi4
+                WHERE oi4.order_id = o.id
+              ) AS quantity,
+              ${itemsSubquery} AS items
        FROM orders o
        LEFT JOIN user_addresses ua ON ua.id = o.address_id
        LEFT JOIN addresses la ON la.id = o.address_id
@@ -164,8 +185,23 @@ export const getOrders = async (req, res) => {
     query(`SELECT COUNT(*) AS total FROM orders o ${where}`, params),
   ]);
 
+  // Parse items JSON string if the DB driver returns it as a string
+  const orders = ordersRes.rows.map((row) => ({
+    ...row,
+    items:
+      typeof row.items === "string"
+        ? (() => {
+            try {
+              return JSON.parse(row.items);
+            } catch {
+              return [];
+            }
+          })()
+        : (row.items ?? []),
+  }));
+
   res.json({
-    orders: ordersRes.rows,
+    orders,
     total: countRes.rows[0].total,
     page: parseInt(page, 10),
     totalPages: Math.ceil(countRes.rows[0].total / parseInt(limit, 10)),
@@ -182,11 +218,11 @@ export const getOrder = async (req, res) => {
   const phoneExpr = schemaInfo.isNewOrderSchema
     ? "o.contact_phone"
     : "o.mobile_number";
-  // Prefer `total` (new schema) but fall back to legacy `amount` if present
   const amountExpr = "COALESCE(o.total, o.amount)";
   const transactionExpr = schemaInfo.isNewOrderSchema
     ? "o.razorpay_payment_id"
     : "o.transaction_id";
+
   const userAddressSnapshot = `CONCAT_WS(", ",
       ua.full_name,
       ua.address_line_1,
@@ -207,18 +243,18 @@ export const getOrder = async (req, res) => {
     )`;
   const shippingAddressExpr = `COALESCE(o.shipping_address, ${userAddressSnapshot}, ${legacyAddressSnapshot}, '')`;
   const notesExpr = schemaInfo.hasOrderNotes ? "o.notes" : "''";
-  // Use new product_name/product_price in detail query as well.
   const itemNameExpr = "oi.product_name";
   const itemPriceExpr = "oi.product_price";
 
   const itemsSubqueryDetail = `(
     SELECT COALESCE(
       JSON_ARRAYAGG(JSON_OBJECT(
-        'id',         oi2.id,
-        'name',       ${itemNameExpr.replace(/\boi\b/g, "oi2")},
-        'quantity',   oi2.quantity,
-        'price',      ${itemPriceExpr.replace(/\boi\b/g, "oi2")},
-        'product_id', oi2.product_id
+        'id',           oi2.id,
+        'product_name', ${itemNameExpr.replace(/\boi\b/g, "oi2")},
+        'quantity',     oi2.quantity,
+        'unit_price',   ${itemPriceExpr.replace(/\boi\b/g, "oi2")},
+        'total_price',  (oi2.quantity * ${itemPriceExpr.replace(/\boi\b/g, "oi2")}),
+        'product_id',   oi2.product_id
       )),
       JSON_ARRAY()
     )
@@ -226,28 +262,36 @@ export const getOrder = async (req, res) => {
     WHERE oi2.order_id = o.id
   )`;
 
-  const firstItemSubqueryDetail = `(
-    SELECT ${itemNameExpr.replace(/\boi\b/g, "oi3")}
-    FROM order_items oi3
-    WHERE oi3.order_id = o.id
-    ORDER BY oi3.created_at ASC
-    LIMIT 1
+  // Comma-separated product names for convenience
+  const productNamesSubqueryDetail = `(
+    SELECT COALESCE(
+      GROUP_CONCAT(${itemNameExpr.replace(/\boi\b/g, "oi5")} ORDER BY oi5.created_at ASC SEPARATOR ', '),
+      ''
+    )
+    FROM order_items oi5
+    WHERE oi5.order_id = o.id
   )`;
 
   const { rows } = await query(
     `SELECT o.id,
-            ${customerNameExpr}         AS customer_name,
-            ${emailExpr}                AS email,
-            ${phoneExpr}                AS mobile_number,
-            ${shippingAddressExpr}      AS shipping_address,
-            ${amountExpr}               AS amount,
+            o.order_number,
+            ${customerNameExpr}              AS customer_name,
+            ${emailExpr}                     AS email,
+            ${phoneExpr}                     AS mobile_number,
+            ${shippingAddressExpr}           AS shipping_address,
+            ${amountExpr}                    AS amount,
             o.order_status,
             o.payment_status,
-            ${transactionExpr}          AS transaction_id,
-            ${notesExpr}                AS notes,
+            ${transactionExpr}               AS transaction_id,
+            ${notesExpr}                     AS notes,
             o.created_at,
-            COALESCE(${firstItemSubqueryDetail}, '') AS product_name,
-            ${itemsSubqueryDetail}                    AS items
+            ${productNamesSubqueryDetail}    AS product_names,
+            (
+              SELECT COALESCE(SUM(oi4.quantity), 0)
+              FROM order_items oi4
+              WHERE oi4.order_id = o.id
+            )                                AS quantity,
+            ${itemsSubqueryDetail}           AS items
      FROM orders o
      LEFT JOIN user_addresses ua ON ua.id = o.address_id
      LEFT JOIN addresses la ON la.id = o.address_id
@@ -256,14 +300,29 @@ export const getOrder = async (req, res) => {
   );
 
   if (!rows.length) return res.status(404).json({ message: "Order not found" });
-  res.json(rows[0]);
+
+  const row = rows[0];
+  const order = {
+    ...row,
+    items:
+      typeof row.items === "string"
+        ? (() => {
+            try {
+              return JSON.parse(row.items);
+            } catch {
+              return [];
+            }
+          })()
+        : (row.items ?? []),
+  };
+
+  res.json(order);
 };
 
 // PATCH /api/admin/orders/:id/status
 export const updateOrderStatus = async (req, res) => {
   const { status, paymentStatus, notes } = req.body;
   const schemaInfo = await getOrderSchemaInfo();
-  // Use transaction so we can insert history + emit consistently
   const client = await (await import("../../config/database.js")).getClient();
   try {
     await client.query("BEGIN");
@@ -281,7 +340,6 @@ export const updateOrderStatus = async (req, res) => {
     const updates = [];
     const params = [];
 
-    // Strict lifecycle enforcement
     const ORDER_STEPS = [
       "pending",
       "confirmed",
@@ -296,12 +354,10 @@ export const updateOrderStatus = async (req, res) => {
         await client.query("ROLLBACK");
         return res.status(400).json({ message: `Invalid status "${status}"` });
       }
-      // Validate transition
       const prev = normalizeOrderStatus(order.order_status);
       const next = normalizeOrderStatus(status);
       const prevIdx = idxOf(prev);
       const nextIdx = idxOf(next);
-      // Allow cancellation from any non-delivered state
       if (next === "cancelled") {
         if (prev === "delivered") {
           await client.query("ROLLBACK");
@@ -310,7 +366,6 @@ export const updateOrderStatus = async (req, res) => {
             .json({ message: "Cannot cancel a delivered order" });
         }
       } else {
-        // Enforce sequential progression (nextIdx === prevIdx + 1) or idempotent (same)
         if (!(nextIdx === prevIdx + 1 || nextIdx === prevIdx)) {
           await client.query("ROLLBACK");
           return res.status(400).json({
@@ -344,10 +399,9 @@ export const updateOrderStatus = async (req, res) => {
       return res.status(400).json({ message: "No fields to update" });
     }
 
-    // always update updated_at
     updates.push("updated_at = CURRENT_TIMESTAMP");
-
     params.push(req.params.id);
+
     await client.query(
       `UPDATE orders SET ${updates.join(", ")} WHERE id = ?`,
       params,
@@ -358,7 +412,6 @@ export const updateOrderStatus = async (req, res) => {
       req.params.id,
     ]);
 
-    // Insert into history table if status changed
     if (status && order.order_status !== status) {
       await client.query(
         `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes) VALUES (?, ?, ?, ?, ?)`,
@@ -384,6 +437,7 @@ export const updateOrderStatus = async (req, res) => {
             to: recipientEmail,
             name: recipientName,
             orderId: updated.id,
+            orderNumber: updated.order_number,
           });
         }
 
@@ -392,6 +446,7 @@ export const updateOrderStatus = async (req, res) => {
             to: recipientEmail,
             name: recipientName,
             orderId: updated.id,
+            orderNumber: updated.order_number,
             notes,
           });
         }
@@ -400,6 +455,7 @@ export const updateOrderStatus = async (req, res) => {
           to: recipientEmail,
           name: recipientName,
           orderId: updated.id,
+          orderNumber: updated.order_number,
           status,
           notes,
         });
@@ -410,7 +466,6 @@ export const updateOrderStatus = async (req, res) => {
       });
     }
 
-    // Emit socket event (best-effort)
     try {
       const io = req.app?.locals?.io;
       if (io) io.emit("order:updated", updated);
@@ -434,16 +489,14 @@ export const bulkUpdateStatus = async (req, res) => {
   if (!Array.isArray(ids) || !ids.length) {
     return res.status(400).json({ message: "ids must be a non-empty array" });
   }
-  if (!VALID_STATUSES.includes(status)) {
+  if (!VALID_ORDER_STATUSES.includes(status)) {
     return res.status(400).json({ message: `Invalid status "${status}"` });
   }
 
-  // Perform transactional bulk update and return list of updated orders
   const client = await (await import("../../config/database.js")).getClient();
   try {
     await client.query("BEGIN");
 
-    // Lock matching rows
     const placeholders = ids.map(() => "?").join(",");
     const selectSql = `SELECT * FROM orders WHERE id IN (${placeholders}) FOR UPDATE`;
     const { rows: found } = await client.query(selectSql, ids);
@@ -452,7 +505,6 @@ export const bulkUpdateStatus = async (req, res) => {
       return res.status(404).json({ message: "No matching orders found" });
     }
 
-    // Validate transitions for all orders
     const ORDER_STEPS = ["pending", "confirmed", "dispatched", "delivered"];
     const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
     for (const o of found) {
@@ -477,7 +529,6 @@ export const bulkUpdateStatus = async (req, res) => {
       }
     }
 
-    // Update rows
     await client.query(
       `UPDATE orders SET order_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`,
       [status, ...ids],
@@ -488,7 +539,6 @@ export const bulkUpdateStatus = async (req, res) => {
       ids,
     );
 
-    // Insert history rows
     const historyStmt = `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by) VALUES `;
     const historyValues = [];
     const historyParams = [];
@@ -514,6 +564,7 @@ export const bulkUpdateStatus = async (req, res) => {
             to: recipientEmail,
             name: recipientName,
             orderId: orderItem.id,
+            orderNumber: orderItem.order_number,
           });
         }
 
@@ -522,6 +573,7 @@ export const bulkUpdateStatus = async (req, res) => {
             to: recipientEmail,
             name: recipientName,
             orderId: orderItem.id,
+            orderNumber: orderItem.order_number,
           });
         }
 
@@ -529,6 +581,7 @@ export const bulkUpdateStatus = async (req, res) => {
           to: recipientEmail,
           name: recipientName,
           orderId: orderItem.id,
+          orderNumber: orderItem.order_number,
           status,
         });
       });
@@ -536,7 +589,6 @@ export const bulkUpdateStatus = async (req, res) => {
       Promise.allSettled(emailPromises).catch(() => {});
     }
 
-    // Emit events for each updated order
     try {
       const io = req.app?.locals?.io;
       if (io) {

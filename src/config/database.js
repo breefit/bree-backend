@@ -119,6 +119,8 @@
 //   return connection;
 // };
 
+
+
 // export default pool;
 import dotenv from "dotenv";
 dotenv.config();
@@ -294,6 +296,60 @@ const ensureStockDeductedColumn = async () => {
 };
 
 await ensureStockDeductedColumn();
+
+// FIX (Order Number feature): ensure orders.order_number + the
+// order_number_counter table exist. Same idempotent information_schema
+// pattern as ensureStockDeductedColumn above — safe to run on every boot.
+// Does NOT touch orders.id (UUID), any Razorpay columns, or any FKs.
+const ensureOrderNumberSchema = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders' AND column_name = 'order_number'`,
+      [currentDb],
+    );
+
+    if (!cols.length) {
+      await pool.query(
+        "ALTER TABLE orders ADD COLUMN order_number VARCHAR(30) NULL UNIQUE",
+      );
+      console.log("✅ Added orders.order_number column");
+    }
+
+    const [tables] = await pool.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = ? AND table_name = 'order_number_counter'`,
+      [currentDb],
+    );
+
+    if (!tables.length) {
+      await pool.query(`
+        CREATE TABLE order_number_counter (
+          id            TINYINT      NOT NULL PRIMARY KEY,
+          current_value INT          NOT NULL,
+          updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                      ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
+      console.log("✅ Created order_number_counter table");
+    }
+
+    await pool.query(
+      "INSERT IGNORE INTO order_number_counter (id, current_value) VALUES (1, 100000)",
+    );
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure order_number schema exists:",
+      err?.message || err,
+    );
+  }
+};
+
+await ensureOrderNumberSchema();
 
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);

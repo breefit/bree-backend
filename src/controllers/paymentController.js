@@ -5,6 +5,7 @@ import {
   verifyWebhookSignature,
 } from "../utils/razorpay.js";
 import { query, getClient } from "../config/database.js";
+import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -236,12 +237,23 @@ export const createOrder = async (req, res) => {
 
     const orderId = randomUUID();
 
+    // FIX (Order Number feature): generate the human-friendly order_number
+    // in the same transaction as order creation. Does not touch rzpOrder.id,
+    // the Razorpay order payload, or any other Razorpay mapping field —
+    // purely an additional column on our own orders row.
+    const orderNumber = await getNextOrderNumber(client);
+
+    // TEMP DEBUG — remove once order_number generation is confirmed stable
+    // in production.
+    console.log("[ORDER_NUMBER] Generated:", orderNumber);
+
     // For Magic Checkout, customer details are unknown at this point — stored
     // as NULL and updated after payment verification.
     // For legacy flow, they are provided upfront.
     await client.query(
       `INSERT INTO orders (
         id,
+        order_number,
         user_id,
         address_id,
         customer_name,
@@ -256,9 +268,10 @@ export const createOrder = async (req, res) => {
         order_status,
         payment_status,
         razorpay_order_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`,
       [
         orderId,
+        orderNumber,
         req.user?.id || null,
         addressId || null,
         customerName || req.user?.name || null,
@@ -273,6 +286,10 @@ export const createOrder = async (req, res) => {
         rzpOrder.id,
       ],
     );
+
+    // TEMP DEBUG — confirms the value actually landed in the row, not just
+    // that getNextOrderNumber() returned something. Remove once confirmed.
+    console.log("[ORDER_NUMBER] Saved:", orderId, orderNumber);
 
     // Persist cart snapshot so verify-payment can rebuild order items without
     // trusting frontend data a second time.
@@ -839,6 +856,7 @@ export const verifyPayment = async (req, res) => {
   return res.json({
     success: true,
     order_id: order.id,
+    order_number: order.order_number || null,
     payment_id: razorpay_payment_id,
     ...(isSubscriptionOrder && {
       subscription_status: "active",

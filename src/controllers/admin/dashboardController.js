@@ -91,6 +91,7 @@ export const getDashboardStats = async (req, res) => {
       query(`
         SELECT
           o.id,
+          o.order_number,
           o.${nameExpr} AS customer_name,
           o.${emailExpr} AS email,
           ${amountExprWithAlias} AS amount,

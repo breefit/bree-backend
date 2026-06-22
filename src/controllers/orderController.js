@@ -5,6 +5,8 @@ import {
   getOrderSchemaInfo,
 } from "../utils/orderSchema.js";
 
+import { getNextOrderNumber } from "../utils/orderNumber.js";
+
 const normalizeOrderStatus = (s) => {
   if (!s) return null;
   const l = String(s).toLowerCase();
@@ -263,18 +265,35 @@ export const createOrder = async (req, res) => {
     const total = calculatedSubtotal + parseFloat(shipping) + parseFloat(tax);
     const orderId = crypto.randomUUID();
 
-    console.log("[CREATE_ORDER] orderId:", orderId, "total:", total);
+    // FIX (Order Number feature): generate the human-friendly order_number
+    // atomically inside this same transaction. UUID generation above is
+    // untouched and remains the primary key / source of truth.
+    const orderNumber = await getNextOrderNumber(client);
+
+    // TEMP DEBUG — remove once order_number generation is confirmed stable
+    // in production.
+    console.log("[ORDER_NUMBER] Generated:", orderNumber);
+
+    console.log(
+      "[CREATE_ORDER] orderId:",
+      orderId,
+      "orderNumber:",
+      orderNumber,
+      "total:",
+      total,
+    );
 
     if (isNewOrderSchema) {
       await client.query(
         `INSERT INTO orders (
-          id, user_id, address_id, contact_name, contact_email, contact_phone,
+          id, order_number, user_id, address_id, contact_name, contact_email, contact_phone,
           customer_name, email, mobile_number,
           shipping_address, subtotal, shipping, tax, total,
           payment_status, order_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
         [
           orderId,
+          orderNumber,
           userId,
           addressId,
           contactName,
@@ -292,10 +311,11 @@ export const createOrder = async (req, res) => {
       );
     } else {
       await client.query(
-        `INSERT INTO orders (id, user_id, address_id, customer_name, email, mobile_number, shipping_address, amount, payment_status, order_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
+        `INSERT INTO orders (id, order_number, user_id, address_id, customer_name, email, mobile_number, shipping_address, amount, payment_status, order_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
         [
           orderId,
+          orderNumber,
           userId,
           addressId,
           contactName,
@@ -306,6 +326,10 @@ export const createOrder = async (req, res) => {
         ],
       );
     }
+
+    // TEMP DEBUG — confirms the value actually landed in the row, not just
+    // that getNextOrderNumber() returned something. Remove once confirmed.
+    console.log("[ORDER_NUMBER] Saved:", orderId, orderNumber);
 
     console.log("[ORDER_SAVE] Saved order:", orderId);
 
@@ -369,6 +393,7 @@ export const createOrder = async (req, res) => {
     res.json({
       success: true,
       orderId,
+      orderNumber,
       addressId,
       total,
       shippingAddress: responseShippingAddress,
@@ -401,13 +426,13 @@ export const getOrder = async (req, res) => {
 
     // FIX: Include shipping_address in new schema query
     const orderQuery = isNewOrderSchema
-      ? `SELECT id, user_id, contact_email, contact_phone, contact_name,
+      ? `SELECT id, order_number, user_id, contact_email, contact_phone, contact_name,
          shipping_address, subtotal, shipping, tax, total, payment_status, order_status,
          razorpay_order_id, razorpay_subscription_id, razorpay_payment_id, paid_at, subscription_status,
          next_billing_date, created_at, updated_at
        FROM orders
        WHERE id = ? AND (user_id = ? OR user_id IS NULL)`
-      : `SELECT id, user_id, email AS contact_email, mobile_number AS contact_phone,
+      : `SELECT id, order_number, user_id, email AS contact_email, mobile_number AS contact_phone,
          customer_name AS contact_name, shipping_address, amount AS total, payment_status,
          order_status, razorpay_order_id, razorpay_subscription_id, razorpay_payment_id, paid_at,
          subscription_status, next_billing_date, created_at, updated_at
@@ -451,7 +476,7 @@ export const getOrderHistory = async (req, res) => {
     const { id } = req.params;
 
     const { rows: orderRows } = await query(
-      "SELECT id FROM orders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
+      "SELECT id, order_number FROM orders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
       [id, userId],
     );
 
@@ -490,14 +515,14 @@ export const getOrderSuccess = async (req, res) => {
 
     // FIX: new-schema query now includes shipping_address column
     const orderQuery = isNewOrderSchema
-      ? `SELECT id, user_id, contact_name, contact_email,
+      ? `SELECT id, order_number, user_id, contact_name, contact_email,
            contact_phone, address_id, shipping_address, subtotal, shipping, tax, total,
            payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
            razorpay_payment_id, paid_at, subscription_status, next_billing_date,
            created_at, updated_at
          FROM orders
          WHERE id = ? AND (user_id = ? OR user_id IS NULL)`
-      : `SELECT id, user_id, customer_name AS contact_name, email AS contact_email,
+      : `SELECT id, order_number, user_id, customer_name AS contact_name, email AS contact_email,
            mobile_number AS contact_phone, shipping_address, amount AS total,
            payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
            razorpay_payment_id, paid_at, subscription_status, next_billing_date,
@@ -678,13 +703,13 @@ export const getMyOrders = async (req, res) => {
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
     const orderQuery = isNewOrderSchema
-      ? `SELECT id, contact_name, contact_email, contact_phone, total,
+      ? `SELECT id, order_number, contact_name, contact_email, contact_phone, total,
            payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
            subscription_status, next_billing_date, created_at
          FROM orders
          WHERE user_id = ?
          ORDER BY created_at DESC`
-      : `SELECT id, customer_name AS contact_name, email AS contact_email,
+      : `SELECT id, order_number, customer_name AS contact_name, email AS contact_email,
            mobile_number AS contact_phone, amount AS total,
            payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
            subscription_status, next_billing_date, created_at
@@ -746,7 +771,7 @@ export const getOrderTracking = async (req, res) => {
     });
 
     const orderQuery = isNewOrderSchema
-      ? `SELECT o.id, o.user_id, o.order_status, o.payment_status, o.shipping_address,
+      ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.created_at,
            o.contact_name, o.contact_email,
            ua.full_name AS ua_full_name,
@@ -768,7 +793,7 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN user_addresses ua ON ua.id = o.address_id AND ua.user_id = o.user_id
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
          WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`
-      : `SELECT o.id, o.user_id, o.order_status, o.payment_status, o.shipping_address,
+      : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.created_at,
            o.customer_name AS contact_name, o.email AS contact_email,
            ua.full_name AS ua_full_name,
