@@ -119,8 +119,6 @@
 //   return connection;
 // };
 
-
-
 // export default pool;
 import dotenv from "dotenv";
 dotenv.config();
@@ -350,6 +348,56 @@ const ensureOrderNumberSchema = async () => {
 };
 
 await ensureOrderNumberSchema();
+
+// ── Phase 2: renewal order columns ────────────────────────────────────────────
+// is_renewal_order — TINYINT flag that distinguishes renewal fulfillment orders
+//   (created by the subscription.charged webhook) from the original first-cycle
+//   subscription order.
+//
+// parent_order_id  — UUID FK pointing to the original (is_renewal_order = 0)
+//   subscription order. Used by admin queries to list all renewals belonging to
+//   a subscription without relying solely on razorpay_subscription_id.
+//
+// Both are idempotent: the ALTER is wrapped in an existence check and is safe to
+// run on every application boot.
+const ensureRenewalOrderColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders'
+         AND column_name IN ('is_renewal_order', 'parent_order_id')`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((c) => c.column_name));
+
+    if (!existing.has("is_renewal_order")) {
+      await pool.query(
+        "ALTER TABLE orders ADD COLUMN is_renewal_order TINYINT(1) NOT NULL DEFAULT 0",
+      );
+      console.log("✅ Added orders.is_renewal_order column");
+    }
+
+    if (!existing.has("parent_order_id")) {
+      await pool.query(
+        "ALTER TABLE orders ADD COLUMN parent_order_id VARCHAR(36) NULL DEFAULT NULL",
+      );
+      console.log("✅ Added orders.parent_order_id column");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure renewal order columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
+await ensureRenewalOrderColumns();
 
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);

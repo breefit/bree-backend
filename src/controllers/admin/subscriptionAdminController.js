@@ -235,22 +235,27 @@ export const getSubscriptionDetails = async (req, res) => {
 
     let renewalRows = [];
     if (s.razorpay_subscription_id) {
+      // Phase 2: is_renewal_order = 1 filters to only the new fulfillment
+      // orders created by the subscription.charged webhook. The original
+      // subscription order (is_renewal_order = 0) is the row we're already
+      // displaying on this page — including it in renewalRows would show it as
+      // its own renewal, which is incorrect.
       const renewalResult = await query(
         `SELECT id, order_number, total, order_status, payment_status,
-                razorpay_order_id, razorpay_payment_id, created_at
+                subscription_status, razorpay_payment_id, created_at
          FROM orders
          WHERE razorpay_subscription_id = ?
+           AND is_renewal_order = 1
          ORDER BY created_at DESC`,
         [s.razorpay_subscription_id],
       );
-      // FIX (Requirement §4): Map renewal rows to include orderNumber
       renewalRows = renewalResult.rows.map((row) => ({
         id: row.id,
         orderNumber: row.order_number,
         total: row.total,
         order_status: row.order_status,
         payment_status: row.payment_status,
-        razorpay_order_id: row.razorpay_order_id,
+        subscription_status: row.subscription_status,
         razorpay_payment_id: row.razorpay_payment_id,
         created_at: row.created_at,
       }));
@@ -278,7 +283,6 @@ export const getSubscriptionDetails = async (req, res) => {
     return res.json({
       subscription: {
         id: s.id,
-        // FIX (Requirement §3): Added orderNumber from o.* (already in SELECT)
         orderNumber: s.order_number,
         customerName: s.contact_name,
         email: s.email,
@@ -288,6 +292,10 @@ export const getSubscriptionDetails = async (req, res) => {
         paymentStatus: s.payment_status,
         razorpaySubscriptionId: s.razorpay_subscription_id,
         razorpayPlanId: s.razorpay_plan_id,
+        // planName: derived from the first order_item's product_name so the
+        // admin UI can display the actual product (e.g. "30-Day Pack") rather
+        // than a hard-coded "Monthly". Works for any future subscription product.
+        planName: itemsResult.rows[0]?.product_name || null,
         amount: Number(s.total || 0),
         startDate: s.created_at,
         nextBillingDate: s.next_billing_date,

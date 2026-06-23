@@ -7,6 +7,7 @@ import {
 import { query, getClient } from "../config/database.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
+import { createRenewalOrder } from "../services/renewalService.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build Razorpay Magic Checkout line_items from server-validated cart items
@@ -1100,8 +1101,17 @@ export const handleWebhook = async (req, res) => {
     );
 
   const loadBySubscription = async () => {
+    // Always load the ORIGINAL subscription order (is_renewal_order = 0).
+    // After Phase 2, multiple rows share razorpay_subscription_id — the origin
+    // plus one renewal order per charge. Webhook handlers that update
+    // subscription_status / next_billing_date must target the origin row; the
+    // renewal rows are fulfillment orders whose status is managed by the admin.
     const { rows } = await query(
-      "SELECT * FROM orders WHERE razorpay_subscription_id = ? LIMIT 1",
+      `SELECT * FROM orders
+       WHERE razorpay_subscription_id = ?
+         AND is_renewal_order = 0
+       ORDER BY created_at ASC
+       LIMIT 1`,
       [rzpSubscriptionId],
     );
     return rows[0];
@@ -1331,48 +1341,81 @@ export const handleWebhook = async (req, res) => {
     }
 
     case "subscription.charged": {
-      // Fired after each successful recurring charge.
-      const order = await loadBySubscription();
-      if (order) {
-        const chargeAt = subscriptionEntity?.charge_at;
-        const nextBilling = chargeAt
-          ? new Date(chargeAt * 1000).toLocaleString("sv-SE", {
-              timeZone: "Asia/Kolkata",
-            })
-          : null;
-        // CRITICAL: Only update subscription_status and billing fields.
-        // order_status is a fulfillment field — NEVER overwrite it here.
-        // The fulfillment team manages order_status independently.
-        await query(
-          `UPDATE orders SET
-             subscription_status = 'active',
-             payment_status = 'paid',
-             next_billing_date = COALESCE(?, next_billing_date),
-             updated_at = NOW()
-           WHERE id = ?`,
-          [nextBilling, order.id],
+      // ── Phase 2: create a new fulfillment order for this renewal charge ────
+      //
+      // Every successful recurring charge creates an independent fulfillment
+      // order so the warehouse team can pack and ship the renewal separately
+      // from previous cycles. The renewal order:
+      //   • gets its own BREE-XXXXXX order number
+      //   • copies all product items from the original subscription order
+      //   • copies all customer / address fields
+      //   • starts at order_status='confirmed', payment_status='paid'
+      //   • is linked back to the origin via parent_order_id
+      //
+      // The ORIGINAL order's subscription_status and next_billing_date are
+      // updated inside createRenewalOrder's transaction — we do NOT issue a
+      // separate UPDATE here to avoid a race condition.
+      //
+      // CRITICAL: order_status on the original order is NEVER touched here.
+      // Fulfillment state is managed independently by the admin.
+      if (!rzpSubscriptionId) {
+        console.warn(
+          "[WEBHOOK] subscription.charged fired without subscription ID — skipping",
         );
-        await addHistory(
-          order.id,
-          order.subscription_status,
-          "active",
-          "Subscription charged via webhook",
+        break;
+      }
+
+      try {
+        const { renewalOrderId, renewalOrderNumber } = await createRenewalOrder(
+          rzpSubscriptionId,
+          paymentEntity,
+          subscriptionEntity,
         );
-        emitUpdate(order.id, order.order_status);
-        // Trigger renewal receipt email (non-blocking)
+
+        console.info("[WEBHOOK] Renewal order created", {
+          renewalOrderId,
+          renewalOrderNumber,
+          rzpSubscriptionId,
+          rzpPaymentId,
+        });
+
+        // Emit socket update so admin order lists refresh in real-time
+        emitUpdate(renewalOrderId, "confirmed");
+
+        // Non-blocking renewal confirmation email
         const { sendSubscriptionChargeReceiptEmail } =
           await import("../services/orderEmailService.js").catch(() => ({}));
+
         if (sendSubscriptionChargeReceiptEmail) {
-          sendSubscriptionChargeReceiptEmail({
-            to: order.contact_email,
-            name: order.contact_name,
-            orderId: order.id,
-            subscriptionId: rzpSubscriptionId,
-            amount: amount,
-          }).catch((e) =>
-            console.error("[WEBHOOK] Charge receipt email failed", e),
-          );
+          // Load the origin order to get contact details (renewal order has them
+          // too, but loadBySubscription() is already scoped to the origin)
+          const originOrder = await loadBySubscription();
+          if (originOrder) {
+            sendSubscriptionChargeReceiptEmail({
+              to: originOrder.contact_email || originOrder.email,
+              name: originOrder.contact_name || originOrder.customer_name,
+              orderId: renewalOrderId,
+              orderNumber: renewalOrderNumber,
+              subscriptionId: rzpSubscriptionId,
+              amount,
+            }).catch((e) =>
+              console.error("[WEBHOOK] Renewal charge receipt email failed", e),
+            );
+          }
         }
+      } catch (err) {
+        // Log and continue — Razorpay expects a 200 OK regardless.
+        // The webhook will retry; idempotency guard in createRenewalOrder
+        // prevents duplicate renewal orders on retry.
+        console.error(
+          "[WEBHOOK] subscription.charged — createRenewalOrder failed",
+          {
+            rzpSubscriptionId,
+            rzpPaymentId,
+            error: err?.message || String(err),
+            stack: err?.stack,
+          },
+        );
       }
       break;
     }
