@@ -125,7 +125,7 @@ const emitProductEvent = (req, eventType, product) => {
     const io = req.app.locals.io;
     if (io) {
       io.emit(`product:${eventType}`, product);
-      console.log(`📡 Emitted: product:${eventType}`);
+      // console.log(`📡 Emitted: product:${eventType}`);
     }
   } catch (err) {
     console.warn("Socket.IO emit failed (non-critical):", err.message);
@@ -250,7 +250,7 @@ export const createProduct = async (req, res) => {
 
   if (isSubscriptionValue === 1) {
     try {
-      console.log("[PLAN] Creating Razorpay plan for:", name);
+      // console.log("[PLAN] Creating Razorpay plan for:", name);
 
       const razorpay = getRazorpay();
 
@@ -269,14 +269,14 @@ export const createProduct = async (req, res) => {
         },
       });
 
-      console.log("[PLAN] Razorpay Plan Created:", plan.id);
+      // console.log("[PLAN] Razorpay Plan Created:", plan.id);
 
       await query(`UPDATE products SET razorpay_plan_id = ? WHERE id = ?`, [
         plan.id,
         productId,
       ]);
 
-      console.log("[PLAN] Saved Plan ID:", plan.id);
+      // console.log("[PLAN] Saved Plan ID:", plan.id);
     } catch (error) {
       console.error("[RAZORPAY PLAN CREATE FAILED]", error);
 
@@ -450,10 +450,10 @@ export const updateProduct = async (req, res) => {
 
     if (shouldCreatePlan) {
       try {
-        console.log(
-          "[PLAN] Creating Razorpay plan for:",
-          name || existingProduct.name,
-        );
+        // console.log(
+        //   "[PLAN] Creating Razorpay plan for:",
+        //   name || existingProduct.name,
+        // );
 
         const razorpay = getRazorpay();
 
@@ -475,14 +475,14 @@ export const updateProduct = async (req, res) => {
           },
         });
 
-        console.log("[PLAN] Razorpay Plan Created:", plan.id);
+        // console.log("[PLAN] Razorpay Plan Created:", plan.id);
 
         await query(`UPDATE products SET razorpay_plan_id = ? WHERE id = ?`, [
           plan.id,
           req.params.id,
         ]);
 
-        console.log("[PLAN] Saved Plan ID:", plan.id);
+        // console.log("[PLAN] Saved Plan ID:", plan.id);
       } catch (error) {
         console.error("[RAZORPAY PLAN CREATE FAILED]", error);
 

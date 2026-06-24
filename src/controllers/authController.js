@@ -32,7 +32,7 @@ const safeUser = (u) => ({
 });
 
 const setAuthCookies = async (res, userId, req) => {
-  console.log("[authController] setAuthCookies called with userId:", userId);
+  // console.log("[authController] setAuthCookies called with userId:", userId);
   const accessToken = signUserToken(userId);
   const refreshToken = await createRefreshToken(userId, {
     userAgent: req.get("User-Agent"),
@@ -97,7 +97,7 @@ export const register = async (req, res, next) => {
     );
 
     const user = rows[0];
-    console.log("[authController] register created user row:", user);
+    // console.log("[authController] register created user row:", user);
 
     const accessToken = await setAuthCookies(res, user.id, req);
 
@@ -125,7 +125,7 @@ export const login = async (req, res, next) => {
     }
 
     const user = rows[0];
-    console.log("[authController] login found user row:", user);
+    // console.log("[authController] login found user row:", user);
     if (!user.password) {
       return res.status(400).json({
         message:
@@ -198,7 +198,7 @@ export const googleSignIn = async (req, res) => {
     );
 
     const user = rows[0];
-    console.log("[authController] googleSignIn created/loaded user row:", user);
+    // console.log("[authController] googleSignIn created/loaded user row:", user);
     const accessToken = await setAuthCookies(res, user.id, req);
     return res.json({ ...safeUser(user), accessToken });
   } catch (error) {

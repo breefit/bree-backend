@@ -36,7 +36,7 @@ export const getNextOrderNumber = async (client) => {
 
   const nextValue = rows?.[0]?.next_value;
 
-  console.log("[ORDER_NUMBER] Counter row fetched:", rows?.[0]);
+  // console.log("[ORDER_NUMBER] Counter row fetched:", rows?.[0]);
 
   if (!nextValue) {
     throw new Error("order_number_counter row missing");

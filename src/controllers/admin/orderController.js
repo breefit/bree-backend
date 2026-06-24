@@ -513,9 +513,9 @@ export const bulkUpdateStatus = async (req, res) => {
     // Razorpay subscription lifecycle field and is NOT used here.
     // If a dedicated subscription fulfillment pipeline is ever introduced,
     // add branching here and in updateOrderStatus().
-    console.log(
-      `[bulk-status] Requested status: "${status}" | Order count: ${found.length}`,
-    );
+    // console.log(
+    //   `[bulk-status] Requested status: "${status}" | Order count: ${found.length}`,
+    // );
     for (const o of found) {
       const orderType =
         o.is_subscription && Number(o.is_subscription) === 1
@@ -548,9 +548,9 @@ export const bulkUpdateStatus = async (req, res) => {
             : `REJECTED (invalid transition ${prev} → ${next})`;
       }
 
-      console.log(
-        `[bulk-status] id=${o.id} | order_number=${o.order_number} | type=${orderType} | is_subscription=${o.is_subscription} | order_status=${o.order_status} | subscription_status=${o.subscription_status ?? "n/a"} | requested_status=${status} | validation=${validationResult}`,
-      );
+      // console.log(
+      //   `[bulk-status] id=${o.id} | order_number=${o.order_number} | type=${orderType} | is_subscription=${o.is_subscription} | order_status=${o.order_status} | subscription_status=${o.subscription_status ?? "n/a"} | requested_status=${status} | validation=${validationResult}`,
+      // );
     }
     // ─────────────────────────────────────────────────────────────────────────
 

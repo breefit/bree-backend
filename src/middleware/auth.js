@@ -12,13 +12,13 @@ const getToken = (req) => {
 
 const auth = async (req, res, next) => {
   const token = getToken(req);
-  console.log(
-    "[auth] request",
-    req.method,
-    req.originalUrl,
-    "tokenPresent:",
-    !!token,
-  );
+  // console.log(
+  //   "[auth] request",
+  //   req.method,
+  //   req.originalUrl,
+  //   "tokenPresent:",
+  //   !!token,
+  // );
   // console.log("[auth] req.user before auth:", req.user);
   // console.log("[auth] req.userId before auth:", req.userId);
   if (!token) {

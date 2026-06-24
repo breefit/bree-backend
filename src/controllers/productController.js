@@ -311,10 +311,10 @@ export const getRecommendations = async (req, res) => {
     );
 
     if (!prodRows.length) {
-      console.log(
-        "⚠️ Product not found, returning empty recommendations:",
-        prodId,
-      );
+      // console.log(
+      //   "⚠️ Product not found, returning empty recommendations:",
+      //   prodId,
+      // );
       cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
       return res.json([]);
     }
@@ -322,9 +322,9 @@ export const getRecommendations = async (req, res) => {
     const product = prodRows[0];
 
     // Debug logs as required
-    console.log("Current Product:", product.name);
-    console.log("Journey Level:", product.journey_level);
-    console.log("Is Subscription:", product.is_subscription);
+    // console.log("Current Product:", product.name);
+    // console.log("Journey Level:", product.journey_level);
+    // console.log("Is Subscription:", product.is_subscription);
 
     // 2. Guard clauses — return early with no recommendations
     if (
@@ -333,7 +333,7 @@ export const getRecommendations = async (req, res) => {
       product.journey_level === 0 ||
       product.journey_level >= 4
     ) {
-      console.log("Recommended Products: [] (suppressed by rules)");
+      // console.log("Recommended Products: [] (suppressed by rules)");
       cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
       return res.json([]);
     }
@@ -350,7 +350,7 @@ export const getRecommendations = async (req, res) => {
 
     const targetLevels = levelMap[product.journey_level];
     if (!targetLevels || targetLevels.length === 0) {
-      console.log("Recommended Products: []");
+      // console.log("Recommended Products: []");
       cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
       return res.json([]);
     }
@@ -398,10 +398,10 @@ export const getRecommendations = async (req, res) => {
       journey_level: prod.journey_level,
     }));
 
-    console.log(
-      "Recommended Products:",
-      recommendations.map((r) => r.name),
-    );
+    // console.log(
+    //   "Recommended Products:",
+    //   recommendations.map((r) => r.name),
+    // );
 
     cache.set(cacheKey, recommendations, RECOMMENDATIONS_TTL);
     res.json(recommendations);

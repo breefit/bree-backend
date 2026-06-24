@@ -120,7 +120,7 @@ export const createOrder = async (req, res) => {
       tax = 0,
     } = req.body;
 
-    console.log("[CREATE_ORDER] addressId:", addressId, "userId:", userId);
+    // console.log("[CREATE_ORDER] addressId:", addressId, "userId:", userId);
 
     const cart =
       Array.isArray(items) && items.length
@@ -200,7 +200,7 @@ export const createOrder = async (req, res) => {
         .filter(Boolean)
         .join(", ");
     }
-    console.log("[ADDRESS_SAVE] Snapshot:", shippingAddressSnapshot);
+    // console.log("[ADDRESS_SAVE] Snapshot:", shippingAddressSnapshot);
 
     const schemaInfo = await getOrderSchemaInfo(client);
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
@@ -272,16 +272,16 @@ export const createOrder = async (req, res) => {
 
     // TEMP DEBUG — remove once order_number generation is confirmed stable
     // in production.
-    console.log("[ORDER_NUMBER] Generated:", orderNumber);
+    // console.log("[ORDER_NUMBER] Generated:", orderNumber);
 
-    console.log(
-      "[CREATE_ORDER] orderId:",
-      orderId,
-      "orderNumber:",
-      orderNumber,
-      "total:",
-      total,
-    );
+    // console.log(
+    //   "[CREATE_ORDER] orderId:",
+    //   orderId,
+    //   "orderNumber:",
+    //   orderNumber,
+    //   "total:",
+    //   total,
+    // );
 
     if (isNewOrderSchema) {
       await client.query(
@@ -329,9 +329,9 @@ export const createOrder = async (req, res) => {
 
     // TEMP DEBUG — confirms the value actually landed in the row, not just
     // that getNextOrderNumber() returned something. Remove once confirmed.
-    console.log("[ORDER_NUMBER] Saved:", orderId, orderNumber);
+    // console.log("[ORDER_NUMBER] Saved:", orderId, orderNumber);
 
-    console.log("[ORDER_SAVE] Saved order:", orderId);
+    // console.log("[ORDER_SAVE] Saved order:", orderId);
 
     for (const item of orderItems) {
       const itemId = crypto.randomUUID();
@@ -380,7 +380,7 @@ export const createOrder = async (req, res) => {
 
     await client.query("COMMIT");
 
-    console.log("[CREATE_ORDER] Complete. orderId:", orderId);
+    // console.log("[CREATE_ORDER] Complete. orderId:", orderId);
 
     try {
       const io = req.app?.locals?.io;
@@ -507,7 +507,7 @@ export const getOrderSuccess = async (req, res) => {
     const userId = req.user?.id;
     const { id } = req.params;
 
-    console.log("[ORDER_SUCCESS] Fetching orderId:", id, "userId:", userId);
+    // console.log("[ORDER_SUCCESS] Fetching orderId:", id, "userId:", userId);
 
     const schemaInfo = await getOrderSchemaInfo();
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
@@ -532,12 +532,12 @@ export const getOrderSuccess = async (req, res) => {
 
     const { rows: orderRows } = await query(orderQuery, [id, userId]);
     if (!orderRows.length) {
-      console.warn("[ORDER_SUCCESS] Order not found:", id);
+      // console.warn("[ORDER_SUCCESS] Order not found:", id);
       return res.status(404).json({ message: "Order not found" });
     }
 
     const orderRow = orderRows[0];
-    console.log("[ORDER_SUCCESS] orderRow:", JSON.stringify(orderRow));
+    // console.log("[ORDER_SUCCESS] orderRow:", JSON.stringify(orderRow));
 
     // ── Shipping address resolution (3-tier fallback) ────────────────────────
     // Tier 1: shipping_address column (set at order creation time — most reliable)
@@ -546,16 +546,16 @@ export const getOrderSuccess = async (req, res) => {
     let shippingAddress = "";
 
     const tier1 = orderRow.shipping_address;
-    console.log("[ORDER_SUCCESS] Tier-1 shipping_address from DB:", tier1);
+    // console.log("[ORDER_SUCCESS] Tier-1 shipping_address from DB:", tier1);
 
     if (tier1 && tier1.trim()) {
       shippingAddress = tier1.trim();
-      console.log("[ORDER_SUCCESS] Using Tier-1 shipping_address");
+      // console.log("[ORDER_SUCCESS] Using Tier-1 shipping_address");
     } else if (orderRow.address_id) {
-      console.log(
-        "[ORDER_SUCCESS] Tier-1 empty, trying Tier-2 address_id:",
-        orderRow.address_id,
-      );
+      // console.log(
+      //   "[ORDER_SUCCESS] Tier-1 empty, trying Tier-2 address_id:",
+      //   orderRow.address_id,
+      // );
 
       // Tier 2a: user_addresses table
       const { rows: addressRows } = await query(
@@ -607,7 +607,7 @@ export const getOrderSuccess = async (req, res) => {
         ]
           .filter(Boolean)
           .join(", ");
-        console.log("[ORDER_SUCCESS] Using Tier-2 address:", shippingAddress);
+        // console.log("[ORDER_SUCCESS] Using Tier-2 address:", shippingAddress);
       }
     }
 
@@ -641,10 +641,10 @@ export const getOrderSuccess = async (req, res) => {
       updatedAt: orderRow.updated_at,
     };
 
-    console.log(
-      "[ORDER_SUCCESS] canonicalOrder.shippingAddress:",
-      canonicalOrder.shippingAddress,
-    );
+    // console.log(
+    //   "[ORDER_SUCCESS] canonicalOrder.shippingAddress:",
+    //   canonicalOrder.shippingAddress,
+    // );
 
     const itemQuery = useNewOrderItems
       ? `SELECT product_id, product_name AS name, product_image AS image, product_price AS unit_price,
@@ -682,10 +682,10 @@ export const getOrderSuccess = async (req, res) => {
       paymentDetails,
     };
 
-    console.log(
-      "[ORDER_SUCCESS] Response shippingAddress:",
-      canonicalOrder.shippingAddress || "(empty)",
-    );
+    // console.log(
+    //   "[ORDER_SUCCESS] Response shippingAddress:",
+    //   canonicalOrder.shippingAddress || "(empty)",
+    // );
     return res.json(responseBody);
   } catch (error) {
     console.error("[ORDER_SUCCESS] Error:", error);
@@ -765,10 +765,10 @@ export const getOrderTracking = async (req, res) => {
     const schemaInfo = await getOrderSchemaInfo();
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
-    console.log("[DIAGNOSTIC] Schema Info:", {
-      isNewOrderSchema,
-      hasNewOrderItems: schemaInfo.hasNewOrderItems,
-    });
+    // console.log("[DIAGNOSTIC] Schema Info:", {
+    //   isNewOrderSchema,
+    //   hasNewOrderItems: schemaInfo.hasNewOrderItems,
+    // });
 
     const orderQuery = isNewOrderSchema
       ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
@@ -816,14 +816,14 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
          WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`;
 
-    console.log(
-      "[DIAGNOSTIC] Using schema:",
-      isNewOrderSchema ? "NEW" : "LEGACY",
-    );
-    console.log(
-      "[DIAGNOSTIC] SQL Query (first 200 chars):",
-      orderQuery.substring(0, 200) + "...",
-    );
+    // console.log(
+    //   "[DIAGNOSTIC] Using schema:",
+    //   isNewOrderSchema ? "NEW" : "LEGACY",
+    // );
+    // console.log(
+    //   "[DIAGNOSTIC] SQL Query (first 200 chars):",
+    //   orderQuery.substring(0, 200) + "...",
+    // );
 
     const { rows: orderRows } = await query(orderQuery, [id, userId]);
 
@@ -833,15 +833,15 @@ export const getOrderTracking = async (req, res) => {
 
     const order = orderRows[0];
 
-    console.log("Tracking order id:", id);
-    console.log("ORDER ROW:", order);
-    console.log(
-      "[DIAGNOSTIC] Raw orderRows[0]:",
-      JSON.stringify(order, null, 2),
-    );
-    console.log("[DIAGNOSTIC] orderRows[0].created_at:", order.created_at);
-    console.log("[DIAGNOSTIC] orderRows[0] keys:", Object.keys(order));
-    console.log("Order ID:", order.id);
+    // console.log("Tracking order id:", id);
+    // console.log("ORDER ROW:", order);
+    // console.log(
+    //   "[DIAGNOSTIC] Raw orderRows[0]:",
+    //   JSON.stringify(order, null, 2),
+    // );
+    // console.log("[DIAGNOSTIC] orderRows[0].created_at:", order.created_at);
+    // console.log("[DIAGNOSTIC] orderRows[0] keys:", Object.keys(order));
+    // console.log("Order ID:", order.id);
 
     // Ensure we include product_image and subtotal in the tracking API
     const { rows: orderItems } = await query(
@@ -859,7 +859,7 @@ WHERE order_id = ?
       [order.id],
     );
 
-    console.log("ORDER ITEMS RAW:", orderItems);
+    // console.log("ORDER ITEMS RAW:", orderItems);
 
     const { rows: historyRows } = await query(
       `SELECT id, previous_status, new_status, changed_by, notes, created_at
@@ -900,34 +900,34 @@ WHERE order_id = ?
       items: orderItems,
     };
 
-    console.log("RESPONSE ORDER:", responseOrder);
-    console.log("[DIAGNOSTIC] responseOrder after spread:", {
-      id: responseOrder.id,
-      created_at: responseOrder.created_at,
-      user_id: responseOrder.user_id,
-      order_status: responseOrder.order_status,
-    });
-    console.log("ORDER CREATED_AT:", responseOrder.created_at);
-    console.log("ORDER RESPONSE:", responseOrder);
+    // console.log("RESPONSE ORDER:", responseOrder);
+    // console.log("[DIAGNOSTIC] responseOrder after spread:", {
+    //   id: responseOrder.id,
+    //   created_at: responseOrder.created_at,
+    //   user_id: responseOrder.user_id,
+    //   order_status: responseOrder.order_status,
+    // });
+    // console.log("ORDER CREATED_AT:", responseOrder.created_at);
+    // console.log("ORDER RESPONSE:", responseOrder);
 
-    console.log(
-      "[TRACKING API]",
-      JSON.stringify(
-        {
-          order: responseOrder,
-          items: orderItems,
-          history: historyRows,
-        },
-        null,
-        2,
-      ),
-    );
+    // console.log(
+    //   "[TRACKING API]",
+    //   JSON.stringify(
+    //     {
+    //       order: responseOrder,
+    //       items: orderItems,
+    //       history: historyRows,
+    //     },
+    //     null,
+    //     2,
+    //   ),
+    // );
 
-    console.log("FINAL ITEMS SENT");
-    console.log(JSON.stringify(orderItems, null, 2));
+    // console.log("FINAL ITEMS SENT");
+    // console.log(JSON.stringify(orderItems, null, 2));
 
-    console.log("FIRST ITEM");
-    console.log(orderItems[0]);
+    // console.log("FIRST ITEM");
+    // console.log(orderItems[0]);
 
     const finalResponse = {
       success: true,
@@ -936,12 +936,12 @@ WHERE order_id = ?
       history: historyRows,
     };
 
-    console.log("\n📤 FINAL API RESPONSE (to send to client):");
-    console.log(JSON.stringify(finalResponse, null, 2));
-    console.log(
-      "✅ Response includes order.created_at:",
-      !!finalResponse.order.created_at,
-    );
+    // console.log("\n📤 FINAL API RESPONSE (to send to client):");
+    // console.log(JSON.stringify(finalResponse, null, 2));
+    // console.log(
+    //   "✅ Response includes order.created_at:",
+    //   !!finalResponse.order.created_at,
+    // );
 
     res.json(finalResponse);
   } catch (error) {

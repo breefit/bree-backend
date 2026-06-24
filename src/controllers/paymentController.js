@@ -246,7 +246,7 @@ export const createOrder = async (req, res) => {
 
     // TEMP DEBUG — remove once order_number generation is confirmed stable
     // in production.
-    console.log("[ORDER_NUMBER] Generated:", orderNumber);
+    // console.log("[ORDER_NUMBER] Generated:", orderNumber);
 
     // For Magic Checkout, customer details are unknown at this point — stored
     // as NULL and updated after payment verification.
@@ -290,7 +290,7 @@ export const createOrder = async (req, res) => {
 
     // TEMP DEBUG — confirms the value actually landed in the row, not just
     // that getNextOrderNumber() returned something. Remove once confirmed.
-    console.log("[ORDER_NUMBER] Saved:", orderId, orderNumber);
+    // console.log("[ORDER_NUMBER] Saved:", orderId, orderNumber);
 
     // Persist cart snapshot so verify-payment can rebuild order items without
     // trusting frontend data a second time.
@@ -410,10 +410,10 @@ export const verifyPayment = async (req, res) => {
     shippingAddress,
   } = req.body;
 
-  console.log("================================");
-  console.log("VERIFY PAYMENT HIT");
-  console.log(req.body);
-  console.log("================================");
+  // console.log("================================");
+  // console.log("VERIFY PAYMENT HIT");
+  // console.log(req.body);
+  // console.log("================================");
 
   console.info("[VERIFY_PAYMENT] Request received", {
     razorpay_order_id,
@@ -465,9 +465,9 @@ export const verifyPayment = async (req, res) => {
         orderId: alreadyProcessed[0].id,
       },
     );
-    console.log("VERIFY STARTED");
-    console.log("subscription id:", razorpay_subscription_id);
-    console.log("payment id:", razorpay_payment_id);
+    // console.log("VERIFY STARTED");
+    // console.log("subscription id:", razorpay_subscription_id);
+    // console.log("payment id:", razorpay_payment_id);
     return res.json({
       success: true,
       order_id: alreadyProcessed[0].id,

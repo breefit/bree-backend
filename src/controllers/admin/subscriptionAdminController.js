@@ -146,12 +146,12 @@ export const getSubscriptions = async (req, res) => {
 };
 
 export const getSubscriptionDetails = async (req, res) => {
-  console.log("[DETAILS PARAM]", req.params.id);
+  // console.log("[DETAILS PARAM]", req.params.id);
 
   try {
     const { id } = req.params;
 
-    console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
+    // console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
 
     const { rows } = await query(
       `SELECT
@@ -189,8 +189,8 @@ export const getSubscriptionDetails = async (req, res) => {
       [id],
     );
 
-    console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
-    console.log("[MAIN QUERY RESULT]", rows);
+    // console.log("[SUB DETAILS] QUERY START", { subscriptionId: id });
+    // console.log("[MAIN QUERY RESULT]", rows);
 
     if (!rows.length) {
       return res.status(404).json({ message: "Subscription not found" });
@@ -198,7 +198,7 @@ export const getSubscriptionDetails = async (req, res) => {
 
     const s = rows[0];
 
-    console.log("[SUB DETAILS] QUERY START items", { orderId: id });
+    // console.log("[SUB DETAILS] QUERY START items", { orderId: id });
 
     const itemsResult = await query(
       `SELECT id, product_name, product_image, product_price, quantity, subtotal
@@ -206,11 +206,11 @@ export const getSubscriptionDetails = async (req, res) => {
        WHERE order_id = ?`,
       [id],
     );
-    console.log("[ITEMS RESULT]", itemsResult.rows);
+    // console.log("[ITEMS RESULT]", itemsResult.rows);
 
-    console.log("[SUB DETAILS] QUERY START payments", {
-      razorpaySubscriptionId: s.razorpay_subscription_id,
-    });
+    // console.log("[SUB DETAILS] QUERY START payments", {
+    //   razorpaySubscriptionId: s.razorpay_subscription_id,
+    // });
 
     let billingRows = [];
     if (s.razorpay_subscription_id) {
@@ -226,12 +226,12 @@ export const getSubscriptionDetails = async (req, res) => {
       );
       billingRows = billingResult.rows;
     }
-    console.log("[PAYMENTS RESULT]", billingRows);
+    // console.log("[PAYMENTS RESULT]", billingRows);
 
     // FIX (Requirement §4): Added order_number to renewal orders query
-    console.log("[SUB DETAILS] QUERY START renewals", {
-      razorpaySubscriptionId: s.razorpay_subscription_id,
-    });
+    // console.log("[SUB DETAILS] QUERY START renewals", {
+    //   razorpaySubscriptionId: s.razorpay_subscription_id,
+    // });
 
     let renewalRows = [];
     if (s.razorpay_subscription_id) {
@@ -260,7 +260,7 @@ export const getSubscriptionDetails = async (req, res) => {
         created_at: row.created_at,
       }));
     }
-    console.log("[RENEWALS RESULT]", renewalRows);
+    // console.log("[RENEWALS RESULT]", renewalRows);
 
     // Resolve address fields from whichever table was actually populated
     const addressName = s.ua2_full_name || s.contact_name || null;

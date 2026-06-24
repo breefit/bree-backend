@@ -22,15 +22,15 @@ export const getRazorpay = () => {
 
   console.log("✅ Razorpay initialized");
 
-  console.log("Subscriptions API Available:", !!razorpayInstance.subscriptions);
+  // console.log("Subscriptions API Available:", !!razorpayInstance.subscriptions);
 
-  console.log("Pause Method:", typeof razorpayInstance.subscriptions?.pause);
+  // console.log("Pause Method:", typeof razorpayInstance.subscriptions?.pause);
 
-  console.log("Resume Method:", typeof razorpayInstance.subscriptions?.resume);
+  // console.log("Resume Method:", typeof razorpayInstance.subscriptions?.resume);
 
-  console.log("Fetch Method:", typeof razorpayInstance.subscriptions?.fetch);
+  // console.log("Fetch Method:", typeof razorpayInstance.subscriptions?.fetch);
 
-  console.log("Create Method:", typeof razorpayInstance.subscriptions?.create);
+  // console.log("Create Method:", typeof razorpayInstance.subscriptions?.create);
 
   return razorpayInstance;
 };

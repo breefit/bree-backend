@@ -34,14 +34,14 @@ const toMySQLDateTime = (date) => {
 export const createSubscription = async (req, res) => {
   const userId = req.user?.id || null;
 
-  console.log("[SUBSCRIPTION] createSubscription called", {
-    userId,
-    email: req.body?.email,
-    itemCount: req.body?.items?.length,
-    hasCustomerName: !!req.body?.customerName,
-    hasShippingAddress: !!req.body?.shippingAddress,
-    hasMobileNumber: !!req.body?.mobileNumber,
-  });
+  // console.log("[SUBSCRIPTION] createSubscription called", {
+  //   userId,
+  //   email: req.body?.email,
+  //   itemCount: req.body?.items?.length,
+  //   hasCustomerName: !!req.body?.customerName,
+  //   hasShippingAddress: !!req.body?.shippingAddress,
+  //   hasMobileNumber: !!req.body?.mobileNumber,
+  // });
 
   const {
     items,
@@ -247,7 +247,7 @@ export const createSubscription = async (req, res) => {
     }
 
     razorpayPlanId = product.razorpay_plan_id;
-    console.log("[SUBSCRIPTION] Using Product Plan:", razorpayPlanId);
+    // console.log("[SUBSCRIPTION] Using Product Plan:", razorpayPlanId);
   } catch (error) {
     console.error("[SUBSCRIPTION] Failed to load product plan", error);
     return res
@@ -293,21 +293,21 @@ export const createSubscription = async (req, res) => {
     // FIX (Requirement §2): Generate order number here, after client exists
     const orderNumber = await getNextOrderNumber(client);
 
-    console.log("[SUBSCRIPTION] Inserting order", {
-      orderId,
-      orderNumber,
-      userId,
-      subscriptionId: subscription.id,
-      planId: razorpayPlanId,
-      amount: serverTotal,
-    });
+    // console.log("[SUBSCRIPTION] Inserting order", {
+    //   orderId,
+    //   orderNumber,
+    //   userId,
+    //   subscriptionId: subscription.id,
+    //   planId: razorpayPlanId,
+    //   amount: serverTotal,
+    // });
 
-    console.log("orderId:", orderId);
-    console.log("orderNumber:", orderNumber);
-    console.log("userId:", userId);
-    console.log("addressId:", addressId);
-    console.log("subscriptionId:", subscription.id);
-    console.log("planId:", razorpayPlanId);
+    // console.log("orderId:", orderId);
+    // console.log("orderNumber:", orderNumber);
+    // console.log("userId:", userId);
+    // console.log("addressId:", addressId);
+    // console.log("subscriptionId:", subscription.id);
+    // console.log("planId:", razorpayPlanId);
 
     // FIX (Requirements §3 & §4): Added order_number to INSERT columns and VALUES
     await client.query(
@@ -392,11 +392,11 @@ export const createSubscription = async (req, res) => {
 
     await client.query("COMMIT");
 
-    console.log("[SUBSCRIPTION] Order committed successfully", {
-      orderId,
-      orderNumber,
-      subscriptionId: subscription.id,
-    });
+    // console.log("[SUBSCRIPTION] Order committed successfully", {
+    //   orderId,
+    //   orderNumber,
+    //   subscriptionId: subscription.id,
+    // });
 
     try {
       const io = req.app?.locals?.io;
@@ -536,11 +536,11 @@ export const getMySubscriptions = async (req, res) => {
         const finalStatus = PROTECTED_STATUSES.includes(currentStatus)
           ? currentStatus
           : liveSub.status;
-        console.log("[SYNC STATUS]", {
-          currentStatus,
-          razorpayStatus: liveSub.status,
-          finalStatus,
-        });
+        // console.log("[SYNC STATUS]", {
+        //   currentStatus,
+        //   razorpayStatus: liveSub.status,
+        //   finalStatus,
+        // });
 
         sub.subscription_status = finalStatus;
 
@@ -640,21 +640,21 @@ export const cancelSubscription = async (req, res) => {
     );
 
     if (!rows.length) {
-      console.warn("[CANCEL] Subscription not found", {
-        razorpaySubscriptionId,
-        userId,
-      });
+      // console.warn("[CANCEL] Subscription not found", {
+      //   razorpaySubscriptionId,
+      //   userId,
+      // });
       return res.status(404).json({ message: "Subscription not found" });
     }
 
     const order = rows[0];
 
-    console.log("[CANCEL]", {
-      routeId: razorpaySubscriptionId,
-      dbSubscriptionId: order.razorpay_subscription_id,
-      orderId: order.id,
-      currentStatus: order.order_status,
-    });
+    // console.log("[CANCEL]", {
+    //   routeId: razorpaySubscriptionId,
+    //   dbSubscriptionId: order.razorpay_subscription_id,
+    //   orderId: order.id,
+    //   currentStatus: order.order_status,
+    // });
 
     const rzp = getRazorpay();
     let response;
@@ -680,12 +680,12 @@ export const cancelSubscription = async (req, res) => {
       });
     }
 
-    console.log("[RAZORPAY CANCEL RESPONSE]", {
-      subscriptionId: order.razorpay_subscription_id,
-      status: response.status,
-      cancelAt: response.cancel_at,
-      endAt: response.end_at,
-    });
+    // console.log("[RAZORPAY CANCEL RESPONSE]", {
+    //   subscriptionId: order.razorpay_subscription_id,
+    //   status: response.status,
+    //   cancelAt: response.cancel_at,
+    //   endAt: response.end_at,
+    // });
 
     try {
       // CRITICAL: Only update subscription_status. order_status is a
@@ -749,26 +749,26 @@ export const pauseSubscription = async (req, res) => {
 
     const order = rows[0];
 
-    console.log("[PAUSE]", {
-      razorpaySubscriptionId: order.razorpay_subscription_id,
-      orderId: order.id,
-    });
+    // console.log("[PAUSE]", {
+    //   razorpaySubscriptionId: order.razorpay_subscription_id,
+    //   orderId: order.id,
+    // });
 
     const rzp = getRazorpay();
-    console.log("RAZORPAY VERSION TEST");
-    console.log("subscriptions:", rzp.subscriptions);
-    console.log("pause method:", typeof rzp.subscriptions.pause);
-    console.log("resume method:", typeof rzp.subscriptions.resume);
+    // console.log("RAZORPAY VERSION TEST");
+    // console.log("subscriptions:", rzp.subscriptions);
+    // console.log("pause method:", typeof rzp.subscriptions.pause);
+    // console.log("resume method:", typeof rzp.subscriptions.resume);
     let response;
     try {
-      console.log("PAUSING SUB:", order.razorpay_subscription_id);
+      // console.log("PAUSING SUB:", order.razorpay_subscription_id);
 
       response = await rzp.subscriptions.pause(order.razorpay_subscription_id, {
         pause_at_cycle_end: 0,
         customer_notify: 1,
       });
 
-      console.log("PAUSE RAW RESPONSE:", response);
+      // console.log("PAUSE RAW RESPONSE:", response);
     } catch (rzpErr) {
       console.error("[PAUSE] Razorpay API call failed", {
         razorpaySubscriptionId: order.razorpay_subscription_id,
@@ -783,10 +783,10 @@ export const pauseSubscription = async (req, res) => {
       });
     }
 
-    console.log("[RAZORPAY PAUSE RESPONSE]", {
-      subscriptionId: order.razorpay_subscription_id,
-      status: response.status,
-    });
+    // console.log("[RAZORPAY PAUSE RESPONSE]", {
+    //   subscriptionId: order.razorpay_subscription_id,
+    //   status: response.status,
+    // });
 
     try {
       // CRITICAL: Only update subscription_status. order_status is a
@@ -842,10 +842,10 @@ export const resumeSubscription = async (req, res) => {
 
     const order = rows[0];
 
-    console.log("[RESUME]", {
-      razorpaySubscriptionId: order.razorpay_subscription_id,
-      orderId: order.id,
-    });
+    // console.log("[RESUME]", {
+    //   razorpaySubscriptionId: order.razorpay_subscription_id,
+    //   orderId: order.id,
+    // });
 
     const rzp = getRazorpay();
     let response;
@@ -868,11 +868,11 @@ export const resumeSubscription = async (req, res) => {
       });
     }
 
-    console.log("[RAZORPAY RESUME RESPONSE]", {
-      subscriptionId: order.razorpay_subscription_id,
-      status: response.status,
-      chargeAt: response.charge_at,
-    });
+    // console.log("[RAZORPAY RESUME RESPONSE]", {
+    //   subscriptionId: order.razorpay_subscription_id,
+    //   status: response.status,
+    //   chargeAt: response.charge_at,
+    // });
 
     const nextBillingDate = response.charge_at
       ? toMySQLDateTime(response.charge_at * 1000)
