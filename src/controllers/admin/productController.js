@@ -90,17 +90,29 @@ const resolveProductStatus = (stockQty, status) => {
   return status !== undefined ? normalizeProductStatus(status) : "In Stock";
 };
 
-// BUG FIX 3 & 4 — shared helper so normalisation is identical in create and
-// update. Accepts the raw req.body value which can be:
-//   boolean true/false  (from JSON body)
-//   string "true"/"false"  (from multipart form)
-//   integer 1/0  (from a future GET→edit round-trip)
+// Accepts boolean true/false, string "true"/"false", or integer 1/0.
 // Returns 1 or 0 for the MySQL TINYINT(1) column.
 const normalizeIsSubscription = (value) => {
   if (value === true || value === 1 || value === "true" || value === "1") {
     return 1;
   }
   return 0;
+};
+
+// Clamp journey_level to 0–5 int range; default 0.
+const normalizeJourneyLevel = (value) => {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  if (n > 5) return 5;
+  return n;
+};
+
+// show_recommendations is 1 unless explicitly false/0/"false"/"0".
+const normalizeShowRecommendations = (value) => {
+  if (value === false || value === 0 || value === "false" || value === "0") {
+    return 0;
+  }
+  return 1;
 };
 
 const invalidateProductCache = () => {
@@ -134,11 +146,11 @@ export const getProducts = async (req, res) => {
 
   const [productsRes, countRes] = await Promise.all([
     query(
-      // is_subscription included so the admin table can show the flag and
-      // so reopening the edit modal always receives the correct value.
       `SELECT id, name, slug, category, description, price, mrp,
               quantity, stock_qty, image, features, popular, display_order,
-              status, is_active, is_subscription, created_at
+              status, is_active, is_subscription,
+              journey_level, show_recommendations,
+              created_at
        FROM products ${where} ORDER BY display_order ASC, created_at DESC
        LIMIT ? OFFSET ?`,
       params,
@@ -165,9 +177,6 @@ export const getProducts = async (req, res) => {
 // POST /api/admin/products
 // ============================================================
 export const createProduct = async (req, res) => {
-  // DEBUG — remove after confirming is_subscription saves correctly
-  console.log("CREATE PRODUCT BODY", req.body);
-
   const {
     name,
     category,
@@ -180,7 +189,9 @@ export const createProduct = async (req, res) => {
     status,
     stockQty,
     displayOrder,
-    is_subscription, // snake_case from frontend payload
+    is_subscription,
+    journey_level,
+    show_recommendations,
   } = req.body;
 
   const image =
@@ -196,11 +207,16 @@ export const createProduct = async (req, res) => {
 
   const stockQuantity = parseInt(stockQty || 0, 10);
   const productStatus = resolveProductStatus(stockQuantity, status);
-
-  // BUG FIX 3: Previous code used `=== true || === "true"` which silently
-  // failed when the value was integer 1 (possible after a round-trip through
-  // the edit form). normalizeIsSubscription() handles all four shapes.
   const isSubscriptionValue = normalizeIsSubscription(is_subscription);
+
+  // Auto-derive show_recommendations: if subscription product, always 0.
+  // Otherwise respect the admin's explicit choice (default: 1).
+  const showRecsValue =
+    isSubscriptionValue === 1
+      ? 0
+      : normalizeShowRecommendations(show_recommendations);
+
+  const journeyLevelValue = normalizeJourneyLevel(journey_level);
 
   const productId = randomUUID();
 
@@ -208,8 +224,8 @@ export const createProduct = async (req, res) => {
     `INSERT INTO products
      (id, name, slug, category, description, price, mrp, quantity,
       stock_qty, image, features, popular, status, display_order,
-      recommended_product_ids, is_subscription)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      recommended_product_ids, is_subscription, journey_level, show_recommendations)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       productId,
       name,
@@ -225,10 +241,13 @@ export const createProduct = async (req, res) => {
       popular === "true" || popular === true ? 1 : 0,
       productStatus,
       displayOrder !== undefined ? parseInt(displayOrder, 10) : 0,
-      JSON.stringify([]),
+      JSON.stringify([]), // recommended_product_ids kept for backwards-compat
       isSubscriptionValue,
+      journeyLevelValue,
+      showRecsValue,
     ],
   );
+
   if (isSubscriptionValue === 1) {
     try {
       console.log("[PLAN] Creating Razorpay plan for:", name);
@@ -252,14 +271,10 @@ export const createProduct = async (req, res) => {
 
       console.log("[PLAN] Razorpay Plan Created:", plan.id);
 
-      await query(
-        `
-      UPDATE products
-      SET razorpay_plan_id = ?
-      WHERE id = ?
-      `,
-        [plan.id, productId],
-      );
+      await query(`UPDATE products SET razorpay_plan_id = ? WHERE id = ?`, [
+        plan.id,
+        productId,
+      ]);
 
       console.log("[PLAN] Saved Plan ID:", plan.id);
     } catch (error) {
@@ -285,11 +300,6 @@ export const createProduct = async (req, res) => {
 // ============================================================
 export const updateProduct = async (req, res) => {
   try {
-    // DEBUG — remove after confirming is_subscription saves correctly
-    // console.log("================================");
-    // console.log("UPDATE PRODUCT BODY", req.body);
-    // console.log("================================");
-
     const {
       name,
       category,
@@ -303,7 +313,9 @@ export const updateProduct = async (req, res) => {
       stockQty,
       isActive,
       displayOrder,
-      is_subscription, // snake_case from frontend payload
+      is_subscription,
+      journey_level,
+      show_recommendations,
     } = req.body;
 
     const { rows: existingRows } = await query(
@@ -368,14 +380,27 @@ export const updateProduct = async (req, res) => {
       add("features", JSON.stringify(normalizedFeatures));
     }
 
-    // BUG FIX 4: Previous code had a typo — "is_Subscription" (capital S)
-    // inside the normalisation expression. JavaScript treated it as a new
-    // undefined variable, so the expression always evaluated to false and
-    // is_subscription was always written as 0 regardless of the checkbox.
-    // Fixed by using normalizeIsSubscription() which uses the correct
-    // lowercase variable name "is_subscription" throughout.
     if (is_subscription !== undefined) {
       add("is_subscription", normalizeIsSubscription(is_subscription));
+    }
+
+    if (journey_level !== undefined) {
+      add("journey_level", normalizeJourneyLevel(journey_level));
+    }
+
+    // Recalculate show_recommendations if either is_subscription or
+    // the explicit flag is changing. Subscription products are always 0.
+    const effectiveIsSubscription =
+      is_subscription !== undefined
+        ? normalizeIsSubscription(is_subscription)
+        : Number(existingProduct.is_subscription);
+
+    if (show_recommendations !== undefined || is_subscription !== undefined) {
+      const showRecsValue =
+        effectiveIsSubscription === 1
+          ? 0
+          : normalizeShowRecommendations(show_recommendations);
+      add("show_recommendations", showRecsValue);
     }
 
     const parsedStockQty =
@@ -399,10 +424,6 @@ export const updateProduct = async (req, res) => {
     }
 
     if (!req.params.id) {
-      console.error("Product update failed: missing product id", {
-        body: req.body,
-        file: req.file,
-      });
       return res.status(400).json({
         success: false,
         message: "Product ID is required",
@@ -413,15 +434,14 @@ export const updateProduct = async (req, res) => {
 
     const sql = `UPDATE products SET ${updates.join(", ")} WHERE id = ?`;
     await query(sql, params);
-    const oldSubscription = Number(existingProduct.is_subscription);
 
+    const oldSubscription = Number(existingProduct.is_subscription);
     const newSubscription =
       is_subscription !== undefined
         ? normalizeIsSubscription(is_subscription)
         : oldSubscription;
 
     const oldPrice = Number(existingProduct.price);
-
     const newPrice = price !== undefined ? Number(price) : oldPrice;
 
     const shouldCreatePlan =
@@ -457,14 +477,10 @@ export const updateProduct = async (req, res) => {
 
         console.log("[PLAN] Razorpay Plan Created:", plan.id);
 
-        await query(
-          `
-      UPDATE products
-      SET razorpay_plan_id = ?
-      WHERE id = ?
-      `,
-          [plan.id, req.params.id],
-        );
+        await query(`UPDATE products SET razorpay_plan_id = ? WHERE id = ?`, [
+          plan.id,
+          req.params.id,
+        ]);
 
         console.log("[PLAN] Saved Plan ID:", plan.id);
       } catch (error) {

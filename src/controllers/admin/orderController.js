@@ -44,7 +44,6 @@ export const getOrders = async (req, res) => {
   const phoneExpr = schemaInfo.isNewOrderSchema
     ? "o.contact_phone"
     : "o.mobile_number";
-  // Prefer `total` (new schema) but fall back to legacy `amount` if present
   const amountExpr = "COALESCE(o.total, o.amount)";
   const transactionExpr = schemaInfo.isNewOrderSchema
     ? "o.razorpay_payment_id"
@@ -71,7 +70,6 @@ export const getOrders = async (req, res) => {
   const shippingAddressExpr = `COALESCE(o.shipping_address, ${userAddressSnapshot}, ${legacyAddressSnapshot}, '')`;
   const notesExpr = schemaInfo.hasOrderNotes ? "o.notes" : "''";
 
-  // After MySQL migration, `order_items` uses `product_name`/`product_price`.
   const itemNameExpr = "oi.product_name";
   const itemPriceExpr = "oi.product_price";
 
@@ -126,9 +124,6 @@ export const getOrders = async (req, res) => {
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const sortColumn = sortExpressions[safeSort] || "o.created_at";
 
-  // Items subquery — returns full array with unit_price and total_price.
-  // Using a subquery avoids GROUP BY incompatibilities with ONLY_FULL_GROUP_BY.
-  // Also avoids JSON_ARRAYAGG([null]) when an order has no items.
   const itemsSubquery = `(
     SELECT COALESCE(
       JSON_ARRAYAGG(JSON_OBJECT(
@@ -144,7 +139,6 @@ export const getOrders = async (req, res) => {
     WHERE oi2.order_id = o.id
   )`;
 
-  // Comma-separated product names for the list view column
   const productNamesSubquery = `(
     SELECT COALESCE(
       GROUP_CONCAT(${itemNameExpr.replace(/\boi\b/g, "oi5")} ORDER BY oi5.created_at ASC SEPARATOR ', '),
@@ -185,7 +179,6 @@ export const getOrders = async (req, res) => {
     query(`SELECT COUNT(*) AS total FROM orders o ${where}`, params),
   ]);
 
-  // Parse items JSON string if the DB driver returns it as a string
   const orders = ordersRes.rows.map((row) => ({
     ...row,
     items:
@@ -262,7 +255,6 @@ export const getOrder = async (req, res) => {
     WHERE oi2.order_id = o.id
   )`;
 
-  // Comma-separated product names for convenience
   const productNamesSubqueryDetail = `(
     SELECT COALESCE(
       GROUP_CONCAT(${itemNameExpr.replace(/\boi\b/g, "oi5")} ORDER BY oi5.created_at ASC SEPARATOR ', '),
@@ -498,37 +490,110 @@ export const bulkUpdateStatus = async (req, res) => {
     await client.query("BEGIN");
 
     const placeholders = ids.map(() => "?").join(",");
-    const selectSql = `SELECT * FROM orders WHERE id IN (${placeholders}) FOR UPDATE`;
-    const { rows: found } = await client.query(selectSql, ids);
+
+    // Lock rows for update and fetch diagnostic fields
+    const { rows: found } = await client.query(
+      `SELECT id, order_number, is_subscription, order_status, subscription_status
+       FROM orders
+       WHERE id IN (${placeholders})
+       FOR UPDATE`,
+      ids,
+    );
+
     if (!found.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ message: "No matching orders found" });
     }
 
-    const ORDER_STEPS = ["pending", "confirmed", "dispatched", "delivered"];
-    const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
+    // ─── Diagnostic log ───────────────────────────────────────────────────────
+    // Both standard orders (is_subscription=0) and subscription orders
+    // (is_subscription=1) share the same order_status fulfillment pipeline:
+    //   pending → confirmed → processing → dispatched → delivered → cancelled
+    // subscription_status (active/paused/cancelled/expired) is a separate
+    // Razorpay subscription lifecycle field and is NOT used here.
+    // If a dedicated subscription fulfillment pipeline is ever introduced,
+    // add branching here and in updateOrderStatus().
+    console.log(
+      `[bulk-status] Requested status: "${status}" | Order count: ${found.length}`,
+    );
     for (const o of found) {
+      const orderType =
+        o.is_subscription && Number(o.is_subscription) === 1
+          ? "subscription"
+          : "standard";
+      const prev = normalizeOrderStatus(o.order_status);
+      const next = normalizeOrderStatus(status);
+
+      const ORDER_STEPS = [
+        "pending",
+        "confirmed",
+        "processing",
+        "dispatched",
+        "delivered",
+      ];
+      const idxOf = (s) => ORDER_STEPS.indexOf(s);
+      const prevIdx = idxOf(prev);
+      const nextIdx = idxOf(next);
+
+      let validationResult;
+      if (next === "cancelled") {
+        validationResult =
+          prev === "delivered"
+            ? "REJECTED (delivered cannot be cancelled)"
+            : "OK";
+      } else {
+        validationResult =
+          nextIdx === prevIdx + 1 || nextIdx === prevIdx
+            ? "OK"
+            : `REJECTED (invalid transition ${prev} → ${next})`;
+      }
+
+      console.log(
+        `[bulk-status] id=${o.id} | order_number=${o.order_number} | type=${orderType} | is_subscription=${o.is_subscription} | order_status=${o.order_status} | subscription_status=${o.subscription_status ?? "n/a"} | requested_status=${status} | validation=${validationResult}`,
+      );
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // Re-fetch full rows for transition checks, emails, and history
+    const { rows: foundFull } = await client.query(
+      `SELECT * FROM orders WHERE id IN (${placeholders})`,
+      ids,
+    );
+
+    // Validate status transitions for every order regardless of type
+    const ORDER_STEPS = [
+      "pending",
+      "confirmed",
+      "processing",
+      "dispatched",
+      "delivered",
+    ];
+    const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
+
+    for (const o of foundFull) {
       const prev = normalizeOrderStatus(o.order_status);
       const next = normalizeOrderStatus(status);
       const prevIdx = idxOf(prev);
       const nextIdx = idxOf(next);
+
       if (next === "cancelled") {
         if (prev === "delivered") {
           await client.query("ROLLBACK");
           return res.status(400).json({
-            message: `Order ${o.id} cannot be cancelled after delivery`,
+            message: `Order ${o.order_number || o.id} cannot be cancelled after delivery`,
           });
         }
       } else {
         if (!(nextIdx === prevIdx + 1 || nextIdx === prevIdx)) {
           await client.query("ROLLBACK");
           return res.status(400).json({
-            message: `Invalid transition for order ${o.id} from ${prev} to ${next}`,
+            message: `Invalid transition for order ${o.order_number || o.id} from ${prev} to ${next}`,
           });
         }
       }
     }
 
+    // Apply update to all selected orders
     await client.query(
       `UPDATE orders SET order_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`,
       [status, ...ids],
@@ -539,20 +604,26 @@ export const bulkUpdateStatus = async (req, res) => {
       ids,
     );
 
-    const historyStmt = `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by) VALUES `;
-    const historyValues = [];
-    const historyParams = [];
-    for (const o of found) {
-      historyParams.push(o.id, o.order_status, status, req.user?.id || null);
-      historyValues.push("(?, ?, ?, ?)");
-    }
-    if (historyValues.length) {
-      await client.query(historyStmt + historyValues.join(", "), historyParams);
+    // Insert history records for all orders whose status actually changed
+    const changedOrders = foundFull.filter((o) => o.order_status !== status);
+    if (changedOrders.length) {
+      const historyValues = changedOrders.map(() => "(?, ?, ?, ?)").join(", ");
+      const historyParams = changedOrders.flatMap((o) => [
+        o.id,
+        o.order_status,
+        status,
+        req.user?.id || null,
+      ]);
+      await client.query(
+        `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by) VALUES ${historyValues}`,
+        historyParams,
+      );
     }
 
     await client.query("COMMIT");
 
-    if (status && status !== "pending") {
+    // Send emails (fire-and-forget, never block the response)
+    if (status !== "pending") {
       const emailPromises = updated.map((orderItem) => {
         const recipientEmail = orderItem.contact_email || orderItem.email;
         const recipientName =
@@ -589,6 +660,7 @@ export const bulkUpdateStatus = async (req, res) => {
       Promise.allSettled(emailPromises).catch(() => {});
     }
 
+    // Emit socket events
     try {
       const io = req.app?.locals?.io;
       if (io) {
@@ -605,7 +677,7 @@ export const bulkUpdateStatus = async (req, res) => {
     });
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("Error in bulk update:", err);
+    console.error("[bulk-status] Error in bulk update:", err);
     res.status(500).json({ message: "Bulk update failed" });
   } finally {
     client.release();

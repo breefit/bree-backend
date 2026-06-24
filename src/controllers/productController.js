@@ -10,11 +10,10 @@ const RECOMMENDATIONS_TTL = 300;
 // ============================================================
 // COMMON PRODUCT SELECT
 // ============================================================
+// journey_level and show_recommendations are included in every
+// product query so frontend components have them available without
+// extra round-trips.
 
-// is_subscription is included here so every endpoint that uses PRODUCT_SELECT
-// returns the field. ProductCard reads it to decide "Subscribe Now" vs
-// "Add to Cart". Previously it was present in this query but missing from
-// the getRecommendations inline SELECT further below — fixed there too.
 const PRODUCT_SELECT = `
  SELECT
   p.id,
@@ -31,34 +30,8 @@ const PRODUCT_SELECT = `
   p.popular,
   p.status,
   p.is_subscription,
-  p.recommended_product_ids,
-
-    COALESCE(
-      (
-        SELECT JSON_ARRAYAGG(
-          JSON_OBJECT(
-            'id', rp.id,
-            'name', rp.name,
-            'slug', rp.slug,
-            'category', rp.category,
-            'description', rp.description,
-            'price', rp.price,
-            'mrp', rp.mrp,
-            'quantity', rp.quantity,
-            'stock_qty', rp.stock_qty,
-            'image', rp.image,
-            'features', rp.features,
-            'popular', rp.popular,
-            'status', rp.status,
-            'is_subscription', rp.is_subscription
-          )
-        )
-        FROM products rp
-        WHERE JSON_CONTAINS(p.recommended_product_ids, JSON_QUOTE(rp.id))
-        AND rp.is_active = 1
-      ),
-      JSON_ARRAY()
-    ) AS recommendations
+  p.journey_level,
+  p.show_recommendations
 
   FROM products p
 `;
@@ -152,10 +125,11 @@ export const getHomeProducts = async (req, res) => {
       return res.json(cached);
     }
 
+    // Lead with journey_level=1 product (trial), then popular product
     const trialRes = await query(`
       ${PRODUCT_SELECT}
       WHERE p.is_active = 1
-      AND p.quantity = 7
+      AND p.journey_level = 1
       LIMIT 1
     `);
 
@@ -255,7 +229,7 @@ export const getHomeData = async (req, res) => {
         query(`
           ${PRODUCT_SELECT}
           WHERE p.is_active = 1
-          AND p.quantity = 7
+          AND p.journey_level = 1
           LIMIT 1
         `),
         query(`
@@ -293,24 +267,44 @@ export const getHomeData = async (req, res) => {
 };
 
 // ============================================================
-// GET PRODUCT RECOMMENDATIONS
+// GET PRODUCT RECOMMENDATIONS — Journey-based, admin-safe
 // ============================================================
+//
+// Logic (mirrors the business rules, zero hardcoded IDs/names):
+//
+//   show_recommendations = 0  → return []
+//   is_subscription = 1       → return []
+//   journey_level = 0         → return []  (unclassified product)
+//   journey_level = 1         → next level only   (level 2)
+//   journey_level = 2         → next 2 levels     (level 3, 4)  — non-sub only
+//   journey_level = 3         → next level only   (level 4)
+//   journey_level = 4         → return []          (highest level)
+//   journey_level = 5+        → return []
+//
+// Filters applied automatically:
+//   - inactive products excluded  (is_active = 1)
+//   - subscription products excluded from upgrade suggestions
+//   - out-of-stock products excluded  (stock_qty > 0 AND status != 'Out Of Stock')
+//
+// The caller (CartDrawer) further filters products already in the cart.
 
 export const getRecommendations = async (req, res) => {
   try {
     const prodId = req.params.id;
     const cacheKey = `products:${prodId}:recommendations`;
+
     const cached = cache.get(cacheKey);
     if (cached) {
       return res.json(cached);
     }
 
+    // 1. Fetch the source product
     const { rows: prodRows } = await query(
       `
-      SELECT recommended_product_ids
+      SELECT id, name, journey_level, show_recommendations, is_subscription
       FROM products
       WHERE (id = ? OR slug = ?)
-      AND is_active = 1
+        AND is_active = 1
       LIMIT 1
       `,
       [prodId, prodId],
@@ -325,66 +319,92 @@ export const getRecommendations = async (req, res) => {
       return res.json([]);
     }
 
-    let recommendedIds = prodRows[0].recommended_product_ids || [];
+    const product = prodRows[0];
 
-    if (typeof recommendedIds === "string") {
-      try {
-        recommendedIds = JSON.parse(recommendedIds);
-      } catch (e) {
-        console.warn(
-          "Failed to parse recommended_product_ids:",
-          recommendedIds,
-        );
-        recommendedIds = [];
-      }
-    }
+    // Debug logs as required
+    console.log("Current Product:", product.name);
+    console.log("Journey Level:", product.journey_level);
+    console.log("Is Subscription:", product.is_subscription);
 
-    if (!Array.isArray(recommendedIds) || !recommendedIds.length) {
-      console.log("⚠️  No recommendations found for product:", prodId);
+    // 2. Guard clauses — return early with no recommendations
+    if (
+      product.show_recommendations === 0 ||
+      product.is_subscription === 1 ||
+      product.journey_level === 0 ||
+      product.journey_level >= 4
+    ) {
+      console.log("Recommended Products: [] (suppressed by rules)");
       cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
       return res.json([]);
     }
 
-    const placeholders = recommendedIds.map(() => "?").join(",");
+    // 3. Determine which journey levels to fetch
+    //    level 1 → [2]
+    //    level 2 → [3, 4]
+    //    level 3 → [4]
+    const levelMap = {
+      1: [2],
+      2: [3, 4],
+      3: [4],
+    };
+
+    const targetLevels = levelMap[product.journey_level];
+    if (!targetLevels || targetLevels.length === 0) {
+      console.log("Recommended Products: []");
+      cache.set(cacheKey, [], RECOMMENDATIONS_TTL);
+      return res.json([]);
+    }
+
+    // 4. Fetch matching products — dynamic, no hardcoded IDs
+    const placeholders = targetLevels.map(() => "?").join(",");
     const { rows } = await query(
-      // BUG FIX 5: is_subscription was missing from this SELECT, so any
-      // product shown as a recommendation would always display "Add to Cart"
-      // even when is_subscription = 1 in the DB.
-      `SELECT
-         id,
-         name,
-         slug,
-         category,
-         description,
-         price,
-         mrp,
-         quantity,
-         stock_qty,
-         image,
-         features,
-         popular,
-         status,
-         is_subscription
-       FROM products
-       WHERE id IN (${placeholders})
-       AND is_active = 1
-       AND stock_qty > 0
-       ORDER BY FIELD(id, ${placeholders})`,
-      [...recommendedIds, ...recommendedIds],
+      `
+      SELECT
+        id,
+        name,
+        slug,
+        description,
+        price,
+        mrp,
+        quantity,
+        stock_qty,
+        image,
+        features,
+        popular,
+        status,
+        is_subscription,
+        journey_level,
+        show_recommendations
+      FROM products
+      WHERE journey_level IN (${placeholders})
+        AND is_active = 1
+        AND is_subscription = 0
+        AND stock_qty > 0
+        AND status != 'Out Of Stock'
+      ORDER BY journey_level ASC
+      `,
+      targetLevels,
     );
 
-    const formattedRecommendations = rows.map((prod) => ({
+    const recommendations = rows.map((prod) => ({
       id: prod.id,
       name: prod.name,
+      slug: prod.slug,
       image: prod.image,
       price: parseFloat(prod.price),
       mrp: parseFloat(prod.mrp),
       quantity: prod.quantity,
-      is_subscription: prod.is_subscription, // included so ProductCard renders correctly
+      is_subscription: prod.is_subscription,
+      journey_level: prod.journey_level,
     }));
 
-    cache.set(cacheKey, formattedRecommendations, RECOMMENDATIONS_TTL);
-    res.json(formattedRecommendations);
+    console.log(
+      "Recommended Products:",
+      recommendations.map((r) => r.name),
+    );
+
+    cache.set(cacheKey, recommendations, RECOMMENDATIONS_TTL);
+    res.json(recommendations);
   } catch (error) {
     console.error("❌ Error fetching recommendations:", error);
     res.status(500).json({ message: "Failed to fetch recommendations" });
