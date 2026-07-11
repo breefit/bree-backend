@@ -4,16 +4,27 @@ import {
   formatAddressSnapshot,
   getOrderSchemaInfo,
 } from "../utils/orderSchema.js";
+import { normalizeOrderStatus } from "../constants/orderStatus.js";
 
 import { getNextOrderNumber } from "../utils/orderNumber.js";
 
-const normalizeOrderStatus = (s) => {
-  if (!s) return null;
-  const l = String(s).toLowerCase();
-  if (["processing", "shipped", "out_for_delivery", "dispatched"].includes(l))
-    return "dispatched";
-  if (["pending", "confirmed", "delivered", "cancelled"].includes(l)) return l;
-  return l;
+let productShippingColumnsAvailable = null;
+
+const getProductShippingColumnsAvailable = async () => {
+  if (productShippingColumnsAvailable !== null) {
+    return productShippingColumnsAvailable;
+  }
+
+  try {
+    const { rows } = await query(
+      "SHOW COLUMNS FROM products LIKE 'is_free_shipping'",
+    );
+    productShippingColumnsAvailable = rows.length > 0;
+  } catch {
+    productShippingColumnsAvailable = false;
+  }
+
+  return productShippingColumnsAvailable;
 };
 
 // ========================================
@@ -221,6 +232,7 @@ export const createOrder = async (req, res) => {
     }
 
     let calculatedSubtotal = 0;
+    let shippingCharge = 0;
     const orderItems = [];
 
     for (const it of cart) {
@@ -231,8 +243,12 @@ export const createOrder = async (req, res) => {
         return res.status(400).json({ message: "Invalid cart item" });
       }
 
+      const hasShippingColumns = await getProductShippingColumnsAvailable();
+      const shippingSelect = hasShippingColumns
+        ? ", is_free_shipping, shipping_charge, estimated_delivery"
+        : "";
       const { rows: productRows } = await client.query(
-        "SELECT id, name, image, price, stock_qty FROM products WHERE id = ? AND is_active = 1 LIMIT 1",
+        `SELECT id, name, image, price, stock_qty${shippingSelect} FROM products WHERE id = ? AND is_active = 1 LIMIT 1`,
         [productId],
       );
       if (!productRows.length) {
@@ -251,7 +267,20 @@ export const createOrder = async (req, res) => {
       }
 
       const price = parseFloat(product.price);
+      const isFreeShipping =
+        product.is_free_shipping === true ||
+        product.is_free_shipping === 1 ||
+        product.is_free_shipping === "true" ||
+        product.is_free_shipping === "1";
+      const parsedShippingCharge = Number(product.shipping_charge ?? 0);
+      const itemShippingCharge = isFreeShipping
+        ? 0
+        : Number.isFinite(parsedShippingCharge)
+          ? Math.max(0, parsedShippingCharge)
+          : 0;
+
       calculatedSubtotal += price * quantity;
+      shippingCharge += itemShippingCharge;
       orderItems.push({
         product_id: product.id,
         name: product.name,
@@ -259,10 +288,14 @@ export const createOrder = async (req, res) => {
         price,
         quantity,
         subtotal: price * quantity,
+        is_free_shipping: isFreeShipping,
+        shipping_charge: itemShippingCharge,
+        estimated_delivery:
+          String(product.estimated_delivery || "").trim() || null,
       });
     }
 
-    const total = calculatedSubtotal + parseFloat(shipping) + parseFloat(tax);
+    const total = calculatedSubtotal + shippingCharge + parseFloat(tax);
     const orderId = crypto.randomUUID();
 
     // FIX (Order Number feature): generate the human-friendly order_number
@@ -289,8 +322,9 @@ export const createOrder = async (req, res) => {
           id, order_number, user_id, address_id, contact_name, contact_email, contact_phone,
           customer_name, email, mobile_number,
           shipping_address, subtotal, shipping, tax, total,
+          is_free_shipping, shipping_charge, estimated_delivery,
           payment_status, order_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending_payment')`,
         [
           orderId,
           orderNumber,
@@ -304,15 +338,19 @@ export const createOrder = async (req, res) => {
           contactPhone,
           shippingAddressSnapshot,
           calculatedSubtotal,
-          shipping,
+          shippingCharge,
           tax,
           total,
+          orderItems.every((item) => item.is_free_shipping) ? 1 : 0,
+          shippingCharge,
+          orderItems.find((item) => item.estimated_delivery)
+            ?.estimated_delivery || null,
         ],
       );
     } else {
       await client.query(
         `INSERT INTO orders (id, order_number, user_id, address_id, customer_name, email, mobile_number, shipping_address, amount, payment_status, order_status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending_payment')`,
         [
           orderId,
           orderNumber,
@@ -372,7 +410,7 @@ export const createOrder = async (req, res) => {
       [
         orderId,
         null,
-        "pending",
+        "pending_payment",
         userId || null,
         "Order created via checkout flow",
       ],
@@ -385,7 +423,10 @@ export const createOrder = async (req, res) => {
     try {
       const io = req.app?.locals?.io;
       if (io)
-        io.emit("order:updated", { id: orderId, order_status: "pending" });
+        io.emit("order:updated", {
+          id: orderId,
+          order_status: "pending_payment",
+        });
     } catch (e) {}
 
     let responseShippingAddress = shippingAddressSnapshot;
@@ -427,13 +468,15 @@ export const getOrder = async (req, res) => {
     // FIX: Include shipping_address in new schema query
     const orderQuery = isNewOrderSchema
       ? `SELECT id, order_number, user_id, contact_email, contact_phone, contact_name,
-         shipping_address, subtotal, shipping, tax, total, payment_status, order_status,
+         shipping_address, subtotal, shipping, tax, total, is_free_shipping, shipping_charge, estimated_delivery,
+         payment_status, order_status,
          razorpay_order_id, razorpay_subscription_id, razorpay_payment_id, paid_at, subscription_status,
          next_billing_date, created_at, updated_at
        FROM orders
        WHERE id = ? AND (user_id = ? OR user_id IS NULL)`
       : `SELECT id, order_number, user_id, email AS contact_email, mobile_number AS contact_phone,
-         customer_name AS contact_name, shipping_address, amount AS total, payment_status,
+         customer_name AS contact_name, shipping_address, amount AS total, is_free_shipping, shipping_charge, estimated_delivery,
+         payment_status,
          order_status, razorpay_order_id, razorpay_subscription_id, razorpay_payment_id, paid_at,
          subscription_status, next_billing_date, created_at, updated_at
        FROM orders
@@ -517,6 +560,7 @@ export const getOrderSuccess = async (req, res) => {
     const orderQuery = isNewOrderSchema
       ? `SELECT id, order_number, user_id, contact_name, contact_email,
            contact_phone, address_id, shipping_address, subtotal, shipping, tax, total,
+           is_free_shipping, shipping_charge, estimated_delivery,
            payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
            razorpay_payment_id, paid_at, subscription_status, next_billing_date,
            created_at, updated_at
@@ -524,6 +568,7 @@ export const getOrderSuccess = async (req, res) => {
          WHERE id = ? AND (user_id = ? OR user_id IS NULL)`
       : `SELECT id, order_number, user_id, customer_name AS contact_name, email AS contact_email,
            mobile_number AS contact_phone, shipping_address, amount AS total,
+           is_free_shipping, shipping_charge, estimated_delivery,
            payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
            razorpay_payment_id, paid_at, subscription_status, next_billing_date,
            created_at, updated_at
@@ -627,6 +672,9 @@ export const getOrderSuccess = async (req, res) => {
       shippingAddress,
       subtotal: parseFloat(orderRow.subtotal ?? 0),
       shipping: parseFloat(orderRow.shipping ?? 0),
+      isFreeShipping: Boolean(orderRow.is_free_shipping),
+      shippingCharge: parseFloat(orderRow.shipping_charge ?? 0),
+      estimatedDelivery: orderRow.estimated_delivery || null,
       tax: parseFloat(orderRow.tax ?? 0),
       total: parseFloat(orderRow.total ?? orderRow.amount ?? 0),
       paymentStatus: orderRow.payment_status,
@@ -704,14 +752,16 @@ export const getMyOrders = async (req, res) => {
 
     const orderQuery = isNewOrderSchema
       ? `SELECT id, order_number, contact_name, contact_email, contact_phone, total,
-           payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
+           payment_status, order_status, is_free_shipping, shipping_charge, estimated_delivery,
+           razorpay_order_id, razorpay_subscription_id,
            subscription_status, next_billing_date, created_at
          FROM orders
          WHERE user_id = ?
          ORDER BY created_at DESC`
       : `SELECT id, order_number, customer_name AS contact_name, email AS contact_email,
            mobile_number AS contact_phone, amount AS total,
-           payment_status, order_status, razorpay_order_id, razorpay_subscription_id,
+           payment_status, order_status, is_free_shipping, shipping_charge, estimated_delivery,
+           razorpay_order_id, razorpay_subscription_id,
            subscription_status, next_billing_date, created_at
          FROM orders
          WHERE user_id = ?
@@ -772,7 +822,7 @@ export const getOrderTracking = async (req, res) => {
 
     const orderQuery = isNewOrderSchema
       ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
-           o.subtotal, o.shipping, o.tax, o.total, o.created_at,
+           o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.contact_name, o.contact_email,
            ua.full_name AS ua_full_name,
            ua.phone AS ua_phone,
@@ -794,7 +844,7 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
          WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`
       : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
-           o.subtotal, o.shipping, o.tax, o.total, o.created_at,
+           o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.customer_name AS contact_name, o.email AS contact_email,
            ua.full_name AS ua_full_name,
            ua.phone AS ua_phone,

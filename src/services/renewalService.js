@@ -17,7 +17,7 @@
 //    the existing row rather than inserting a duplicate.
 //
 // 3. Fulfillment-first: the renewal order starts at
-//    order_status   = 'confirmed'   (payment already received)
+//    order_status   = 'paid'   (payment already received)
 //    payment_status = 'paid'
 //    is_subscription = 1            (so admin sub views link it correctly)
 //    subscription_status = 'active' (billing state)
@@ -168,7 +168,7 @@ export const createRenewalOrder = async (
     // ── 5a. Insert the new order row ────────────────────────────────────────
     // Copies: user_id, address_id, customer details, shipping address,
     //         razorpay_subscription_id, razorpay_plan_id from the original.
-    // New:    order_number, id, order_status='confirmed', payment_status='paid',
+    // New:    order_number, id, order_status='paid', payment_status='paid',
     //         is_renewal_order=1, razorpay_payment_id, parent_order_id.
     await client.query(
       `INSERT INTO orders (
@@ -201,7 +201,7 @@ export const createRenewalOrder = async (
          updated_at
        ) VALUES (
          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-         ?, ?, ?, 'confirmed', 'paid', 'active',
+         ?, ?, ?, 'paid', 'paid', 'active',
          1, 1, ?, ?, ?, ?, ?,
          ?, NOW(), NOW(), NOW()
        )`,
@@ -277,7 +277,7 @@ export const createRenewalOrder = async (
     await client.query(
       `INSERT INTO order_status_history
          (order_id, previous_status, new_status, changed_by, notes)
-       VALUES (?, NULL, 'confirmed', NULL, ?)`,
+       VALUES (?, NULL, 'paid', NULL, ?)`,
       [
         renewalOrderId,
         `Renewal order created from subscription.charged webhook (sub: ${rzpSubscriptionId})`,

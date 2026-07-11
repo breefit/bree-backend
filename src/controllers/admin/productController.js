@@ -150,6 +150,7 @@ export const getProducts = async (req, res) => {
               quantity, stock_qty, image, features, popular, display_order,
               status, is_active, is_subscription,
               journey_level, show_recommendations,
+              is_free_shipping, shipping_charge, estimated_delivery,
               created_at
        FROM products ${where} ORDER BY display_order ASC, created_at DESC
        LIMIT ? OFFSET ?`,
@@ -192,6 +193,9 @@ export const createProduct = async (req, res) => {
     is_subscription,
     journey_level,
     show_recommendations,
+    is_free_shipping,
+    shipping_charge,
+    estimated_delivery,
   } = req.body;
 
   const image =
@@ -208,6 +212,19 @@ export const createProduct = async (req, res) => {
   const stockQuantity = parseInt(stockQty || 0, 10);
   const productStatus = resolveProductStatus(stockQuantity, status);
   const isSubscriptionValue = normalizeIsSubscription(is_subscription);
+  const isFreeShippingValue =
+    is_free_shipping === true ||
+    is_free_shipping === 1 ||
+    is_free_shipping === "true" ||
+    is_free_shipping === "1";
+  const normalizedShippingCharge =
+    isFreeShippingValue || shipping_charge === undefined
+      ? 0
+      : Math.max(0, Number(shipping_charge || 0));
+  const normalizedEstimatedDelivery =
+    typeof estimated_delivery === "string"
+      ? estimated_delivery.trim()
+      : estimated_delivery || null;
 
   // Auto-derive show_recommendations: if subscription product, always 0.
   // Otherwise respect the admin's explicit choice (default: 1).
@@ -224,8 +241,9 @@ export const createProduct = async (req, res) => {
     `INSERT INTO products
      (id, name, slug, category, description, price, mrp, quantity,
       stock_qty, image, features, popular, status, display_order,
-      recommended_product_ids, is_subscription, journey_level, show_recommendations)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      recommended_product_ids, is_subscription, journey_level, show_recommendations,
+      is_free_shipping, shipping_charge, estimated_delivery)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       productId,
       name,
@@ -245,6 +263,9 @@ export const createProduct = async (req, res) => {
       isSubscriptionValue,
       journeyLevelValue,
       showRecsValue,
+      isFreeShippingValue ? 1 : 0,
+      normalizedShippingCharge,
+      normalizedEstimatedDelivery,
     ],
   );
 
@@ -316,6 +337,9 @@ export const updateProduct = async (req, res) => {
       is_subscription,
       journey_level,
       show_recommendations,
+      is_free_shipping,
+      shipping_charge,
+      estimated_delivery,
     } = req.body;
 
     const { rows: existingRows } = await query(
@@ -405,6 +429,25 @@ export const updateProduct = async (req, res) => {
 
     const parsedStockQty =
       stockQty !== undefined ? parseInt(stockQty, 10) : undefined;
+    const isFreeShippingValue =
+      is_free_shipping !== undefined
+        ? is_free_shipping === true ||
+          is_free_shipping === 1 ||
+          is_free_shipping === "true" ||
+          is_free_shipping === "1"
+        : undefined;
+    const normalizedShippingCharge =
+      isFreeShippingValue === true
+        ? 0
+        : shipping_charge !== undefined
+          ? Math.max(0, Number(shipping_charge || 0))
+          : undefined;
+    const normalizedEstimatedDelivery =
+      estimated_delivery !== undefined
+        ? typeof estimated_delivery === "string"
+          ? estimated_delivery.trim()
+          : estimated_delivery || null
+        : undefined;
     const explicitStatus =
       status !== undefined ? normalizeProductStatus(status) : undefined;
 
@@ -421,6 +464,18 @@ export const updateProduct = async (req, res) => {
 
     if (resolvedStatus !== undefined) {
       add("status", resolvedStatus);
+    }
+
+    if (isFreeShippingValue !== undefined) {
+      add("is_free_shipping", isFreeShippingValue ? 1 : 0);
+    }
+
+    if (normalizedShippingCharge !== undefined) {
+      add("shipping_charge", normalizedShippingCharge);
+    }
+
+    if (normalizedEstimatedDelivery !== undefined) {
+      add("estimated_delivery", normalizedEstimatedDelivery);
     }
 
     if (!req.params.id) {

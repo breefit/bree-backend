@@ -1,14 +1,19 @@
 import bcrypt from "bcryptjs";
 import { query } from "../config/database.js";
+import { ensureUserCustomerNumber } from "../utils/customerNumber.js";
 
 // GET /api/profile
 export const getProfile = async (req, res, next) => {
   try {
     const { rows } = await query(
-      "SELECT id, name, email, phone, picture, provider, created_at FROM users WHERE id = ?",
+      "SELECT id, name, email, phone, picture, provider, customer_number, created_at FROM users WHERE id = ?",
       [req.user.id],
     );
-    res.json(rows[0]);
+    const user = rows[0];
+    if (user && !user.customer_number) {
+      user.customer_number = await ensureUserCustomerNumber(user.id);
+    }
+    res.json(user);
   } catch (err) {
     next(err);
   }
@@ -40,10 +45,14 @@ export const updateProfile = async (req, res, next) => {
     await query(`UPDATE users SET ${updates.join(", ")} WHERE id = ?`, params);
 
     const { rows } = await query(
-      `SELECT id, name, email, phone, picture FROM users WHERE id = ?`,
+      `SELECT id, name, email, phone, picture, customer_number FROM users WHERE id = ?`,
       [req.user.id],
     );
-    res.json(rows[0]);
+    const user = rows[0];
+    if (user && !user.customer_number) {
+      user.customer_number = await ensureUserCustomerNumber(user.id);
+    }
+    res.json(user);
   } catch (err) {
     next(err);
   }

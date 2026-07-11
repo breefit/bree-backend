@@ -17,6 +17,7 @@ import {
   addressRouter,
   contactRouter,
   testimonialRouter,
+  shippingRouter,
 } from "./routes/index.js";
 import adminRouter from "./routes/admin/index.js";
 import errorHandler from "./middleware/errorHandler.js";
@@ -53,19 +54,30 @@ const frontendUrls = (process.env.FRONTEND_URL || "http://localhost:3000")
   .map((url) => url.trim())
   .filter(Boolean);
 
-const allowedOrigins = [
-  ...new Set([
-    ...frontendUrls,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-  ]),
-].map((origin) => origin.replace(/\/$/, ""));
+const defaultDevOrigins = [
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "http://localhost:3001",
+  "http://127.0.0.1:3001",
+];
 
+const allowedOrigins = [
+  ...new Set([...frontendUrls, ...defaultDevOrigins]),
+].map((origin) => origin.replace(/\/$/, ""));
 
 // debug log for CORS allowed origins ------------------------------------------
 if (process.env.NODE_ENV === "production") {
   console.log("✅ CORS allowed origins:", allowedOrigins);
 }
+
+const isAllowedRazorpayOrigin = (origin) => {
+  if (!origin) {
+    return false;
+  }
+
+  const normalized = origin.replace(/\/$/, "");
+  return /(^|\.)razorpay\.(com|in)$/i.test(normalized);
+};
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -75,7 +87,10 @@ const corsOptions = {
     }
 
     const normalized = origin.replace(/\/$/, "");
-    if (allowedOrigins.includes(normalized)) {
+    if (
+      allowedOrigins.includes(normalized) ||
+      isAllowedRazorpayOrigin(normalized)
+    ) {
       return callback(null, true);
     }
 
@@ -178,6 +193,7 @@ try {
   app.use("/api/subscriptions", subscriptionRouter);
   app.use("/api/profile", profileRouter);
   app.use("/api/addresses", addressRouter);
+  app.use("/api/shipping", shippingRouter);
   app.use("/api/bulk-bookings", bulkRouter);
   app.use("/api/contact", contactRouter);
   app.use("/api/testimonials", testimonialRouter);

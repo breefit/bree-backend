@@ -18,6 +18,7 @@ import {
   revokeUserRefreshTokens,
   loadUserById,
 } from "../services/authService.js";
+import { ensureUserCustomerNumber } from "../utils/customerNumber.js";
 
 const SALT_ROUNDS = 12;
 
@@ -29,6 +30,7 @@ const safeUser = (u) => ({
   picture: u.picture,
   provider: u.provider,
   role: u.role || "user",
+  customer_number: u.customer_number || null,
 });
 
 const setAuthCookies = async (res, userId, req) => {
@@ -89,8 +91,10 @@ export const register = async (req, res, next) => {
       [userId, name.trim(), email.toLowerCase(), hashed],
     );
 
+    await ensureUserCustomerNumber(userId);
+
     const { rows } = await query(
-      `SELECT id, name, email, phone, picture, provider, role
+      `SELECT id, name, email, phone, picture, provider, role, customer_number
        FROM users
        WHERE id = ?`,
       [userId],
@@ -116,7 +120,7 @@ export const login = async (req, res, next) => {
     const { email, password } = req.body;
 
     const { rows } = await query(
-      "SELECT id, name, email, phone, picture, provider, role, password FROM users WHERE email = ?",
+      "SELECT id, name, email, phone, picture, provider, role, customer_number, password FROM users WHERE email = ?",
       [email.toLowerCase()],
     );
 
@@ -137,6 +141,8 @@ export const login = async (req, res, next) => {
     if (!valid) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
+
+    user.customer_number = await ensureUserCustomerNumber(user.id);
 
     const accessToken = await setAuthCookies(res, user.id, req);
     res.json({ ...safeUser(user), accessToken });
@@ -192,12 +198,15 @@ export const googleSignIn = async (req, res) => {
     );
 
     const { rows } = await query(
-      `SELECT id, name, email, phone, picture, provider, role
+      `SELECT id, name, email, phone, picture, provider, role, customer_number
        FROM users WHERE email = ?`,
       [email],
     );
 
     const user = rows[0];
+    if (user) {
+      user.customer_number = await ensureUserCustomerNumber(user.id);
+    }
     // console.log("[authController] googleSignIn created/loaded user row:", user);
     const accessToken = await setAuthCookies(res, user.id, req);
     return res.json({ ...safeUser(user), accessToken });

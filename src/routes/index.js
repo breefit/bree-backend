@@ -20,6 +20,7 @@ import {
   verifyPayment,
   getShippingInfo,
   getPromotions,
+  applyPromotions,
   handleWebhook,
   getPaymentStatus,
 } from "../controllers/paymentController.js";
@@ -47,6 +48,7 @@ import {
   getTestimonials,
   submitTestimonial,
 } from "../controllers/testimonialController.js";
+import { createShipment } from "../controllers/shippingController.js";
 import auth from "../middleware/auth.js";
 import { optionalAuth } from "../middleware/auth.js";
 
@@ -89,6 +91,7 @@ paymentRouter.get("/status/:paymentId", optionalAuth, getPaymentStatus);
 paymentRouter.post("/create-order", optionalAuth, createOrder);
 paymentRouter.post("/shipping-info", optionalAuth, getShippingInfo);
 paymentRouter.post("/promotions", optionalAuth, getPromotions);
+paymentRouter.post("/apply-promotions", optionalAuth, applyPromotions);
 paymentRouter.post("/verify", optionalAuth, verifyPayment);
 
 // ── Subscriptions (authenticated) ──────────────────────────────────────────────
@@ -121,3 +124,6 @@ contactRouter.post("/", submitInquiry);
 export const testimonialRouter = Router();
 testimonialRouter.get("/", getTestimonials);
 testimonialRouter.post("/", optionalAuth, submitTestimonial);
+// ── Shipping (authenticated) ──────────────────────────────────────────────────
+export const shippingRouter = Router();
+shippingRouter.post("/:orderId", auth, createShipment);

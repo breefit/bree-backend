@@ -333,10 +333,12 @@ export const updateOrderStatus = async (req, res) => {
     const params = [];
 
     const ORDER_STEPS = [
-      "pending",
-      "confirmed",
+      "pending_payment",
+      "paid",
       "processing",
-      "dispatched",
+      "ready_to_ship",
+      "shipped",
+      "out_for_delivery",
       "delivered",
     ];
     const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
@@ -356,6 +358,13 @@ export const updateOrderStatus = async (req, res) => {
           return res
             .status(400)
             .json({ message: "Cannot cancel a delivered order" });
+        }
+      } else if (next === "returned") {
+        if (prev !== "delivered" && prev !== "out_for_delivery") {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            message: `Invalid status transition from ${prev} to ${next}`,
+          });
         }
       } else {
         if (!(nextIdx === prevIdx + 1 || nextIdx === prevIdx)) {
@@ -422,7 +431,7 @@ export const updateOrderStatus = async (req, res) => {
     const recipientEmail = updated.contact_email || updated.email;
     const recipientName =
       updated.contact_name || updated.customer_name || "Customer";
-    if (status && status !== "pending" && recipientEmail) {
+    if (status && status !== "pending_payment" && recipientEmail) {
       const emailPromise = (() => {
         if (status === "delivered") {
           return sendOrderDeliveredEmail({
@@ -508,7 +517,8 @@ export const bulkUpdateStatus = async (req, res) => {
     // ─── Diagnostic log ───────────────────────────────────────────────────────
     // Both standard orders (is_subscription=0) and subscription orders
     // (is_subscription=1) share the same order_status fulfillment pipeline:
-    //   pending → confirmed → processing → dispatched → delivered → cancelled
+    //   pending_payment → paid → processing → ready_to_ship → shipped →
+    //   out_for_delivery → delivered → cancelled/returned
     // subscription_status (active/paused/cancelled/expired) is a separate
     // Razorpay subscription lifecycle field and is NOT used here.
     // If a dedicated subscription fulfillment pipeline is ever introduced,
@@ -525,10 +535,12 @@ export const bulkUpdateStatus = async (req, res) => {
       const next = normalizeOrderStatus(status);
 
       const ORDER_STEPS = [
-        "pending",
-        "confirmed",
+        "pending_payment",
+        "paid",
         "processing",
-        "dispatched",
+        "ready_to_ship",
+        "shipped",
+        "out_for_delivery",
         "delivered",
       ];
       const idxOf = (s) => ORDER_STEPS.indexOf(s);
@@ -562,10 +574,12 @@ export const bulkUpdateStatus = async (req, res) => {
 
     // Validate status transitions for every order regardless of type
     const ORDER_STEPS = [
-      "pending",
-      "confirmed",
+      "pending_payment",
+      "paid",
       "processing",
-      "dispatched",
+      "ready_to_ship",
+      "shipped",
+      "out_for_delivery",
       "delivered",
     ];
     const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
@@ -581,6 +595,13 @@ export const bulkUpdateStatus = async (req, res) => {
           await client.query("ROLLBACK");
           return res.status(400).json({
             message: `Order ${o.order_number || o.id} cannot be cancelled after delivery`,
+          });
+        }
+      } else if (next === "returned") {
+        if (prev !== "delivered" && prev !== "out_for_delivery") {
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            message: `Invalid transition for order ${o.order_number || o.id} from ${prev} to ${next}`,
           });
         }
       } else {
@@ -623,7 +644,7 @@ export const bulkUpdateStatus = async (req, res) => {
     await client.query("COMMIT");
 
     // Send emails (fire-and-forget, never block the response)
-    if (status !== "pending") {
+    if (status !== "pending_payment") {
       const emailPromises = updated.map((orderItem) => {
         const recipientEmail = orderItem.contact_email || orderItem.email;
         const recipientName =

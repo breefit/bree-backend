@@ -169,6 +169,108 @@ export const sendOrderCancelledEmail = async ({ to, name, orderId, notes }) => {
   });
 };
 
+export const sendShipmentCreatedEmail = async ({
+  to,
+  name,
+  orderId,
+  awbNumber,
+  trackingUrl,
+  expectedDeliveryDate,
+  courier = "Delhivery",
+}) => {
+  const orderReference = String(orderId).slice(-8).toUpperCase();
+  const trackingLink = trackingUrl || getOrderTrackingLink(orderId);
+  const frontendUrl = getFrontendUrl();
+
+  await sendEmail({
+    to,
+    subject: `Shipment Created — BREE #${orderReference}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
+        <p>Your shipment for order <strong>#${orderReference}</strong> has been created.</p>
+        <p><strong>Courier:</strong> ${courier}</p>
+        <p><strong>AWB Number:</strong> ${awbNumber || "Pending"}</p>
+        <p><strong>Tracking URL:</strong> <a href="${trackingLink}">${trackingLink}</a></p>
+        ${expectedDeliveryDate ? `<p><strong>Expected delivery:</strong> ${expectedDeliveryDate}</p>` : ""}
+        <p style="margin-top:20px;"><a href="${trackingLink}" style="background:#047857;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:6px;display:inline-block;">Track Shipment</a></p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">You can also visit <a href="${frontendUrl}">${frontendUrl}</a> for updates.</p>
+      </div>
+    `,
+  });
+};
+
+export const sendOutForDeliveryEmail = async ({
+  to,
+  name,
+  orderId,
+  awbNumber,
+  trackingUrl,
+  currentLocation,
+  expectedDeliveryDate,
+}) => {
+  const orderReference = String(orderId).slice(-8).toUpperCase();
+  const trackingLink = trackingUrl || getOrderTrackingLink(orderId);
+  const frontendUrl = getFrontendUrl();
+
+  await sendEmail({
+    to,
+    subject: `Out for Delivery — BREE #${orderReference}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
+        <p>Your order <strong>#${orderReference}</strong> is out for delivery.</p>
+        <p><strong>AWB Number:</strong> ${awbNumber || "Pending"}</p>
+        ${currentLocation ? `<p><strong>Current location:</strong> ${currentLocation}</p>` : ""}
+        ${expectedDeliveryDate ? `<p><strong>Expected delivery:</strong> ${expectedDeliveryDate}</p>` : ""}
+        <p style="margin-top:20px;"><a href="${trackingLink}" style="background:#047857;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:6px;display:inline-block;">Track Shipment</a></p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">Visit <a href="${frontendUrl}">${frontendUrl}</a> for the latest order updates.</p>
+      </div>
+    `,
+  });
+};
+
+export const sendShipmentDeliveredEmail = async ({ to, name, orderId }) => {
+  const orderReference = String(orderId).slice(-8).toUpperCase();
+  const frontendUrl = getFrontendUrl();
+
+  await sendEmail({
+    to,
+    subject: `Delivered — BREE #${orderReference}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
+        <p>Delivery confirmation for order <strong>#${orderReference}</strong> is complete.</p>
+        <p>Thank you for choosing BREE Wellness. We hope you enjoy your order.</p>
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">If you have any questions, visit <a href="${frontendUrl}">${frontendUrl}</a>.</p>
+      </div>
+    `,
+  });
+};
+
+export const sendShipmentCancelledEmail = async ({
+  to,
+  name,
+  orderId,
+  cancellationReason,
+}) => {
+  const orderReference = String(orderId).slice(-8).toUpperCase();
+  const frontendUrl = getFrontendUrl();
+
+  await sendEmail({
+    to,
+    subject: `Shipment Cancelled — BREE #${orderReference}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
+        <h2 style="color:#b91c1c;">Hi ${name || "there"},</h2>
+        <p>Your shipment for order <strong>#${orderReference}</strong> has been cancelled.</p>
+        ${cancellationReason ? `<p><strong>Reason:</strong> ${cancellationReason}</p>` : ""}
+        <p style="color:#6b7280;font-size:13px;margin-top:28px;">For support, please visit <a href="${frontendUrl}">${frontendUrl}</a>.</p>
+      </div>
+    `,
+  });
+};
+
 export const sendSubscriptionChargeReceiptEmail = async ({
   to,
   name,

@@ -399,6 +399,67 @@ const ensureRenewalOrderColumns = async () => {
 
 await ensureRenewalOrderColumns();
 
+// FIX: ensure the orders table has the shipping / totals columns expected by
+// the checkout and order APIs. This keeps older databases functional without
+// requiring a manual SQL migration for each local environment.
+const ensureOrderShippingColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders'`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((c) => c.column_name));
+    const additions = [];
+
+    if (!existing.has("subtotal")) {
+      additions.push("ADD COLUMN subtotal DECIMAL(10,2) NULL DEFAULT NULL");
+    }
+    if (!existing.has("shipping")) {
+      additions.push("ADD COLUMN shipping DECIMAL(10,2) NOT NULL DEFAULT 0");
+    }
+    if (!existing.has("tax")) {
+      additions.push("ADD COLUMN tax DECIMAL(10,2) NOT NULL DEFAULT 0");
+    }
+    if (!existing.has("total")) {
+      additions.push("ADD COLUMN total DECIMAL(10,2) NULL DEFAULT NULL");
+    }
+    if (!existing.has("is_free_shipping")) {
+      additions.push(
+        "ADD COLUMN is_free_shipping TINYINT(1) NOT NULL DEFAULT 0",
+      );
+    }
+    if (!existing.has("shipping_charge")) {
+      additions.push(
+        "ADD COLUMN shipping_charge DECIMAL(10,2) NOT NULL DEFAULT 0",
+      );
+    }
+    if (!existing.has("estimated_delivery")) {
+      additions.push(
+        "ADD COLUMN estimated_delivery VARCHAR(100) NULL DEFAULT NULL",
+      );
+    }
+
+    if (additions.length) {
+      await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
+      console.log("✅ Added missing orders shipping/totals columns");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure orders shipping/totals columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
+await ensureOrderShippingColumns();
+
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);
 };

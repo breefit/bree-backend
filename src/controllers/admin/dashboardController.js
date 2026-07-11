@@ -61,7 +61,7 @@ export const getDashboardStats = async (req, res) => {
       query(`
         SELECT COUNT(*) AS total
         FROM orders
-        WHERE order_status = 'pending'
+        WHERE order_status = 'pending_payment'
       `),
 
       query(`

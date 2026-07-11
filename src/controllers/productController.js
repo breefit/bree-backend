@@ -7,12 +7,7 @@ const CATEGORY_LIST_TTL = 600;
 const HOME_DATA_TTL = 600;
 const RECOMMENDATIONS_TTL = 300;
 
-// ============================================================
-// COMMON PRODUCT SELECT
-// ============================================================
-// journey_level and show_recommendations are included in every
-// product query so frontend components have them available without
-// extra round-trips.
+let productShippingColumnsAvailable = null;
 
 const PRODUCT_SELECT = `
  SELECT
@@ -32,9 +27,39 @@ const PRODUCT_SELECT = `
   p.is_subscription,
   p.journey_level,
   p.show_recommendations
+`;
+
+const getProductShippingColumnsAvailable = async () => {
+  if (productShippingColumnsAvailable !== null) {
+    return productShippingColumnsAvailable;
+  }
+
+  try {
+    const { rows } = await query(
+      "SHOW COLUMNS FROM products LIKE 'is_free_shipping'",
+    );
+    productShippingColumnsAvailable = rows.length > 0;
+  } catch {
+    productShippingColumnsAvailable = false;
+  }
+
+  return productShippingColumnsAvailable;
+};
+
+const getProductSelectQuery = async () => {
+  const hasShippingColumns = await getProductShippingColumnsAvailable();
+  const shippingColumns = hasShippingColumns
+    ? `,
+  p.is_free_shipping,
+  p.shipping_charge,
+  p.estimated_delivery`
+    : "";
+
+  return `${PRODUCT_SELECT}${shippingColumns}
 
   FROM products p
 `;
+};
 
 // ============================================================
 // GET ALL PRODUCTS
@@ -53,8 +78,9 @@ export const getProducts = async (req, res) => {
     }
 
     const hasCategory = Boolean(category);
+    const productSelect = await getProductSelectQuery();
     const queryText = `
-      ${PRODUCT_SELECT}
+      ${productSelect}
       WHERE p.is_active = 1
       ${hasCategory ? "AND p.category = ?" : ""}
       ORDER BY p.display_order ASC, p.created_at ASC
@@ -62,9 +88,29 @@ export const getProducts = async (req, res) => {
     const params = hasCategory ? [category] : [];
 
     const { rows } = await query(queryText, params);
-    cache.set(cacheKey, rows, PRODUCT_LIST_TTL);
+    const normalizedRows = rows.map((row) => {
+      const isFreeShipping =
+        row.is_free_shipping === true ||
+        row.is_free_shipping === 1 ||
+        row.is_free_shipping === "true" ||
+        row.is_free_shipping === "1";
+      const parsedShippingCharge = Number(row.shipping_charge ?? 0);
+      const shippingCharge = Number.isFinite(parsedShippingCharge)
+        ? Math.max(0, parsedShippingCharge)
+        : 0;
+      const estimatedDelivery =
+        String(row.estimated_delivery || "").trim() || null;
 
-    res.json(rows);
+      return {
+        ...row,
+        isFreeShipping,
+        shippingCharge: isFreeShipping ? 0 : shippingCharge,
+        estimatedDelivery,
+      };
+    });
+    cache.set(cacheKey, normalizedRows, PRODUCT_LIST_TTL);
+
+    res.json(normalizedRows);
   } catch (error) {
     console.error("Error fetching products:", error);
     res.status(500).json({ message: "Failed to fetch products" });
@@ -83,9 +129,10 @@ export const getProduct = async (req, res) => {
       return res.json(cached);
     }
 
+    const productSelect = await getProductSelectQuery();
     const { rows } = await query(
       `
-      ${PRODUCT_SELECT}
+      ${productSelect}
       WHERE (p.id = ? OR p.slug = ?)
       AND p.is_active = 1
       LIMIT 1
@@ -97,7 +144,27 @@ export const getProduct = async (req, res) => {
       return res.status(404).json({ message: "Product not found" });
     }
 
-    const product = rows[0];
+    const product = (() => {
+      const row = rows[0];
+      const isFreeShipping =
+        row.is_free_shipping === true ||
+        row.is_free_shipping === 1 ||
+        row.is_free_shipping === "true" ||
+        row.is_free_shipping === "1";
+      const parsedShippingCharge = Number(row.shipping_charge ?? 0);
+      const shippingCharge = Number.isFinite(parsedShippingCharge)
+        ? Math.max(0, parsedShippingCharge)
+        : 0;
+      const estimatedDelivery =
+        String(row.estimated_delivery || "").trim() || null;
+
+      return {
+        ...row,
+        isFreeShipping,
+        shippingCharge: isFreeShipping ? 0 : shippingCharge,
+        estimatedDelivery,
+      };
+    })();
     cache.set(cacheKey, product, PRODUCT_DETAIL_TTL);
     if (product.slug) {
       cache.set(`products:id:${product.slug}`, product, PRODUCT_DETAIL_TTL);
@@ -125,16 +192,18 @@ export const getHomeProducts = async (req, res) => {
       return res.json(cached);
     }
 
+    const productSelect = await getProductSelectQuery();
+
     // Lead with journey_level=1 product (trial), then popular product
     const trialRes = await query(`
-      ${PRODUCT_SELECT}
+      ${productSelect}
       WHERE p.is_active = 1
       AND p.journey_level = 1
       LIMIT 1
     `);
 
     const featuredRes = await query(`
-      ${PRODUCT_SELECT}
+      ${productSelect}
       WHERE p.is_active = 1
       AND p.popular = 1
       LIMIT 1
@@ -154,8 +223,9 @@ export const getHomeProducts = async (req, res) => {
     }
 
     if (results.length < 2) {
+      const productSelect = await getProductSelectQuery();
       const { rows } = await query(`
-        ${PRODUCT_SELECT}
+        ${productSelect}
         WHERE p.is_active = 1
         ORDER BY p.display_order ASC, p.created_at ASC
         LIMIT 2
@@ -224,16 +294,18 @@ export const getHomeData = async (req, res) => {
       },
     ];
 
+    const productSelect = await getProductSelectQuery();
+
     const [featuredRes, popularRes, categoriesRes, testimonialsRes] =
       await Promise.all([
         query(`
-          ${PRODUCT_SELECT}
+          ${productSelect}
           WHERE p.is_active = 1
           AND p.journey_level = 1
           LIMIT 1
         `),
         query(`
-          ${PRODUCT_SELECT}
+          ${productSelect}
           WHERE p.is_active = 1
           AND p.popular = 1
           LIMIT 4
@@ -374,7 +446,10 @@ export const getRecommendations = async (req, res) => {
         status,
         is_subscription,
         journey_level,
-        show_recommendations
+        show_recommendations,
+        is_free_shipping,
+        shipping_charge,
+        estimated_delivery
       FROM products
       WHERE journey_level IN (${placeholders})
         AND is_active = 1
@@ -396,6 +471,9 @@ export const getRecommendations = async (req, res) => {
       quantity: prod.quantity,
       is_subscription: prod.is_subscription,
       journey_level: prod.journey_level,
+      is_free_shipping: prod.is_free_shipping,
+      shipping_charge: prod.shipping_charge,
+      estimated_delivery: prod.estimated_delivery,
     }));
 
     // console.log(

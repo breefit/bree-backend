@@ -18,7 +18,8 @@ export const validateCart = async (req, res) => {
       const clientPrice = Number(it.price ?? it.unit_price ?? 0);
 
       const { rows } = await query(
-        `SELECT id, name, image, price AS price, stock_qty, is_active, status
+        `SELECT id, name, image, price AS price, stock_qty, is_active, status,
+                is_free_shipping, shipping_charge, estimated_delivery
          FROM products
          WHERE id = ?
          LIMIT 1`,
@@ -39,6 +40,17 @@ export const validateCart = async (req, res) => {
       const available = !!p.is_active && p.status === "In Stock";
       const stock = Number(p.stock_qty ?? 0);
       const currentPrice = Number(p.price ?? 0);
+      const isFreeShipping =
+        p.is_free_shipping === true ||
+        p.is_free_shipping === 1 ||
+        p.is_free_shipping === "true" ||
+        p.is_free_shipping === "1";
+      const parsedShippingCharge = Number(p.shipping_charge ?? 0);
+      const shippingCharge = Number.isFinite(parsedShippingCharge)
+        ? Math.max(0, parsedShippingCharge)
+        : 0;
+      const estimatedDelivery =
+        String(p.estimated_delivery || "").trim() || null;
 
       const priceChanged = Math.abs(currentPrice - clientPrice) > 0.009;
       const outOfStock = !available;
@@ -58,6 +70,12 @@ export const validateCart = async (req, res) => {
         priceChanged,
         outOfStock,
         insufficientStock,
+        is_free_shipping: isFreeShipping,
+        shipping_charge: shippingCharge,
+        estimated_delivery: estimatedDelivery,
+        isFreeShipping,
+        shippingCharge,
+        estimatedDelivery,
       });
     }
 

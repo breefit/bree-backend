@@ -1,5 +1,6 @@
 import { verifyUserToken, COOKIE_NAME } from "../utils/jwt.js";
 import { query } from "../config/database.js";
+import { ensureUserCustomerNumber } from "../utils/customerNumber.js";
 
 const getToken = (req) => {
   const cookieToken = req.cookies[COOKIE_NAME];
@@ -35,7 +36,7 @@ const auth = async (req, res, next) => {
   }
 
   const { rows } = await query(
-    "SELECT id, name, email, phone, picture, provider, role FROM users WHERE id = ?",
+    "SELECT id, name, email, phone, picture, provider, role, customer_number FROM users WHERE id = ?",
     [decoded.userId],
   );
   // console.log("[auth] user lookup rows:", rows.length, rows[0]);
@@ -45,7 +46,12 @@ const auth = async (req, res, next) => {
     return res.status(401).json({ success: false, message: "Unauthorized" });
   }
 
-  req.user = rows[0];
+  const user = rows[0];
+  if (!user.customer_number) {
+    user.customer_number = await ensureUserCustomerNumber(user.id);
+  }
+
+  req.user = user;
   // console.log("[auth] req.user after auth:", req.user);
   // console.log("[auth] req.userId after auth:", req.userId);
   next();
@@ -57,10 +63,16 @@ export const optionalAuth = async (req, res, next) => {
     try {
       const decoded = verifyUserToken(token);
       const { rows } = await query(
-        "SELECT id, name, email, phone, picture, provider, role FROM users WHERE id = ?",
+        "SELECT id, name, email, phone, picture, provider, role, customer_number FROM users WHERE id = ?",
         [decoded.userId],
       );
-      if (rows.length) req.user = rows[0];
+      if (rows.length) {
+        const user = rows[0];
+        if (!user.customer_number) {
+          user.customer_number = await ensureUserCustomerNumber(user.id);
+        }
+        req.user = user;
+      }
     } catch {
       // Invalid or expired token; proceed as unauthenticated.
     }

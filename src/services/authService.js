@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { randomUUID } from "crypto";
 import { query } from "../config/database.js";
+import { ensureUserCustomerNumber } from "../utils/customerNumber.js";
 
 const HASH_ALGORITHM = "sha256";
 const REFRESH_TOKEN_SIZE = 64;
@@ -23,10 +24,7 @@ export const createRefreshToken = async (
     Date.now() + DEFAULT_REFRESH_DAYS * 24 * 60 * 60 * 1000,
   );
 
-  const expiresAt = expiresDate
-    .toISOString()
-    .slice(0, 19)
-    .replace("T", " ");
+  const expiresAt = expiresDate.toISOString().slice(0, 19).replace("T", " ");
 
   const tokenId = randomUUID();
 
@@ -149,7 +147,8 @@ export const loadUserById = async (userId) => {
       phone,
       picture,
       provider,
-      role
+      role,
+      customer_number
     FROM users
     WHERE id = ?
     `,

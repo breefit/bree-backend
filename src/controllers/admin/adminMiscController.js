@@ -11,15 +11,23 @@ const invalidateTestimonialsCache = () => {
 export const getCustomers = async (req, res) => {
   const { search = "", page = 1, limit = 20 } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
-  const where = search ? `WHERE u.name LIKE ? OR u.email LIKE ?` : "";
+  const where = search
+    ? `WHERE u.customer_number LIKE ? OR u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?`
+    : "";
   const params = search
-    ? [`%${search}%`, `%${search}%`, parseInt(limit), offset]
+    ? [
+        `%${search}%`,
+        `%${search}%`,
+        `%${search}%`,
+        `%${search}%`,
+        parseInt(limit),
+        offset,
+      ]
     : [parseInt(limit), offset];
-  const pIdx = search ? { l: "?", o: "?" } : { l: "?", o: "?" };
 
   const [usersRes, countRes] = await Promise.all([
     query(
-      `SELECT u.id, u.name, u.email, u.phone, u.provider, u.created_at,
+      `SELECT u.id, u.name, u.email, u.phone, u.customer_number, u.provider, u.created_at,
               COUNT(o.id) AS order_count,
               COALESCE(SUM(CASE WHEN o.payment_status='paid' THEN COALESCE(o.total, o.amount) ELSE 0 END),0) AS total_spent
        FROM users u
@@ -32,7 +40,9 @@ export const getCustomers = async (req, res) => {
     ),
     query(
       `SELECT COUNT(*) AS total FROM users u ${where}`,
-      search ? [`%${search}%`, `%${search}%`] : [],
+      search
+        ? [`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`]
+        : [],
     ),
   ]);
 

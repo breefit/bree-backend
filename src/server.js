@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import { startShippingTrackingCron } from "./cron/shippingTrackingCron.js";
 
 dotenv.config();
 
@@ -23,13 +24,36 @@ const PORT = process.env.PORT || 4000;
 const startServer = async () => {
   try {
     const { default: app } = await import("./app.js");
+    const { query } = await import("./config/database.js");
+
+    try {
+      await query("SELECT 1");
+      console.log("✅ Database connection verified");
+      startShippingTrackingCron();
+    } catch (dbErr) {
+      console.error(
+        "⚠️ Database connection check failed; cron not started",
+        dbErr,
+      );
+    }
+
     app.set("trust proxy", 1);
     const httpServer = createServer(app);
 
-    const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:3000")
+    const frontendUrls = (process.env.FRONTEND_URL || "http://localhost:3000")
       .split(",")
       .map((u) => u.trim())
       .filter(Boolean);
+
+    const allowedOrigins = [
+      ...new Set([
+        ...frontendUrls,
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+      ]),
+    ].map((origin) => origin.replace(/\/$/, ""));
 
     const io = new Server(httpServer, {
       cors: {

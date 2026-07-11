@@ -9,6 +9,25 @@ import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
 
+let productShippingColumnsAvailable = null;
+
+const getProductShippingColumnsAvailable = async () => {
+  if (productShippingColumnsAvailable !== null) {
+    return productShippingColumnsAvailable;
+  }
+
+  try {
+    const { rows } = await query(
+      "SHOW COLUMNS FROM products LIKE 'is_free_shipping'",
+    );
+    productShippingColumnsAvailable = rows.length > 0;
+  } catch {
+    productShippingColumnsAvailable = false;
+  }
+
+  return productShippingColumnsAvailable;
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Build Razorpay Magic Checkout line_items from server-validated cart items
 // (DB-verified price/name/image from `validatedItems` — never the frontend's
@@ -68,6 +87,8 @@ export const createOrder = async (req, res) => {
 
   // ── Server-side cart validation & total calculation ───────────────────────
   const validatedItems = [];
+  let serverSubtotal = 0;
+  let shippingCharge = 0;
   let serverTotal = 0;
 
   for (const item of items) {
@@ -80,8 +101,12 @@ export const createOrder = async (req, res) => {
         .json({ success: false, message: "Invalid cart item submitted" });
     }
 
+    const hasShippingColumns = await getProductShippingColumnsAvailable();
+    const shippingSelect = hasShippingColumns
+      ? ", is_free_shipping, shipping_charge, estimated_delivery"
+      : "";
     const { rows } = await query(
-      `SELECT id, name, image, price, stock_qty
+      `SELECT id, name, image, price, stock_qty${shippingSelect}
        FROM products
        WHERE id = ? AND is_active = 1 AND status = 'In Stock'`,
       [productId],
@@ -104,7 +129,21 @@ export const createOrder = async (req, res) => {
     }
 
     const itemPrice = Number(product.price);
-    serverTotal += itemPrice * quantity;
+    const isFreeShipping =
+      product.is_free_shipping === true ||
+      product.is_free_shipping === 1 ||
+      product.is_free_shipping === "true" ||
+      product.is_free_shipping === "1";
+    const parsedShippingCharge = Number(product.shipping_charge ?? 0);
+    const itemShippingCharge = isFreeShipping
+      ? 0
+      : Number.isFinite(parsedShippingCharge)
+        ? Math.max(0, parsedShippingCharge)
+        : 0;
+
+    serverSubtotal += itemPrice * quantity;
+    shippingCharge += itemShippingCharge;
+    serverTotal = serverSubtotal + shippingCharge;
 
     validatedItems.push({
       product_id: product.id,
@@ -112,6 +151,10 @@ export const createOrder = async (req, res) => {
       image: product.image || null,
       quantity,
       price: itemPrice,
+      is_free_shipping: isFreeShipping,
+      shipping_charge: itemShippingCharge,
+      estimated_delivery:
+        String(product.estimated_delivery || "").trim() || null,
     });
   }
 
@@ -265,11 +308,15 @@ export const createOrder = async (req, res) => {
         contact_email,
         contact_phone,
         subtotal,
+        shipping,
         total,
+        is_free_shipping,
+        shipping_charge,
+        estimated_delivery,
         order_status,
         payment_status,
         razorpay_order_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         orderId,
         orderNumber,
@@ -282,8 +329,15 @@ export const createOrder = async (req, res) => {
         customerName || req.user?.name || null,
         email || req.user?.email || null,
         mobileNumber || null,
+        serverSubtotal,
+        shippingCharge,
         serverTotal,
-        serverTotal,
+        validatedItems.every((item) => item.is_free_shipping) ? 1 : 0,
+        shippingCharge,
+        validatedItems.find((item) => item.estimated_delivery)
+          ?.estimated_delivery || null,
+        "pending_payment",
+        "pending",
         rzpOrder.id,
       ],
     );
@@ -648,17 +702,13 @@ export const verifyPayment = async (req, res) => {
     }
 
     // Determine new statuses.
-    // Both one-time and subscription orders move to order_status = 'confirmed'
-    // when payment is verified. 'confirmed' means payment received and the order
+    // Both one-time and subscription orders move to order_status = 'paid'
+    // when payment is verified. 'paid' means payment received and the order
     // is ready for fulfillment — it is NOT a billing concept.
-    //
-    // The original code set order_status = 'active' for subscription orders.
-    // 'active' is a subscription_status value, not a fulfillment status. That
-    // was the bug. The fix is to use 'confirmed' for both order types.
     //
     // subscription_status is updated separately (set to 'active' below via the
     // conditional SQL fragment) and is the correct place for billing state.
-    const newOrderStatus = "confirmed";
+    const newOrderStatus = "paid";
     const newPaymentStatus = "paid";
 
     // Update order row — write back customer details from Magic Checkout popup
@@ -881,60 +931,148 @@ export const verifyPayment = async (req, res) => {
 // Magic Checkout callback — returns available shipping methods for the address
 // ─────────────────────────────────────────────────────────────────────────────
 export const getShippingInfo = async (req, res) => {
-  const { items, shippingAddress } = req.body;
+  const rawBodyValue =
+    typeof req.rawBody === "string"
+      ? req.rawBody
+      : Buffer.isBuffer(req.rawBody)
+        ? req.rawBody.toString("utf8")
+        : typeof req.body === "string"
+          ? req.body
+          : undefined;
+
+  const body = req.body || {};
+  const parsedBody =
+    typeof body === "string"
+      ? (() => {
+          try {
+            return JSON.parse(body);
+          } catch {
+            return {};
+          }
+        })()
+      : body;
+
+  const contentType = req.headers?.["content-type"] || "";
+  console.info("[SHIPPING_INFO] incoming request", {
+    method: req.method,
+    headers: req.headers,
+    contentType,
+    rawBody: rawBodyValue,
+    parsedBody,
+  });
+
+  const items = Array.isArray(parsedBody?.items)
+    ? parsedBody.items
+    : Array.isArray(parsedBody?.line_items)
+      ? parsedBody.line_items
+      : [];
+
+  const shippingAddress =
+    parsedBody?.shippingAddress ||
+    parsedBody?.shipping_address ||
+    parsedBody?.customer_details?.shipping_address ||
+    parsedBody?.customer_details?.shippingAddress ||
+    null;
 
   if (!Array.isArray(items) || !items.length || !shippingAddress) {
+    console.warn("[SHIPPING_INFO] invalid payload", {
+      method: req.method,
+      contentType,
+      parsedBody,
+    });
+
     return res.status(400).json({
+      success: false,
       message: "Shipping info request requires items and shippingAddress",
     });
   }
 
-  const subtotal = items.reduce(
-    (sum, item) => sum + Number(item.price ?? 0) * Number(item.quantity ?? 1),
-    0,
-  );
-  const isFreeShipping = subtotal >= 500;
+  const shippingCharge = items.reduce((sum, item) => {
+    const isFreeShipping =
+      item.is_free_shipping === true ||
+      item.is_free_shipping === 1 ||
+      item.is_free_shipping === "true" ||
+      item.is_free_shipping === "1";
+    const parsedShippingCharge = Number(item.shipping_charge ?? 0);
+    const itemShippingCharge = isFreeShipping
+      ? 0
+      : Number.isFinite(parsedShippingCharge)
+        ? Math.max(0, parsedShippingCharge)
+        : 0;
+    return sum + itemShippingCharge;
+  }, 0);
+
+  const firstPaidItem = items.find((item) => {
+    const isFreeShipping =
+      item.is_free_shipping === true ||
+      item.is_free_shipping === 1 ||
+      item.is_free_shipping === "true" ||
+      item.is_free_shipping === "1";
+    return !isFreeShipping;
+  });
+  const estimatedDelivery =
+    firstPaidItem?.estimated_delivery ??
+    firstPaidItem?.estimatedDelivery ??
+    null;
 
   const shippingMethods = [
     {
       id: "standard",
-      label: isFreeShipping ? "Free Standard Delivery" : "Standard Delivery",
-      amount: isFreeShipping ? 0 : 4900,
+      label:
+        shippingCharge > 0 ? "Standard Delivery" : "Free Standard Delivery",
+      amount: shippingCharge > 0 ? Math.round(shippingCharge * 100) : 0,
       currency: "INR",
-      estimated_delivery: "3-5 business days",
-    },
-    {
-      id: "express",
-      label: "Express Delivery",
-      amount: 4900,
-      currency: "INR",
-      estimated_delivery: "1-2 business days",
+      estimated_delivery: estimatedDelivery || "3-5 business days",
     },
   ];
 
   return res.json({
+    success: true,
     shipping_address: shippingAddress,
     default_shipping_method: "standard",
     shipping_methods: shippingMethods,
-    shipping_total: isFreeShipping ? 0 : 4900,
+    shipping_total: shippingCharge,
   });
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// POST /api/payment/promotions
-// Magic Checkout callback — returns applicable coupon offers
-// ─────────────────────────────────────────────────────────────────────────────
-export const getPromotions = async (req, res) => {
-  const { items, email, amount } = req.body;
+const parsePromotionRequestBody = (req) => {
+  const rawBodyValue =
+    typeof req.rawBody === "string"
+      ? req.rawBody
+      : Buffer.isBuffer(req.rawBody)
+        ? req.rawBody.toString("utf8")
+        : typeof req.body === "string"
+          ? req.body
+          : undefined;
 
-  if (!Array.isArray(items) || !items.length) {
-    return res
-      .status(400)
-      .json({ message: "Promotions request requires cart items" });
-  }
+  const body = req.body || {};
+  const parsedBody =
+    typeof body === "string"
+      ? (() => {
+          try {
+            return JSON.parse(body);
+          } catch {
+            return {};
+          }
+        })()
+      : body;
 
-  const subtotal = Number(
-    amount ??
+  return { rawBodyValue, body: parsedBody };
+};
+
+const getPromotionItems = (body) => {
+  const items = Array.isArray(body?.items)
+    ? body.items
+    : Array.isArray(body?.line_items)
+      ? body.line_items
+      : [];
+
+  return Array.isArray(items) ? items : [];
+};
+
+const calculatePromotionSubtotal = (items, fallbackAmount) =>
+  Number(
+    fallbackAmount ??
       items.reduce(
         (sum, item) =>
           sum +
@@ -943,7 +1081,8 @@ export const getPromotions = async (req, res) => {
       ),
   );
 
-  const allCoupons = [
+const getPromotionCatalog = (subtotal) =>
+  [
     {
       code: "FLAT10",
       summary: "₹10 off on your order",
@@ -971,12 +1110,97 @@ export const getPromotions = async (req, res) => {
       min_order_amount: 50000,
       is_applicable: subtotal >= 500,
     },
-  ];
+  ].filter((coupon) => coupon.is_applicable);
+
+const normalizePromotionCode = (value) =>
+  String(value ?? "")
+    .trim()
+    .toUpperCase();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payment/promotions
+// Magic Checkout callback — returns applicable coupon offers
+// ─────────────────────────────────────────────────────────────────────────────
+export const getPromotions = async (req, res) => {
+  const { body } = parsePromotionRequestBody(req);
+  const items = getPromotionItems(body);
+
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({
+      success: false,
+      message: "Promotions request requires cart items",
+    });
+  }
+
+  const subtotal = calculatePromotionSubtotal(items, body.amount);
+  const promotions = getPromotionCatalog(subtotal);
 
   return res.json({
-    promotions: allCoupons.filter((c) => c.is_applicable),
-    email: email || null,
+    success: true,
+    promotions,
+    email: body.email || null,
     amount: subtotal,
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/payment/apply-promotions
+// Magic Checkout callback — applies a specific promotion code to the cart
+// ─────────────────────────────────────────────────────────────────────────────
+export const applyPromotions = async (req, res) => {
+  const { body } = parsePromotionRequestBody(req);
+  const items = getPromotionItems(body);
+
+  if (!Array.isArray(items) || !items.length) {
+    return res.status(400).json({
+      success: false,
+      message: "Apply promotions request requires cart items",
+    });
+  }
+
+  const promotionCode = normalizePromotionCode(
+    body.promotion_code ||
+      body.promotionCode ||
+      body.code ||
+      body.coupon_code ||
+      body.couponCode ||
+      body.promo_code ||
+      body.promoCode ||
+      body.coupon ||
+      body.promotion,
+  );
+
+  if (!promotionCode) {
+    return res.status(400).json({
+      success: false,
+      message: "Promotion code is required",
+    });
+  }
+
+  const subtotal = calculatePromotionSubtotal(items, body.amount);
+  const promotions = getPromotionCatalog(subtotal);
+  const matchedPromotion = promotions.find(
+    (promotion) => normalizePromotionCode(promotion.code) === promotionCode,
+  );
+
+  if (!matchedPromotion) {
+    return res.status(404).json({
+      success: false,
+      message: "Promotion not applicable",
+    });
+  }
+
+  const discountAmount = Number(matchedPromotion.discount_amount ?? 0);
+  const finalAmount = Math.max(0, subtotal - discountAmount);
+
+  return res.json({
+    success: true,
+    applied: true,
+    promotion: matchedPromotion,
+    discount_amount: discountAmount,
+    amount: subtotal,
+    final_amount: finalAmount,
+    currency: "INR",
   });
 };
 
@@ -1179,7 +1403,7 @@ export const handleWebhook = async (req, res) => {
 
             await whClient.query(
               `UPDATE orders SET
-                 payment_status = 'paid', order_status = 'confirmed', updated_at = NOW()
+                 payment_status = 'paid', order_status = 'paid', updated_at = NOW()
                WHERE id = ?`,
               [order.id],
             );
@@ -1238,7 +1462,7 @@ export const handleWebhook = async (req, res) => {
             await whClient.query(
               `INSERT INTO order_status_history
                  (order_id, previous_status, new_status, changed_by, notes)
-               VALUES (?, ?, 'confirmed', NULL, 'Payment captured via webhook')`,
+               VALUES (?, ?, 'paid', NULL, 'Payment captured via webhook')`,
               [order.id, lockedWh[0].order_status],
             );
 
@@ -1254,7 +1478,7 @@ export const handleWebhook = async (req, res) => {
             whClient.release();
           }
 
-          emitUpdate(order.id, "confirmed");
+          emitUpdate(order.id, "paid");
         }
       }
       break;
@@ -1349,7 +1573,7 @@ export const handleWebhook = async (req, res) => {
       //   • gets its own BREE-XXXXXX order number
       //   • copies all product items from the original subscription order
       //   • copies all customer / address fields
-      //   • starts at order_status='confirmed', payment_status='paid'
+      //   • starts at order_status='paid', payment_status='paid'
       //   • is linked back to the origin via parent_order_id
       //
       // The ORIGINAL order's subscription_status and next_billing_date are
@@ -1380,7 +1604,7 @@ export const handleWebhook = async (req, res) => {
         });
 
         // Emit socket update so admin order lists refresh in real-time
-        emitUpdate(renewalOrderId, "confirmed");
+        emitUpdate(renewalOrderId, "paid");
 
         // Non-blocking renewal confirmation email
         const { sendSubscriptionChargeReceiptEmail } =
