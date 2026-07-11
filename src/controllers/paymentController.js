@@ -1123,20 +1123,15 @@ export const getShippingInfo = async (req, res) => {
   }
 
   for (const [index, address] of addresses.entries()) {
-    const missingFields = ["id", "zipcode", "country", "state_code"].filter(
-      (field) => !address?.[field],
-    );
-    if (missingFields.length) {
-      console.warn("[SHIPPING_INFO] Address validation failed", {
-        index,
-        addressId: address?.id,
-        missingFields,
-      });
-      return res.status(400).json({
-        message: `Address at index ${index} is missing required field(s): ${missingFields.join(", ")}.`,
-      });
-    }
+  const missingFields = ["id", "zipcode", "country"].filter(
+    (field) => !address?.[field],
+  );
+  if (missingFields.length) {
+    return res.status(400).json({
+      message: `Address at index ${index} is missing required field(s): ${missingFields.join(", ")}.`,
+    });
   }
+}
 
   // ── Resolve the order lookup key ────────────────────────────────────────
   // razorpay_order_id and order_number map to different columns — never
