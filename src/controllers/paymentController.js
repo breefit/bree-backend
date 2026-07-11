@@ -1127,6 +1127,11 @@ export const getShippingInfo = async (req, res) => {
     (field) => !address?.[field],
   );
   if (missingFields.length) {
+    console.warn("[SHIPPING_INFO] Address validation failed", {
+      index,
+      addressId: address?.id,
+      missingFields,
+    });
     return res.status(400).json({
       message: `Address at index ${index} is missing required field(s): ${missingFields.join(", ")}.`,
     });
