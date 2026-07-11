@@ -931,6 +931,15 @@ export const verifyPayment = async (req, res) => {
 // Magic Checkout callback — returns available shipping methods for the address
 // ─────────────────────────────────────────────────────────────────────────────
 export const getShippingInfo = async (req, res) => {
+  console.log("========== SHIPPING INFO REQUEST ==========");
+  console.log("Method:", req.method);
+  console.log("URL:", req.originalUrl);
+  console.log("Headers:", JSON.stringify(req.headers, null, 2));
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("Query:", JSON.stringify(req.query, null, 2));
+  console.log("Params:", JSON.stringify(req.params, null, 2));
+  console.log("===========================================");
+
   const rawBodyValue =
     typeof req.rawBody === "string"
       ? req.rawBody
@@ -980,6 +989,7 @@ export const getShippingInfo = async (req, res) => {
       contentType,
       parsedBody,
     });
+    console.log("[SHIPPING INFO] Validation Failed");
 
     return res.status(400).json({
       success: false,
@@ -1026,13 +1036,20 @@ export const getShippingInfo = async (req, res) => {
     },
   ];
 
-  return res.json({
+  const responseData = {
     success: true,
     shipping_address: shippingAddress,
     default_shipping_method: "standard",
     shipping_methods: shippingMethods,
     shipping_total: shippingCharge,
-  });
+  };
+
+  console.log(
+    "[SHIPPING INFO] Success Response:",
+    JSON.stringify(responseData, null, 2),
+  );
+
+  return res.json(responseData);
 };
 
 const parsePromotionRequestBody = (req) => {
