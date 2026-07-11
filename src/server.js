@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { startShippingTrackingCron } from "./cron/shippingTrackingCron.js";
+import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 
 dotenv.config();
 
