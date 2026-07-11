@@ -8,6 +8,7 @@ import { query, getClient } from "../config/database.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
+import delhiveryService from "../services/delhiveryService.js";
 
 let productShippingColumnsAvailable = null;
 
@@ -437,6 +438,120 @@ const formatRazorpayShippingAddress = (addr) => {
       .filter(Boolean)
       .join(", ") || null
   );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Normalise a Delhivery serviceability response into a boolean.
+// Handles:
+//   - a raw boolean
+//   - { serviceable: true }
+//   - { is_serviceable: true }
+//   - { isServiceable: true }
+//   - { serviceability: true }
+//   - { data: { serviceable: true } }  (nested, same flag shapes as above)
+//   - { delivery_status: "Serviceable" } (or status / deliveryStatus string)
+//   - { delivery_codes: [ { postal_code: { success: true } } ] }
+//     (Delhivery's actual pincode serviceability API shape)
+//   - an array of any of the above (every entry must pass)
+// Returns true if ANY valid success indicator is found in the response.
+// ─────────────────────────────────────────────────────────────────────────────
+const parseDelhiveryServiceability = (delhiveryResponse) => {
+  if (typeof delhiveryResponse === "boolean") {
+    return delhiveryResponse;
+  }
+
+  const readFlags = (obj) => {
+    if (!obj || typeof obj !== "object") return null;
+    if (typeof obj.serviceable === "boolean") return obj.serviceable;
+    if (typeof obj.is_serviceable === "boolean") return obj.is_serviceable;
+    if (typeof obj.isServiceable === "boolean") return obj.isServiceable;
+    if (typeof obj.serviceability === "boolean") return obj.serviceability;
+    const status = obj.delivery_status || obj.status || obj.deliveryStatus;
+    if (typeof status === "string") {
+      return /serviceable|available|yes/i.test(status);
+    }
+    return null;
+  };
+
+  // Delhivery's real pincode serviceability response:
+  // { delivery_codes: [ { postal_code: { success: true, ... } } ] }
+  const readDeliveryCodes = (obj) => {
+    if (!obj || typeof obj !== "object") return null;
+    const deliveryCodes = obj.delivery_codes;
+    if (!Array.isArray(deliveryCodes) || deliveryCodes.length === 0) {
+      return null;
+    }
+    return deliveryCodes.some((entry) => {
+      const postalCode = entry?.postal_code;
+      if (postalCode && typeof postalCode === "object") {
+        if (typeof postalCode.success === "boolean") return postalCode.success;
+        if (typeof postalCode.success === "string") {
+          return /^(true|yes|y|1)$/i.test(postalCode.success);
+        }
+      }
+      // Fall back to a direct flag on the entry itself
+      const entryFlag = readFlags(entry);
+      return entryFlag === true;
+    });
+  };
+
+  if (Array.isArray(delhiveryResponse)) {
+    if (delhiveryResponse.length === 0) return false;
+    return delhiveryResponse.every((entry) => {
+      const deliveryCodesFlag = readDeliveryCodes(entry);
+      if (deliveryCodesFlag !== null) return deliveryCodesFlag;
+      return readFlags(entry) !== false;
+    });
+  }
+
+  if (delhiveryResponse && typeof delhiveryResponse === "object") {
+    const deliveryCodesFlag = readDeliveryCodes(delhiveryResponse);
+    if (deliveryCodesFlag !== null) return deliveryCodesFlag;
+
+    const direct = readFlags(delhiveryResponse);
+    if (direct !== null) return direct;
+
+    const nested =
+      delhiveryResponse.data && typeof delhiveryResponse.data === "object"
+        ? delhiveryResponse.data
+        : null;
+    if (nested) {
+      const nestedDeliveryCodesFlag = readDeliveryCodes(nested);
+      if (nestedDeliveryCodesFlag !== null) return nestedDeliveryCodesFlag;
+
+      const nestedFlag = readFlags(nested);
+      if (nestedFlag !== null) return nestedFlag;
+    }
+  }
+
+  return false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Normalise a country value to check whether it represents India.
+// Accepts (case-insensitively): IN, IND, INDIA.
+// ─────────────────────────────────────────────────────────────────────────────
+const isIndiaCountry = (country) => {
+  const normalized = String(country || "")
+    .trim()
+    .toUpperCase();
+  return normalized === "IN" || normalized === "IND" || normalized === "INDIA";
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Race a promise against a timeout. Never throws on timeout — resolves with
+// a sentinel object instead, so callers can distinguish "timed out" from
+// "rejected" from "resolved normally" without try/catch gymnastics.
+// ─────────────────────────────────────────────────────────────────────────────
+const withTimeout = (promise, ms) => {
+  let timeoutHandle;
+  const timeoutPromise = new Promise((resolve) => {
+    timeoutHandle = setTimeout(() => resolve({ __timedOut: true }), ms);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timeoutHandle);
+  });
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -928,9 +1043,19 @@ export const verifyPayment = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/shipping-info
-// Magic Checkout callback — returns available shipping methods for the address
+// Magic Checkout callback — returns available shipping methods per address,
+// per Razorpay's documented Shipping Info API contract.
 // ─────────────────────────────────────────────────────────────────────────────
+// Delhivery API must never be allowed to hold the Magic Checkout popup open
+// indefinitely — cap every serviceability check at this many milliseconds.
+const DELHIVERY_SERVICEABILITY_TIMEOUT_MS = 5000;
+
 export const getShippingInfo = async (req, res) => {
+  console.log("================================");
+  console.log("MAGIC CHECKOUT SHIPPING INFO HIT");
+  console.log("Headers:", req.headers);
+  console.log("Body:", JSON.stringify(req.body, null, 2));
+  console.log("================================");
   console.log("========== SHIPPING INFO REQUEST ==========");
   console.log("Method:", req.method);
   console.log("URL:", req.originalUrl);
@@ -970,80 +1095,223 @@ export const getShippingInfo = async (req, res) => {
     parsedBody,
   });
 
-  const items = Array.isArray(parsedBody?.items)
-    ? parsedBody.items
-    : Array.isArray(parsedBody?.line_items)
-      ? parsedBody.line_items
-      : [];
+  // ── Razorpay Magic Checkout Shipping Info payload ──────────────────────────
+  const {
+    order_id: receiptOrderId,
+    razorpay_order_id: razorpayOrderId,
+    contact,
+    addresses,
+  } = parsedBody;
 
-  const shippingAddress =
-    parsedBody?.shippingAddress ||
-    parsedBody?.shipping_address ||
-    parsedBody?.customer_details?.shipping_address ||
-    parsedBody?.customer_details?.shippingAddress ||
-    null;
-
-  if (!Array.isArray(items) || !items.length || !shippingAddress) {
-    console.warn("[SHIPPING_INFO] invalid payload", {
-      method: req.method,
-      contentType,
-      parsedBody,
-    });
-    console.log("[SHIPPING INFO] Validation Failed");
-
+  // ── Validate request ────────────────────────────────────────────────────
+  if (!receiptOrderId && !razorpayOrderId) {
     return res.status(400).json({
-      success: false,
-      message: "Shipping info request requires items and shippingAddress",
+      message: "order_id or razorpay_order_id is required",
     });
   }
 
-  const shippingCharge = items.reduce((sum, item) => {
-    const isFreeShipping =
-      item.is_free_shipping === true ||
-      item.is_free_shipping === 1 ||
-      item.is_free_shipping === "true" ||
-      item.is_free_shipping === "1";
-    const parsedShippingCharge = Number(item.shipping_charge ?? 0);
-    const itemShippingCharge = isFreeShipping
-      ? 0
-      : Number.isFinite(parsedShippingCharge)
-        ? Math.max(0, parsedShippingCharge)
-        : 0;
-    return sum + itemShippingCharge;
-  }, 0);
+  if (!contact) {
+    return res.status(400).json({
+      message: "contact is required",
+    });
+  }
 
-  const firstPaidItem = items.find((item) => {
-    const isFreeShipping =
-      item.is_free_shipping === true ||
-      item.is_free_shipping === 1 ||
-      item.is_free_shipping === "true" ||
-      item.is_free_shipping === "1";
-    return !isFreeShipping;
+  if (!Array.isArray(addresses) || addresses.length === 0) {
+    return res.status(400).json({
+      message: "addresses is required",
+    });
+  }
+
+  for (const [index, address] of addresses.entries()) {
+    const missingFields = ["id", "zipcode", "country", "state_code"].filter(
+      (field) => !address?.[field],
+    );
+    if (missingFields.length) {
+      console.warn("[SHIPPING_INFO] Address validation failed", {
+        index,
+        addressId: address?.id,
+        missingFields,
+      });
+      return res.status(400).json({
+        message: `Address at index ${index} is missing required field(s): ${missingFields.join(", ")}.`,
+      });
+    }
+  }
+
+  // ── Resolve the order lookup key ────────────────────────────────────────
+  // razorpay_order_id and order_number map to different columns — never
+  // reuse one value to search the other's column. If only one identifier is
+  // present, search on that column alone. If both are present, search either
+  // column (OR) since either could be the one Razorpay actually populated.
+  let lookupSql;
+  let lookupParams;
+  let lookupKeyUsed;
+
+  if (razorpayOrderId && receiptOrderId) {
+    lookupSql = "razorpay_order_id = ? OR order_number = ?";
+    lookupParams = [razorpayOrderId, receiptOrderId];
+    lookupKeyUsed = "razorpay_order_id_or_order_number";
+  } else if (razorpayOrderId) {
+    lookupSql = "razorpay_order_id = ?";
+    lookupParams = [razorpayOrderId];
+    lookupKeyUsed = "razorpay_order_id";
+  } else {
+    lookupSql = "order_number = ?";
+    lookupParams = [receiptOrderId];
+    lookupKeyUsed = "order_number";
+  }
+
+  console.info("[SHIPPING_INFO] Order lookup", {
+    receiptOrderId,
+    razorpayOrderId,
+    lookupKeyUsed,
   });
-  const estimatedDelivery =
-    firstPaidItem?.estimated_delivery ??
-    firstPaidItem?.estimatedDelivery ??
-    null;
 
-  const shippingMethods = [
-    {
-      id: "standard",
-      label:
-        shippingCharge > 0 ? "Standard Delivery" : "Free Standard Delivery",
-      amount: shippingCharge > 0 ? Math.round(shippingCharge * 100) : 0,
-      currency: "INR",
-      estimated_delivery: estimatedDelivery || "3-5 business days",
-    },
-  ];
+  // ── Load order-level shipping data (never recomputed from cart items) ─────
+  const { rows: orderRows } = await query(
+    `SELECT
+       id,
+       shipping,
+       shipping_charge,
+       is_free_shipping,
+       estimated_delivery,
+       razorpay_order_id,
+       order_number
+     FROM orders
+     WHERE ${lookupSql}
+     LIMIT 1`,
+    lookupParams,
+  );
+
+  if (!orderRows.length) {
+    console.warn("[SHIPPING_INFO] Order not found", {
+      receiptOrderId,
+      razorpayOrderId,
+      lookupKeyUsed,
+    });
+    return res.status(404).json({ message: "Order not found", addresses: [] });
+  }
+
+  const order = orderRows[0];
+
+  console.info("[SHIPPING_INFO] Order loaded", {
+    orderId: order.id,
+    razorpayOrderId: order.razorpay_order_id,
+    orderNumber: order.order_number,
+  });
+
+  const isFreeShipping =
+    order.is_free_shipping === true ||
+    order.is_free_shipping === 1 ||
+    order.is_free_shipping === "true" ||
+    order.is_free_shipping === "1";
+
+  const storedShippingCharge = Number(
+    order.shipping ?? order.shipping_charge ?? 0,
+  );
+  const shippingFee = isFreeShipping
+    ? 0
+    : Number.isFinite(storedShippingCharge)
+      ? Math.max(0, storedShippingCharge)
+      : 0;
+  const shippingFeePaise = Math.round(shippingFee * 100);
+
+  const estimatedDelivery =
+    String(order.estimated_delivery || "").trim() || "3-5 business days";
+
+  console.info("[SHIPPING_INFO] Shipping fee", {
+    orderId: order.id,
+    isFreeShipping,
+    shippingFee,
+    shippingFeePaise,
+  });
+  console.info("[SHIPPING_INFO] Estimated delivery", {
+    orderId: order.id,
+    estimatedDelivery,
+  });
+
+  // ── Check Delhivery serviceability per address, in parallel ───────────────
+  const responseAddresses = await Promise.all(
+    addresses.map(async (address) => {
+      const zipcode = address.zipcode;
+      const country = String(address.country || "");
+
+      let serviceable = true;
+
+      if (!isIndiaCountry(country)) {
+        serviceable = false;
+        console.warn("[SHIPPING_INFO] Unsupported country", {
+          addressId: address.id,
+          country,
+        });
+      } else {
+        try {
+          console.info("[SHIPPING_INFO] Delhivery request", {
+            addressId: address.id,
+            zipcode,
+          });
+
+          const delhiveryResult = await withTimeout(
+            delhiveryService.checkServiceability(String(zipcode)),
+            DELHIVERY_SERVICEABILITY_TIMEOUT_MS,
+          );
+
+          if (delhiveryResult?.__timedOut) {
+            serviceable = false;
+            console.warn("[SHIPPING_INFO] Delhivery request timed out", {
+              addressId: address.id,
+              zipcode,
+              timeoutMs: DELHIVERY_SERVICEABILITY_TIMEOUT_MS,
+            });
+          } else {
+            console.info("[SHIPPING_INFO] Delhivery response", {
+              addressId: address.id,
+              zipcode,
+              delhiveryResponse: delhiveryResult,
+            });
+            serviceable = parseDelhiveryServiceability(delhiveryResult);
+          }
+        } catch (error) {
+          serviceable = false;
+          console.error("[SHIPPING_INFO] Delhivery error", {
+            addressId: address.id,
+            zipcode,
+            error: error?.message || error,
+          });
+        }
+      }
+
+      console.info("[SHIPPING_INFO] Address serviceability result", {
+        addressId: address.id,
+        zipcode,
+        country: address.country,
+        serviceable,
+      });
+
+      return {
+        id: address.id,
+        zipcode,
+        country: address.country,
+        shipping_methods: [
+          {
+            id: "standard",
+            name: "Standard Delivery",
+            description: `Delivery in ${estimatedDelivery}`,
+            serviceable,
+            shipping_fee: shippingFeePaise,
+            cod: false,
+            cod_fee: 0,
+          },
+        ],
+      };
+    }),
+  );
 
   const responseData = {
-    success: true,
-    shipping_address: shippingAddress,
-    default_shipping_method: "standard",
-    shipping_methods: shippingMethods,
-    shipping_total: shippingCharge,
+    addresses: responseAddresses,
   };
 
+  console.info("[SHIPPING_INFO] Final response", { responseData });
   console.log(
     "[SHIPPING INFO] Success Response:",
     JSON.stringify(responseData, null, 2),
