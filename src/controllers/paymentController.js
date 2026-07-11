@@ -187,7 +187,7 @@ export const createOrder = async (req, res) => {
   // the popup rejects it). Returning an expired order causes silent failures,
   // so we fall through to create a fresh one whenever the cached order is no
   // longer in 'created' status.
-  if (req.user?.id) {
+  if (req.user?.id && !isMagicCheckout) {
     const { rows: existingOrders } = await query(
       `SELECT id, razorpay_order_id FROM orders
        WHERE user_id = ? AND payment_status = 'pending'
