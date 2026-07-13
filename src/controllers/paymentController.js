@@ -2042,6 +2042,9 @@
 //   return res.json({ status: "ok" });
 // };
 
+
+// -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
 import { randomUUID } from "crypto";
 import { getRazorpay } from "../config/razorpay.js";
 import {
@@ -2324,7 +2327,7 @@ export const createOrder = async (req, res) => {
     const orderPayload = {
       amount: Math.round(serverTotal * 100), // paise
       currency: "INR",
-      receipt: `bree_${Date.now()}`,
+      receipt: order.order_number, // BREE-100048 ----------------------------------------------------
     };
 
     // Magic Checkout requires line_items + line_items_total on the actual
