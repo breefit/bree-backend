@@ -2042,7 +2042,6 @@
 //   return res.json({ status: "ok" });
 // };
 
-
 // -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 
 import { randomUUID } from "crypto";
@@ -2563,8 +2562,12 @@ const formatRazorpayShippingAddress = (addr) => {
 // ─────────────────────────────────────────────────────────────────────────────
 const isPostalCodeServiceable = (postalCode) => {
   if (!postalCode || typeof postalCode !== "object") return false;
-  const prePaid = String(postalCode.pre_paid ?? "").trim().toUpperCase();
-  const pickup = String(postalCode.pickup ?? "").trim().toUpperCase();
+  const prePaid = String(postalCode.pre_paid ?? "")
+    .trim()
+    .toUpperCase();
+  const pickup = String(postalCode.pickup ?? "")
+    .trim()
+    .toUpperCase();
   // Core requirement: prepaid shipments accepted AND pickup available.
   return prePaid === "Y" && pickup === "Y";
 };
@@ -3163,10 +3166,10 @@ export const verifyPayment = async (req, res) => {
       }
     } catch (billingErr) {
       // Non-blocking — the webhook (subscription.charged) will sync it later.
-      console.warn(
-        "[VERIFY_PAYMENT] Could not fetch charge_at from Razorpay",
-        { orderId: order.id, ...describeRazorpayError(billingErr) },
-      );
+      console.warn("[VERIFY_PAYMENT] Could not fetch charge_at from Razorpay", {
+        orderId: order.id,
+        ...describeRazorpayError(billingErr),
+      });
     }
   }
 
@@ -3487,26 +3490,58 @@ const parsePromotionRequestBody = (req) => {
   return { body: parsedBody };
 };
 
-const getPromotionItems = (body) => {
-  const items = Array.isArray(body?.items)
-    ? body.items
-    : Array.isArray(body?.line_items)
-      ? body.line_items
-      : [];
+// ─────────────────────────────────────────────────────────────────────────────
+// Resolve the DB order for a promotions callback.
+//
+// FIX: This is the single source of truth for "how much does this order
+// cost". Previously getPromotions()/applyPromotions() derived their subtotal
+// from whatever `items` / `line_items` / `amount` Razorpay's promotions
+// callback happened to send in the request body. That payload is NOT
+// guaranteed to match the Razorpay order Razorpay itself created in
+// createOrder() (e.g. it can reflect product-only pricing with the ₹49
+// shipping charge left out). When getPromotions() then returned that
+// incomplete amount back to Magic Checkout, the popup displayed/reconciled
+// against a total that didn't match the underlying Razorpay order amount
+// (₹545 / 54500 paise), which is exactly what produces Razorpay's
+// "Payment amount is different from your order amount" error.
+//
+// Same lookup pattern as getShippingInfo() above: razorpay_order_id and
+// order_number map to different columns, so search whichever identifier(s)
+// are actually present.
+// ─────────────────────────────────────────────────────────────────────────────
+const resolvePromotionOrder = async (body) => {
+  const receiptOrderId = body?.order_id;
+  const razorpayOrderId = body?.razorpay_order_id;
 
-  return Array.isArray(items) ? items : [];
-};
+  if (!receiptOrderId && !razorpayOrderId) {
+    return null;
+  }
 
-const calculatePromotionSubtotal = (items, fallbackAmount) =>
-  Number(
-    fallbackAmount ??
-      items.reduce(
-        (sum, item) =>
-          sum +
-          Number(item.price ?? 0) * Number(item.quantity ?? item.qty ?? 1),
-        0,
-      ),
+  let lookupSql;
+  let lookupParams;
+
+  if (razorpayOrderId && receiptOrderId) {
+    lookupSql = "razorpay_order_id = ? OR order_number = ?";
+    lookupParams = [razorpayOrderId, receiptOrderId];
+  } else if (razorpayOrderId) {
+    lookupSql = "razorpay_order_id = ?";
+    lookupParams = [razorpayOrderId];
+  } else {
+    lookupSql = "order_number = ?";
+    lookupParams = [receiptOrderId];
+  }
+
+  const { rows } = await query(
+    `SELECT id, subtotal, shipping, shipping_charge, total, is_free_shipping,
+            razorpay_order_id, order_number
+     FROM orders
+     WHERE ${lookupSql}
+     LIMIT 1`,
+    lookupParams,
   );
+
+  return rows[0] || null;
+};
 
 const getPromotionCatalog = (subtotal) =>
   [
@@ -3547,23 +3582,34 @@ const normalizePromotionCode = (value) =>
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/promotions
 // Magic Checkout callback — returns applicable coupon offers
+//
+// FIX: amount is now read from the DB order (order.total — subtotal +
+// shipping, with admin-controlled free shipping already applied at
+// createOrder() time), never recomputed from body.amount/items/line_items.
+// This keeps the amount Magic Checkout displays in sync with the actual
+// Razorpay order amount, resolving the ₹496-vs-₹545 mismatch.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getPromotions = async (req, res) => {
   const { body } = parsePromotionRequestBody(req);
-  const items = getPromotionItems(body);
 
-  if (!Array.isArray(items) || !items.length) {
-    return res.status(400).json({
+  const order = await resolvePromotionOrder(body);
+  if (!order) {
+    console.warn("[PROMOTIONS] Order not found", {
+      orderId: body?.order_id,
+      razorpayOrderId: body?.razorpay_order_id,
+    });
+    return res.status(404).json({
       success: false,
-      message: "Promotions request requires cart items",
+      message: "Order not found",
     });
   }
 
-  const subtotal = calculatePromotionSubtotal(items, body.amount);
+  const subtotal = Number(order.total ?? order.subtotal ?? 0);
   const promotions = getPromotionCatalog(subtotal);
 
   console.info("[PROMOTIONS] Resolved", {
-    orderId: body.order_id,
+    orderId: order.id,
+    razorpayOrderId: order.razorpay_order_id,
     subtotal,
     applicableCount: promotions.length,
   });
@@ -3579,15 +3625,23 @@ export const getPromotions = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/apply-promotions
 // Magic Checkout callback — applies a specific promotion code to the cart
+//
+// FIX: same as getPromotions() above — subtotal/final_amount are computed
+// from the DB order's stored total, never from client-supplied
+// items/line_items/amount.
 // ─────────────────────────────────────────────────────────────────────────────
 export const applyPromotions = async (req, res) => {
   const { body } = parsePromotionRequestBody(req);
-  const items = getPromotionItems(body);
 
-  if (!Array.isArray(items) || !items.length) {
-    return res.status(400).json({
+  const order = await resolvePromotionOrder(body);
+  if (!order) {
+    console.warn("[APPLY_PROMOTIONS] Order not found", {
+      orderId: body?.order_id,
+      razorpayOrderId: body?.razorpay_order_id,
+    });
+    return res.status(404).json({
       success: false,
-      message: "Apply promotions request requires cart items",
+      message: "Order not found",
     });
   }
 
@@ -3610,7 +3664,7 @@ export const applyPromotions = async (req, res) => {
     });
   }
 
-  const subtotal = calculatePromotionSubtotal(items, body.amount);
+  const subtotal = Number(order.total ?? order.subtotal ?? 0);
   const promotions = getPromotionCatalog(subtotal);
   const matchedPromotion = promotions.find(
     (promotion) => normalizePromotionCode(promotion.code) === promotionCode,
@@ -3618,7 +3672,7 @@ export const applyPromotions = async (req, res) => {
 
   if (!matchedPromotion) {
     console.warn("[APPLY_PROMOTIONS] Not applicable", {
-      orderId: body.order_id,
+      orderId: order.id,
       promotionCode,
       subtotal,
     });
@@ -3632,7 +3686,7 @@ export const applyPromotions = async (req, res) => {
   const finalAmount = Math.max(0, subtotal - discountAmount);
 
   console.info("[APPLY_PROMOTIONS] Applied", {
-    orderId: body.order_id,
+    orderId: order.id,
     promotionCode,
     discountAmount,
     finalAmount,
