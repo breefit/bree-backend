@@ -2319,51 +2319,62 @@ export const createOrder = async (req, res) => {
     }
   }
 
-  // ── Create Razorpay order ─────────────────────────────────────────────────
-  let rzpOrder;
-  try {
-    const rzp = getRazorpay();
-
-    const orderPayload = {
-      amount: Math.round(serverTotal * 100), // paise
-      currency: "INR",
-      receipt: orderNumber, // BREE-100048 ----------------------------------------------------
-    };
-
-    // Magic Checkout requires line_items + line_items_total on the actual
-    // Razorpay order, or Razorpay silently serves Standard Checkout instead,
-    // regardless of any client-side option.
-    if (isMagicCheckout) {
-      orderPayload.line_items =
-        buildLineItemsFromValidatedItems(validatedItems);
-      orderPayload.line_items_total = orderPayload.amount;
-    }
-
-    rzpOrder = await rzp.orders.create(orderPayload);
-  } catch (err) {
-    console.error(
-      "[CREATE_ORDER] Razorpay order creation failed",
-      describeRazorpayError(err),
-    );
-    return res.status(502).json({
-      success: false,
-      message: "Failed to create payment order. Please try again.",
-    });
-  }
-
-  // ── Persist pending order in a transaction ────────────────────────────────
+  // ── Open DB transaction first ─────────────────────────────────────────────
+  // orderNumber must exist before the Razorpay order is created, because the
+  // Razorpay `receipt` field is set to orderNumber. So the sequence is now:
+  // BEGIN -> generate orderId/orderNumber -> create Razorpay order -> persist
+  // everything -> COMMIT. This avoids the previous
+  // "ReferenceError: orderNumber is not defined" caused by creating the
+  // Razorpay order before orderNumber existed.
   const client = await getClient();
+  let orderId;
+  let orderNumber;
+  let rzpOrder;
+
   try {
     await client.query("BEGIN");
 
-    const orderId = randomUUID();
+    orderId = randomUUID();
 
     // Generate the human-friendly order_number in the same transaction as
     // order creation. Does not touch rzpOrder.id, the Razorpay order
     // payload, or any other Razorpay mapping field — purely an additional
     // column on our own orders row.
-    const orderNumber = await getNextOrderNumber(client);
+    orderNumber = await getNextOrderNumber(client);
 
+    // ── Create Razorpay order ───────────────────────────────────────────────
+    try {
+      const rzp = getRazorpay();
+
+      const orderPayload = {
+        amount: Math.round(serverTotal * 100), // paise
+        currency: "INR",
+        receipt: orderNumber, // BREE-100048 ----------------------------------------------------
+      };
+
+      // Magic Checkout requires line_items + line_items_total on the actual
+      // Razorpay order, or Razorpay silently serves Standard Checkout instead,
+      // regardless of any client-side option.
+      if (isMagicCheckout) {
+        orderPayload.line_items =
+          buildLineItemsFromValidatedItems(validatedItems);
+        orderPayload.line_items_total = orderPayload.amount;
+      }
+
+      rzpOrder = await rzp.orders.create(orderPayload);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      console.error(
+        "[CREATE_ORDER] Razorpay order creation failed",
+        describeRazorpayError(err),
+      );
+      return res.status(502).json({
+        success: false,
+        message: "Failed to create payment order. Please try again.",
+      });
+    }
+
+    // ── Persist pending order ─────────────────────────────────────────────────
     // For Magic Checkout, customer details are unknown at this point — stored
     // as NULL and updated after payment verification.
     // For legacy flow, they are provided upfront.
