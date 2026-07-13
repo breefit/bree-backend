@@ -2327,7 +2327,7 @@ export const createOrder = async (req, res) => {
     const orderPayload = {
       amount: Math.round(serverTotal * 100), // paise
       currency: "INR",
-      receipt: order.order_number, // BREE-100048 ----------------------------------------------------
+      receipt: order_number, // BREE-100048 ----------------------------------------------------
     };
 
     // Magic Checkout requires line_items + line_items_total on the actual
