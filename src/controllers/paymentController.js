@@ -2323,9 +2323,7 @@ export const createOrder = async (req, res) => {
   // orderNumber must exist before the Razorpay order is created, because the
   // Razorpay `receipt` field is set to orderNumber. So the sequence is now:
   // BEGIN -> generate orderId/orderNumber -> create Razorpay order -> persist
-  // everything -> COMMIT. This avoids the previous
-  // "ReferenceError: orderNumber is not defined" caused by creating the
-  // Razorpay order before orderNumber existed.
+  // everything -> COMMIT.
   const client = await getClient();
   let orderId;
   let orderNumber;
@@ -2526,58 +2524,82 @@ const formatRazorpayShippingAddress = (addr) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Normalise a Delhivery serviceability response into a boolean.
-// Handles:
-//   - a raw boolean
-//   - { serviceable: true }
-//   - { is_serviceable: true }
-//   - { isServiceable: true }
-//   - { serviceability: true }
-//   - { data: { serviceable: true } }  (nested, same flag shapes as above)
-//   - { delivery_status: "Serviceable" } (or status / deliveryStatus string)
-//   - { delivery_codes: [ { postal_code: { success: true } } ] }
-//     (Delhivery's actual pincode serviceability API shape)
-//   - an array of any of the above (every entry must pass)
-// Returns true if ANY valid success indicator is found in the response.
+//
+// Delhivery's REAL pincode serviceability response looks like:
+//   {
+//     "delivery_codes": [
+//       {
+//         "postal_code": {
+//           "pin": 500072,
+//           "pre_paid": "Y",
+//           "pickup": "Y",
+//           "cash": "Y",
+//           "repl": "Y",
+//           "country_code": "IN",
+//           "state_code": "TS"
+//         }
+//       }
+//     ]
+//   }
+//
+// There is NO `success` field anywhere in this payload — a previous version
+// of this parser incorrectly looked for `postal_code.success`, which never
+// exists, so every response was silently treated as not serviceable.
+//
+// A pincode is considered serviceable when Delhivery indicates it can accept
+// prepaid shipments AND pick up from that pincode:
+//   postal_code.pre_paid === "Y"  AND  postal_code.pickup === "Y"
+// `cash` (COD support) and `repl` (reverse pickup / replacement support) are
+// NOT required — BREE doesn't offer COD on this flow, and requiring them
+// would incorrectly reject pincodes that are otherwise perfectly serviceable
+// for a standard prepaid shipment.
+//
+// If ANY entry in `delivery_codes` passes this check, the pincode is
+// serviceable.
+//
+// Legacy/alternate response shapes (boolean, `serviceable` flags, status
+// strings, nested `data`) are still supported as a fallback, in case this
+// endpoint is ever called against a different Delhivery API surface.
 // ─────────────────────────────────────────────────────────────────────────────
+const isPostalCodeServiceable = (postalCode) => {
+  if (!postalCode || typeof postalCode !== "object") return false;
+  const prePaid = String(postalCode.pre_paid ?? "").trim().toUpperCase();
+  const pickup = String(postalCode.pickup ?? "").trim().toUpperCase();
+  // Core requirement: prepaid shipments accepted AND pickup available.
+  return prePaid === "Y" && pickup === "Y";
+};
+
+const readDeliveryCodes = (obj) => {
+  if (!obj || typeof obj !== "object") return null;
+  const deliveryCodes = obj.delivery_codes;
+  if (!Array.isArray(deliveryCodes) || deliveryCodes.length === 0) {
+    return null;
+  }
+  // Serviceable if ANY entry's postal_code passes the pre_paid + pickup check
+  return deliveryCodes.some((entry) =>
+    isPostalCodeServiceable(entry?.postal_code),
+  );
+};
+
+// Legacy/fallback flag shapes — retained for backward compatibility with any
+// other Delhivery-shaped response this endpoint may still receive.
+const readFlags = (obj) => {
+  if (!obj || typeof obj !== "object") return null;
+  if (typeof obj.serviceable === "boolean") return obj.serviceable;
+  if (typeof obj.is_serviceable === "boolean") return obj.is_serviceable;
+  if (typeof obj.isServiceable === "boolean") return obj.isServiceable;
+  if (typeof obj.serviceability === "boolean") return obj.serviceability;
+  const status = obj.delivery_status || obj.status || obj.deliveryStatus;
+  if (typeof status === "string") {
+    return /serviceable|available|yes/i.test(status);
+  }
+  return null;
+};
+
 const parseDelhiveryServiceability = (delhiveryResponse) => {
   if (typeof delhiveryResponse === "boolean") {
     return delhiveryResponse;
   }
-
-  const readFlags = (obj) => {
-    if (!obj || typeof obj !== "object") return null;
-    if (typeof obj.serviceable === "boolean") return obj.serviceable;
-    if (typeof obj.is_serviceable === "boolean") return obj.is_serviceable;
-    if (typeof obj.isServiceable === "boolean") return obj.isServiceable;
-    if (typeof obj.serviceability === "boolean") return obj.serviceability;
-    const status = obj.delivery_status || obj.status || obj.deliveryStatus;
-    if (typeof status === "string") {
-      return /serviceable|available|yes/i.test(status);
-    }
-    return null;
-  };
-
-  // Delhivery's real pincode serviceability response:
-  // { delivery_codes: [ { postal_code: { success: true, ... } } ] }
-  const readDeliveryCodes = (obj) => {
-    if (!obj || typeof obj !== "object") return null;
-    const deliveryCodes = obj.delivery_codes;
-    if (!Array.isArray(deliveryCodes) || deliveryCodes.length === 0) {
-      return null;
-    }
-    return deliveryCodes.some((entry) => {
-      const postalCode = entry?.postal_code;
-      if (postalCode && typeof postalCode === "object") {
-        if (typeof postalCode.success === "boolean") return postalCode.success;
-        if (typeof postalCode.success === "string") {
-          return /^(true|yes|y|1)$/i.test(postalCode.success);
-        }
-      }
-      // Fall back to a direct flag on the entry itself
-      const entryFlag = readFlags(entry);
-      return entryFlag === true;
-    });
-  };
 
   if (Array.isArray(delhiveryResponse)) {
     if (delhiveryResponse.length === 0) return false;
@@ -2609,6 +2631,38 @@ const parseDelhiveryServiceability = (delhiveryResponse) => {
   }
 
   return false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Extract the raw postal_code flags from a Delhivery response purely for
+// logging purposes (pre_paid / pickup / cash / repl), so ops can see exactly
+// what Delhivery returned without having to re-derive it from the full raw
+// payload dump. Only inspects the first delivery_codes entry — sufficient
+// for a single-pincode lookup, which is how this endpoint calls Delhivery.
+// Never throws; returns null if the shape doesn't match.
+// ─────────────────────────────────────────────────────────────────────────────
+const extractPostalCodeLogFields = (delhiveryResponse) => {
+  try {
+    const source = Array.isArray(delhiveryResponse)
+      ? delhiveryResponse[0]
+      : delhiveryResponse;
+    const deliveryCodes = source?.delivery_codes;
+    const postalCode = Array.isArray(deliveryCodes)
+      ? deliveryCodes[0]?.postal_code
+      : null;
+
+    if (!postalCode || typeof postalCode !== "object") return null;
+
+    return {
+      pin: postalCode.pin,
+      pre_paid: postalCode.pre_paid,
+      pickup: postalCode.pickup,
+      cash: postalCode.cash,
+      repl: postalCode.repl,
+    };
+  } catch {
+    return null;
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3333,31 +3387,56 @@ export const getShippingInfo = async (req, res) => {
           );
 
           if (delhiveryResult?.__timedOut) {
-            serviceable = false;
-            console.warn("[SHIPPING_INFO] Delhivery request timed out", {
-              orderId: order.id,
-              addressId: address.id,
-              zipcode,
-              timeoutMs: DELHIVERY_SERVICEABILITY_TIMEOUT_MS,
-            });
+            // ── Delhivery timed out ──────────────────────────────────────────
+            // A timeout is NOT evidence the pincode is unserviceable — it's a
+            // transient infrastructure issue on Delhivery's side (or ours).
+            // Fail OPEN (assume serviceable) rather than incorrectly showing
+            // "Pincode not serviceable" to a customer on a perfectly valid
+            // Indian pincode. This matches existing business logic of never
+            // blocking checkout on a Delhivery outage.
+            serviceable = true;
+            console.warn(
+              "[SHIPPING_INFO] Delhivery request timed out — assuming serviceable (fail-open)",
+              {
+                orderId: order.id,
+                addressId: address.id,
+                zipcode,
+                timeoutMs: DELHIVERY_SERVICEABILITY_TIMEOUT_MS,
+              },
+            );
           } else {
             serviceable = parseDelhiveryServiceability(delhiveryResult);
+            const logFields = extractPostalCodeLogFields(delhiveryResult);
             console.info("[SHIPPING_INFO] Delhivery response", {
               orderId: order.id,
               addressId: address.id,
               zipcode,
+              pin: logFields?.pin,
+              pre_paid: logFields?.pre_paid,
+              pickup: logFields?.pickup,
+              cash: logFields?.cash,
+              repl: logFields?.repl,
               serviceable,
               delhiveryResponse: delhiveryResult,
             });
           }
         } catch (error) {
-          serviceable = false;
-          console.error("[SHIPPING_INFO] Delhivery error", {
-            orderId: order.id,
-            addressId: address.id,
-            zipcode,
-            message: error?.message || String(error),
-          });
+          // ── Delhivery request failed (network error / 5xx / parse error) ──
+          // Same reasoning as the timeout branch above: a Delhivery-side
+          // failure is not proof the pincode is unserviceable. Fail OPEN so
+          // Magic Checkout doesn't incorrectly reject a valid Indian pincode
+          // because of a transient upstream error. Log loudly for ops to
+          // investigate the underlying Delhivery issue.
+          serviceable = true;
+          console.error(
+            "[SHIPPING_INFO] Delhivery error — assuming serviceable (fail-open)",
+            {
+              orderId: order.id,
+              addressId: address.id,
+              zipcode,
+              message: error?.message || String(error),
+            },
+          );
         }
       }
 
