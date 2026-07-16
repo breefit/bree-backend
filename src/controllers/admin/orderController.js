@@ -20,6 +20,28 @@ const VALID_SORTS = [
   "order_number",
 ];
 
+// ===== Added: Delhivery automatic-sync boundary =====
+// Once a shipment (AWB) has been created for an order, Delhivery becomes the
+// single source of truth for these statuses. Manual admin requests to set
+// any of them must be rejected while an AWB is present on the order.
+// "processing" and "ready_to_ship" remain manually editable at all times.
+const DELHIVERY_LOCKED_STATUSES = [
+  "shipped",
+  "out_for_delivery",
+  "delivered",
+  "returned",
+  "cancelled",
+];
+
+const DELHIVERY_SYNC_MESSAGE =
+  "Shipping status is managed automatically by Delhivery after shipment creation.";
+
+const hasAwbShipment = (order) =>
+  Boolean(
+    order?.delhivery_awb || order?.awb_number || order?.awbNumber || order?.awb,
+  );
+// ===== End Added =====
+
 // GET /api/admin/orders
 export const getOrders = async (req, res) => {
   const {
@@ -350,6 +372,17 @@ export const updateOrderStatus = async (req, res) => {
       }
       const prev = normalizeOrderStatus(order.order_status);
       const next = normalizeOrderStatus(status);
+
+      // ===== Added: Delhivery automatic-sync boundary =====
+      // Once a shipment (AWB) exists for this order, Delhivery owns the
+      // shipped/out_for_delivery/delivered/returned/cancelled statuses.
+      // Reject manual attempts to set any of them while an AWB is present.
+      if (DELHIVERY_LOCKED_STATUSES.includes(next) && hasAwbShipment(order)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ message: DELHIVERY_SYNC_MESSAGE });
+      }
+      // ===== End Added =====
+
       const prevIdx = idxOf(prev);
       const nextIdx = idxOf(next);
       if (next === "cancelled") {
@@ -587,6 +620,19 @@ export const bulkUpdateStatus = async (req, res) => {
     for (const o of foundFull) {
       const prev = normalizeOrderStatus(o.order_status);
       const next = normalizeOrderStatus(status);
+
+      // ===== Added: Delhivery automatic-sync boundary =====
+      // Same rule as updateOrderStatus(): once an order has an AWB, the
+      // Delhivery-owned statuses can no longer be set manually, including
+      // via bulk update.
+      if (DELHIVERY_LOCKED_STATUSES.includes(next) && hasAwbShipment(o)) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          message: `Order ${o.order_number || o.id}: ${DELHIVERY_SYNC_MESSAGE}`,
+        });
+      }
+      // ===== End Added =====
+
       const prevIdx = idxOf(prev);
       const nextIdx = idxOf(next);
 

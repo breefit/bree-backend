@@ -60,42 +60,53 @@
 // export { firebaseAdminReady, firebaseAdminMode };
 // export default firebaseAuth;
 
-
 import admin from "firebase-admin";
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const cleanEnv = (value) => value?.trim();
+const currentFilePath = fileURLToPath(import.meta.url);
+const currentDir = path.dirname(currentFilePath);
+const backendRoot = path.resolve(currentDir, "..", "..");
 
-const googleApplicationCredentials = cleanEnv(
-  process.env.GOOGLE_APPLICATION_CREDENTIALS
-);
+const candidateCredentialPaths = [
+  cleanEnv(process.env.GOOGLE_APPLICATION_CREDENTIALS),
+  path.join(backendRoot, "serviceAccountKey.json"),
+  path.join(process.cwd(), "serviceAccountKey.json"),
+].filter(Boolean);
+
+let credentialPath = null;
+
+for (const candidate of candidateCredentialPaths) {
+  if (fs.existsSync(candidate)) {
+    credentialPath = candidate;
+    break;
+  }
+}
+
+if (!credentialPath) {
+  throw new Error(
+    "Firebase Admin SDK is misconfigured. Provide GOOGLE_APPLICATION_CREDENTIALS with the absolute path to your Firebase service account JSON file.",
+  );
+}
+
+process.env.GOOGLE_APPLICATION_CREDENTIALS = credentialPath;
 
 let firebaseAdminReady = false;
 let firebaseAdminMode = "none";
 
 try {
   if (!admin.apps.length) {
-    if (!googleApplicationCredentials) {
-      throw new Error(
-        "Firebase Admin SDK is misconfigured. Provide GOOGLE_APPLICATION_CREDENTIALS with the absolute path to your Firebase service account JSON file."
-      );
-    }
-
-    const credentialsExist = fs.existsSync(googleApplicationCredentials);
-
-    if (!credentialsExist) {
-      throw new Error(
-        `GOOGLE_APPLICATION_CREDENTIALS file not found at ${googleApplicationCredentials}`
-      );
-    }
+    const serviceAccount = JSON.parse(fs.readFileSync(credentialPath, "utf8"));
 
     admin.initializeApp({
-      credential: admin.credential.applicationDefault(),
+      credential: admin.credential.cert(serviceAccount),
     });
 
     firebaseAdminReady = true;
-    firebaseAdminMode = "application-default";
-    console.log("Firebase Admin initialized using GOOGLE_APPLICATION_CREDENTIALS.");
+    firebaseAdminMode = "service-account";
+    console.log("Firebase Admin initialized using service account file.");
   } else {
     firebaseAdminReady = true;
     firebaseAdminMode = "existing-app";
@@ -103,7 +114,7 @@ try {
 } catch (error) {
   console.error("Firebase Admin initialization error:", {
     message: error.message,
-    GOOGLE_APPLICATION_CREDENTIALS: googleApplicationCredentials || null,
+    GOOGLE_APPLICATION_CREDENTIALS: credentialPath || null,
   });
 
   throw error;
