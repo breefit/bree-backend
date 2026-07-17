@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { body } from "express-validator";
 import {
-  register,
-  login,
+  sendOtp,
+  verifyOtp,
+  resendOtp,
   googleSignIn,
   getMe,
   verifyAuth,
@@ -23,30 +24,48 @@ const validate = (validations) => async (req, res, next) => {
 const router = Router();
 
 router.post(
-  "/register",
+  "/send-otp",
   validate([
-    body("name").trim().notEmpty().withMessage("Name is required"),
-    body("email")
-      .isEmail()
-      .normalizeEmail()
-      .withMessage("Valid email required"),
-    body("password")
-      .isLength({ min: 6 })
-      .withMessage("Password must be at least 6 characters"),
+    body("mobile")
+      .notEmpty()
+      .withMessage("Mobile number is required")
+      .bail()
+      .matches(/^\d{10}$/)
+      .withMessage("Mobile number must be exactly 10 digits"),
   ]),
-  register,
+  sendOtp,
 );
 
 router.post(
-  "/login",
+  "/verify-otp",
   validate([
-    body("email")
-      .isEmail()
-      .normalizeEmail()
-      .withMessage("Valid email required"),
-    body("password").notEmpty().withMessage("Password is required"),
+    body("mobile")
+      .notEmpty()
+      .withMessage("Mobile number is required")
+      .bail()
+      .matches(/^\d{10}$/)
+      .withMessage("Mobile number must be exactly 10 digits"),
+    body("otp")
+      .notEmpty()
+      .withMessage("OTP is required")
+      .bail()
+      .matches(/^\d{6}$/)
+      .withMessage("OTP must be exactly 6 digits"),
   ]),
-  login,
+  verifyOtp,
+);
+
+router.post(
+  "/resend-otp",
+  validate([
+    body("mobile")
+      .notEmpty()
+      .withMessage("Mobile number is required")
+      .bail()
+      .matches(/^\d{10}$/)
+      .withMessage("Mobile number must be exactly 10 digits"),
+  ]),
+  resendOtp,
 );
 
 router.post(

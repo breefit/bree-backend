@@ -1,7 +1,9 @@
 import dotenv from "dotenv";
 import { createServer } from "http";
 import { Server } from "socket.io";
+import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
+import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 
 dotenv.config();
 
@@ -29,7 +31,17 @@ const startServer = async () => {
     try {
       await query("SELECT 1");
       console.log("✅ Database connection verified");
+
+      // Start Delhivery tracking cron
       startShippingTrackingCron();
+
+      // OTP cleanup cron (runs every hour)
+      cron.schedule("0 * * * *", () => {
+        cleanupExpiredOtps().catch((err) => {
+          console.error("[otpCleanupJob] Failed to clean expired OTPs:", err);
+        });
+      });
+      console.log("🧹 OTP cleanup cron started (runs every hour)");
     } catch (dbErr) {
       console.error(
         "⚠️ Database connection check failed; cron not started",

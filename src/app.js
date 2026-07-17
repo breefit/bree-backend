@@ -22,6 +22,7 @@ import {
 import adminRouter from "./routes/admin/index.js";
 import errorHandler from "./middleware/errorHandler.js";
 import bulkRouter from "./routes/bulkRoutes.js";
+import webhookRouter from "./routes/webhookRoutes.js";
 // console.log("STEP 2 - App file loaded");
 
 const app = express();
@@ -195,6 +196,7 @@ try {
   app.use("/api/addresses", addressRouter);
   app.use("/api/shipping", shippingRouter);
   app.use("/api/bulk-bookings", bulkRouter);
+  app.use("/api/webhooks", webhookRouter);
   app.use("/api/contact", contactRouter);
   app.use("/api/testimonials", testimonialRouter);
   app.use("/api/admin", adminRouter);
