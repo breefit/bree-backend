@@ -2058,7 +2058,7 @@ import delhiveryService from "../services/delhiveryService.js";
 import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
-} from "../services/whatsappService.js";
+} from "../services/whatsappNotificationService.js";
 
 let productShippingColumnsAvailable = null;
 
