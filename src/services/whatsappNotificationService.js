@@ -12,6 +12,7 @@ const PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
 
 const ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 
+const LANGUAGE_CODE = process.env.META_DEFAULT_LANGUAGE || "en";
 
 /*
 |--------------------------------------------------------------------------
