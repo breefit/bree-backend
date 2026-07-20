@@ -327,6 +327,11 @@ export const sendTemplateMessage = async ({
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
+      console.log("========== META REQUEST ==========");
+      console.log("Template:", templateName);
+      console.log("Mobile:", formattedMobile);
+      console.log("Payload:", JSON.stringify(payload, null, 2));
+      console.log("=================================");
       const response = await axios.post(getApiUrl(), payload, {
         headers: {
           Authorization: `Bearer ${ACCESS_TOKEN}`,
@@ -392,11 +397,12 @@ export const sendOrderConfirmationWhatsApp = async ({
   customerName,
   orderNumber,
   orderAmount,
+  orderDate,
 }) => {
   return sendTemplateMessage({
     mobile,
     templateName: TEMPLATES.ORDER_CONFIRMED,
-    parameters: [customerName, orderNumber, `₹${orderAmount}`],
+    parameters: [customerName, orderNumber, `₹${orderAmount}`, orderDate],
   });
 };
 

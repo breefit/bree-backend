@@ -2055,6 +2055,10 @@ import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
 import delhiveryService from "../services/delhiveryService.js";
+import {
+  safelySendWhatsApp,
+  sendOrderConfirmationWhatsApp,
+} from "../services/whatsappService.js";
 
 let productShippingColumnsAvailable = null;
 
@@ -3150,6 +3154,27 @@ export const verifyPayment = async (req, res) => {
       message: err?.message || String(err),
     });
   });
+
+  console.log("========== WHATSAPP ==========");
+  console.log("Name :", resolvedName);
+  console.log("Phone:", resolvedPhone);
+  console.log("Email:", resolvedEmail);
+  console.log("Order:", order.order_number);
+  console.log("==============================");
+
+  if (resolvedPhone) {
+    await safelySendWhatsApp("Order Confirmed", () =>
+      sendOrderConfirmationWhatsApp({
+        mobile: resolvedPhone,
+        customerName: resolvedName,
+        orderNumber: order.order_number || order.id,
+        orderAmount: dbTotal,
+        orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString("en-IN"),
+      }),
+    );
+  } else {
+    console.warn("[WhatsApp] Skipped: No mobile number found.");
+  }
 
   // ── For subscriptions: fetch charge_at from Razorpay and write
   // next_billing_date so SubscriptionSuccess and MySubscriptions pages can
