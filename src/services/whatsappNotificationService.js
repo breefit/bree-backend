@@ -24,59 +24,22 @@ const LANGUAGE_CODE = process.env.META_DEFAULT_LANGUAGE || "en";
 | Example:
 |
 | META_TEMPLATE_ORDER_CONFIRMED=order_confirmed
-| META_TEMPLATE_ORDER_PROCESSING=order_processing
-| META_TEMPLATE_ORDER_READY_TO_SHIP=order_ready_to_ship
-| META_TEMPLATE_ORDER_SHIPPED=order_shipped
-| META_TEMPLATE_ORDER_OUT_FOR_DELIVERY=order_out_for_delivery
-| META_TEMPLATE_ORDER_DELIVERED=order_delivered
-| META_TEMPLATE_ORDER_CANCELLED=order_cancelled
+| META_TEMPLATE_ORDER_STATUS=order_status_update
 |
-| META_TEMPLATE_SUBSCRIPTION_CREATED=subscription_created
-| META_TEMPLATE_SUBSCRIPTION_RENEWED=subscription_renewed
-| META_TEMPLATE_SUBSCRIPTION_FAILED=subscription_failed
-| META_TEMPLATE_SUBSCRIPTION_CANCELLED=subscription_cancelled
-| META_TEMPLATE_SUBSCRIPTION_RESUMED=subscription_resumed
+| META_TEMPLATE_SUBSCRIPTION_STATUS=subscription_status_update
 |
 */
 
 const TEMPLATES = {
   ORDER_CONFIRMED: process.env.META_TEMPLATE_ORDER_CONFIRMED,
 
-  ORDER_PROCESSING: process.env.META_TEMPLATE_ORDER_PROCESSING,
+  ORDER_STATUS: process.env.META_TEMPLATE_ORDER_STATUS,
 
-  ORDER_READY_TO_SHIP: process.env.META_TEMPLATE_ORDER_READY_TO_SHIP,
-
-  ORDER_SHIPPED: process.env.META_TEMPLATE_ORDER_SHIPPED,
-
-  ORDER_OUT_FOR_DELIVERY: process.env.META_TEMPLATE_ORDER_OUT_FOR_DELIVERY,
-
-  ORDER_DELIVERED: process.env.META_TEMPLATE_ORDER_DELIVERED,
-
-  ORDER_CANCELLED: process.env.META_TEMPLATE_ORDER_CANCELLED,
-
-  ORDER_RETURNED: process.env.META_TEMPLATE_ORDER_RETURNED,
-
-  SUBSCRIPTION_CREATED: process.env.META_TEMPLATE_SUBSCRIPTION_CREATED,
-
-  SUBSCRIPTION_RENEWED: process.env.META_TEMPLATE_SUBSCRIPTION_RENEWED,
-
-  SUBSCRIPTION_FAILED: process.env.META_TEMPLATE_SUBSCRIPTION_FAILED,
-
-  SUBSCRIPTION_CANCELLED: process.env.META_TEMPLATE_SUBSCRIPTION_CANCELLED,
-
-  SUBSCRIPTION_RESUMED: process.env.META_TEMPLATE_SUBSCRIPTION_RESUMED,
-
-  SUBSCRIPTION_PAUSED: process.env.META_TEMPLATE_SUBSCRIPTION_PAUSED,
-
-  SUBSCRIPTION_EXPIRING: process.env.META_TEMPLATE_SUBSCRIPTION_EXPIRING,
+  SUBSCRIPTION_STATUS: process.env.META_TEMPLATE_SUBSCRIPTION_STATUS,
 
   PAYMENT_SUCCESS: process.env.META_TEMPLATE_PAYMENT_SUCCESS,
 
   PAYMENT_FAILED: process.env.META_TEMPLATE_PAYMENT_FAILED,
-
-  TRACKING_LINK: process.env.META_TEMPLATE_TRACKING_LINK,
-
-  ORDER_STATUS: process.env.META_TEMPLATE_ORDER_STATUS,
 };
 
 /*
@@ -385,11 +348,18 @@ export const sendTemplateMessage = async ({
 /**
  * Sends the "order confirmed" WhatsApp notification.
  *
+ * The `order_confirmed` template now carries a dynamic "Track Order"
+ * URL button, so an optional `orderUuid` is accepted and passed as the
+ * button's dynamic suffix. Existing body parameters are unchanged.
+ *
  * @param {Object} params
  * @param {string|number} params.mobile - Recipient's mobile number.
  * @param {string} params.customerName - Customer's display name.
  * @param {string} params.orderNumber - Order reference number.
  * @param {number|string} params.orderAmount - Order total amount (without currency symbol).
+ * @param {string} params.orderDate - Order date.
+ * @param {string} [params.orderUuid] - Order UUID for the Track Order button
+ * (https://www.breefit.in/order/{orderUuid}/tracking). Button is omitted if not provided.
  * @returns {Promise<Object>} The Meta API response data.
  */
 export const sendOrderConfirmationWhatsApp = async ({
@@ -398,164 +368,134 @@ export const sendOrderConfirmationWhatsApp = async ({
   orderNumber,
   orderAmount,
   orderDate,
+  orderUuid,
 }) => {
   return sendTemplateMessage({
     mobile,
     templateName: TEMPLATES.ORDER_CONFIRMED,
     parameters: [customerName, orderNumber, `₹${orderAmount}`, orderDate],
+    buttonParameters: orderUuid
+      ? [
+          {
+            subType: "url",
+            index: 0,
+            parameters: [orderUuid],
+          },
+        ]
+      : undefined,
   });
 };
 
 /**
- * Sends the "order processing" WhatsApp notification.
+ * Maps an internal order status value to the body message shown in
+ * template variable {{4}} of `order_status_update`.
  *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @returns {Promise<Object>} The Meta API response data.
+ * @param {string} status - Internal order status value (e.g. "shipped").
+ * @returns {string} The status message line, or a generic fallback if
+ * the status is unrecognized.
  */
-export const sendOrderProcessingWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_PROCESSING,
-    parameters: [customerName, orderNumber],
-  });
+export const buildOrderStatusMessage = (status) => {
+  const messages = {
+    pending_payment: "Your order has been placed and is awaiting payment.",
+    paid: "Payment received successfully. Your order has been confirmed.",
+    processing: "Our team has started preparing your order.",
+    ready_to_ship: "Your order has been packed and is ready for shipment.",
+    shipped: "Your order has been shipped.",
+    out_for_delivery: "Your order is out for delivery.",
+    delivered: "Your order has been delivered successfully.",
+    cancelled: "Your order has been cancelled.",
+    returned: "Your returned order has been received.",
+  };
+
+  return messages[status] || "Your order status has been updated.";
 };
 
 /**
- * Sends the "ready to ship" WhatsApp notification.
+ * Maps an internal order status value to the human-readable label shown
+ * in template variable {{3}} of `order_status_update`.
  *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @returns {Promise<Object>} The Meta API response data.
+ * @param {string} status - Internal order status value (e.g. "out_for_delivery").
+ * @returns {string} The readable label, or a title-cased fallback if
+ * the status is unrecognized.
  */
-export const sendReadyToShipWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_READY_TO_SHIP,
-    parameters: [customerName, orderNumber],
-  });
+export const getReadableOrderStatus = (status) => {
+  const labels = {
+    pending_payment: "Pending Payment",
+    paid: "Confirmed",
+    processing: "Processing",
+    ready_to_ship: "Ready to Ship",
+    shipped: "Shipped",
+    out_for_delivery: "Out for Delivery",
+    delivered: "Delivered",
+    cancelled: "Cancelled",
+    returned: "Returned",
+  };
+
+  if (labels[status]) {
+    return labels[status];
+  }
+
+  return String(status || "Updated")
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 };
 
 /**
- * Sends the "order shipped" WhatsApp notification.
+ * Sends the consolidated order status update WhatsApp notification via
+ * the `order_status_update` template. This single function replaces the
+ * previous per-status senders and should be called for every order
+ * status change after the initial order confirmation.
  *
  * @param {Object} params
  * @param {string|number} params.mobile - Recipient's mobile number.
  * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @param {string} params.courierName - Name of the courier partner.
- * @param {string} params.trackingNumber - Shipment tracking/AWB number.
+ * @param {string} params.orderNumber - Order reference number (e.g. BREE-100001).
+ * @param {string} [params.orderUuid] - Order UUID, sent as the tracking button's
+ * dynamic URL suffix (https://www.breefit.in/order/{orderUuid}/tracking).
+ * The button is omitted entirely if this is not provided.
+ * @param {string} params.status - Internal order status value (e.g. "shipped").
  * @returns {Promise<Object>} The Meta API response data.
+ * @throws {Error} If `customerName`, `orderNumber`, or `status` is missing.
  */
-export const sendShippedWhatsApp = async ({
+export const sendOrderStatusUpdateWhatsApp = async ({
   mobile,
   customerName,
   orderNumber,
-  courierName,
-  trackingNumber,
+  orderUuid,
+  status,
 }) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_SHIPPED,
-    parameters: [customerName, orderNumber, courierName, trackingNumber],
-  });
-};
+  if (!customerName || !String(customerName).trim()) {
+    throw new Error("customerName is required");
+  }
 
-/**
- * Sends the "out for delivery" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendOutForDeliveryWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_OUT_FOR_DELIVERY,
-    parameters: [customerName, orderNumber],
-  });
-};
+  if (!orderNumber || !String(orderNumber).trim()) {
+    throw new Error("orderNumber is required");
+  }
 
-/**
- * Sends the "order delivered" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendDeliveredWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_DELIVERED,
-    parameters: [customerName, orderNumber],
-  });
-};
+  if (!status || !String(status).trim()) {
+    throw new Error("status is required");
+  }
 
-/**
- * Sends the "order cancelled" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @param {string} [params.reason] - Cancellation reason. Defaults to "Not specified".
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendOrderCancelledWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-  reason,
-}) => {
   return sendTemplateMessage({
     mobile,
-    templateName: TEMPLATES.ORDER_CANCELLED,
-    parameters: [customerName, orderNumber, reason || "Not specified"],
-  });
-};
-
-/**
- * Sends the "order returned" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendOrderReturnedWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_RETURNED,
-    parameters: [customerName, orderNumber],
+    templateName: TEMPLATES.ORDER_STATUS,
+    parameters: [
+      customerName,
+      orderNumber,
+      getReadableOrderStatus(status),
+      buildOrderStatusMessage(status),
+    ],
+    buttonParameters: orderUuid
+      ? [
+          {
+            subType: "url",
+            index: 0,
+            parameters: [orderUuid],
+          },
+        ]
+      : undefined,
   });
 };
 
@@ -566,159 +506,115 @@ export const sendOrderReturnedWhatsApp = async ({
 */
 
 /**
- * Sends the "subscription created" WhatsApp notification.
+ * Maps an internal subscription status/event value to the body message
+ * shown in template variable {{4}} of `subscription_status_update`.
+ *
+ * @param {string} status - Internal subscription status value (e.g. "renewed").
+ * @returns {string} The status message line, or a generic fallback if
+ * the status is unrecognized.
+ */
+export const buildSubscriptionStatusMessage = (status) => {
+  const messages = {
+    created: "Your subscription has been activated successfully.",
+    renewed: "Your subscription has been renewed successfully.",
+    payment_failed:
+      "We couldn't process your subscription payment. Please update your payment method.",
+    paused: "Your subscription has been paused successfully.",
+    resumed: "Your subscription has been resumed successfully.",
+    cancelled: "Your subscription has been cancelled successfully.",
+    expiring:
+      "Your subscription will expire soon. Please renew it to continue enjoying your benefits.",
+  };
+
+  return messages[status] || "Your subscription status has been updated.";
+};
+
+/**
+ * Maps an internal subscription status/event value to the human-readable
+ * label shown in template variable {{3}} of `subscription_status_update`.
+ *
+ * @param {string} status - Internal subscription status value (e.g. "payment_failed").
+ * @returns {string} The readable label, or a title-cased fallback if
+ * the status is unrecognized.
+ */
+export const getReadableSubscriptionStatus = (status) => {
+  const labels = {
+    created: "Active",
+    renewed: "Renewed",
+    payment_failed: "Payment Failed",
+    paused: "Paused",
+    resumed: "Active",
+    cancelled: "Cancelled",
+    expiring: "Expiring Soon",
+  };
+
+  if (labels[status]) {
+    return labels[status];
+  }
+
+  return String(status || "Updated")
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+};
+
+/**
+ * Sends the consolidated subscription status update WhatsApp
+ * notification via the `subscription_status_update` template. This
+ * single function replaces the previous per-event senders (created,
+ * renewed, payment failed, paused, resumed, cancelled, expiring) and
+ * should be called for every subscription status change.
  *
  * @param {Object} params
  * @param {string|number} params.mobile - Recipient's mobile number.
  * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
  * @param {string} params.planName - Name of the subscribed plan.
+ * @param {string} [params.subscriptionUuid] - Subscription UUID, sent as the
+ * "Manage Subscription" button's dynamic URL suffix
+ * (https://www.breefit.in/subscriptions/{subscriptionUuid}). The button
+ * is omitted entirely if this is not provided.
+ * @param {string} params.status - Internal subscription status value (e.g. "renewed").
  * @returns {Promise<Object>} The Meta API response data.
+ * @throws {Error} If `customerName`, `planName`, or `status` is missing.
  */
-export const sendSubscriptionCreatedWhatsApp = async ({
+export const sendSubscriptionStatusUpdateWhatsApp = async ({
   mobile,
   customerName,
-  subscriptionId,
   planName,
+  subscriptionUuid,
+  status,
 }) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_CREATED,
-    parameters: [customerName, subscriptionId, planName],
-  });
-};
+  if (!customerName || !String(customerName).trim()) {
+    throw new Error("customerName is required");
+  }
 
-/**
- * Sends the "subscription renewed" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
- * @param {string} params.planName - Name of the subscribed plan.
- * @param {number|string} params.amount - Renewal amount (without currency symbol).
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendSubscriptionRenewedWhatsApp = async ({
-  mobile,
-  customerName,
-  subscriptionId,
-  planName,
-  amount,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_RENEWED,
-    parameters: [customerName, subscriptionId, planName, `₹${amount}`],
-  });
-};
+  if (!planName || !String(planName).trim()) {
+    throw new Error("planName is required");
+  }
 
-/**
- * Sends the "subscription payment failed" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
- * @param {string} [params.reason] - Failure reason. Defaults to "Payment failed".
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendSubscriptionFailedWhatsApp = async ({
-  mobile,
-  customerName,
-  subscriptionId,
-  reason,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_FAILED,
-    parameters: [customerName, subscriptionId, reason || "Payment failed"],
-  });
-};
+  if (!status || !String(status).trim()) {
+    throw new Error("status is required");
+  }
 
-/**
- * Sends the "subscription cancelled" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendSubscriptionCancelledWhatsApp = async ({
-  mobile,
-  customerName,
-  subscriptionId,
-}) => {
   return sendTemplateMessage({
     mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_CANCELLED,
-    parameters: [customerName, subscriptionId],
-  });
-};
-
-/**
- * Sends the "subscription resumed" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendSubscriptionResumedWhatsApp = async ({
-  mobile,
-  customerName,
-  subscriptionId,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_RESUMED,
-    parameters: [customerName, subscriptionId],
-  });
-};
-
-/**
- * Sends the "subscription paused" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendSubscriptionPausedWhatsApp = async ({
-  mobile,
-  customerName,
-  subscriptionId,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_PAUSED,
-    parameters: [customerName, subscriptionId],
-  });
-};
-
-/**
- * Sends the "subscription expiring soon" WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.subscriptionId - Subscription reference ID.
- * @param {string} params.renewalDate - Upcoming renewal date.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendSubscriptionExpiringWhatsApp = async ({
-  mobile,
-  customerName,
-  subscriptionId,
-  renewalDate,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.SUBSCRIPTION_EXPIRING,
-    parameters: [customerName, subscriptionId, renewalDate],
+    templateName: TEMPLATES.SUBSCRIPTION_STATUS,
+    parameters: [
+      customerName,
+      planName,
+      getReadableSubscriptionStatus(status),
+      buildSubscriptionStatusMessage(status),
+    ],
+    buttonParameters: subscriptionUuid
+      ? [
+          {
+            subType: "url",
+            index: 0,
+            parameters: [subscriptionUuid],
+          },
+        ]
+      : undefined,
   });
 };
 
@@ -771,83 +667,6 @@ export const sendPaymentFailedWhatsApp = async ({
     mobile,
     templateName: TEMPLATES.PAYMENT_FAILED,
     parameters: [customerName, orderNumber, `₹${amount}`],
-  });
-};
-
-/*
-|--------------------------------------------------------------------------
-| Tracking Notifications
-|--------------------------------------------------------------------------
-*/
-
-/**
- * Sends the "tracking link" WhatsApp notification.
- *
- * Uses a Meta WhatsApp URL button component to carry the tracking URL
- * (the `TRACKING_LINK` template must be configured with a dynamic URL
- * button) rather than sending the link as plain body text — this gives
- * the customer a tappable "Track Order" style button.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @param {string} params.courierName - Name of the courier partner.
- * @param {string} params.trackingNumber - Shipment tracking/AWB number.
- * @param {string} params.trackingUrl - Public tracking URL, sent as the
- * dynamic suffix of the template's URL button.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendTrackingLinkWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-  courierName,
-  trackingNumber,
-  trackingUrl,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.TRACKING_LINK,
-    parameters: [customerName, orderNumber, courierName, trackingNumber],
-    buttonParameters: trackingUrl
-      ? [
-          {
-            subType: "url",
-            index: 0,
-            parameters: [trackingUrl],
-          },
-        ]
-      : undefined,
-  });
-};
-
-/*
-|--------------------------------------------------------------------------
-| Generic Status Notification
-|--------------------------------------------------------------------------
-*/
-
-/**
- * Sends a generic order status update WhatsApp notification.
- *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @param {string} params.status - Human-readable status text.
- * @returns {Promise<Object>} The Meta API response data.
- */
-export const sendOrderStatusUpdateWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-  status,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.ORDER_STATUS,
-    parameters: [customerName, orderNumber, status],
   });
 };
 
@@ -1086,28 +905,18 @@ export default {
 
   // Order Notifications
   sendOrderConfirmationWhatsApp,
-  sendOrderProcessingWhatsApp,
-  sendReadyToShipWhatsApp,
-  sendShippedWhatsApp,
-  sendOutForDeliveryWhatsApp,
-  sendDeliveredWhatsApp,
-  sendOrderCancelledWhatsApp,
-  sendOrderReturnedWhatsApp,
   sendOrderStatusUpdateWhatsApp,
-  sendTrackingLinkWhatsApp,
+  buildOrderStatusMessage,
+  getReadableOrderStatus,
 
   // Payment Notifications
   sendPaymentSuccessWhatsApp,
   sendPaymentFailedWhatsApp,
 
   // Subscription Notifications
-  sendSubscriptionCreatedWhatsApp,
-  sendSubscriptionRenewedWhatsApp,
-  sendSubscriptionFailedWhatsApp,
-  sendSubscriptionCancelledWhatsApp,
-  sendSubscriptionResumedWhatsApp,
-  sendSubscriptionPausedWhatsApp,
-  sendSubscriptionExpiringWhatsApp,
+  sendSubscriptionStatusUpdateWhatsApp,
+  buildSubscriptionStatusMessage,
+  getReadableSubscriptionStatus,
 
   // Helpers
   safelySendWhatsApp,
