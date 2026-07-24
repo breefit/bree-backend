@@ -386,7 +386,7 @@ export const sendOrderConfirmationWhatsApp = async ({
     {
       subType: "url",
       index: 0,
-      parameters: [orderUuid],
+      parameters: [`${orderUuid}/tracking`],
     },
   ];
 
@@ -507,7 +507,7 @@ export const sendOrderStatusUpdateWhatsApp = async ({
           {
             subType: "url",
             index: 0,
-            parameters: [orderUuid],
+           parameters: [`${orderUuid}/tracking`],
           },
         ]
       : undefined,
