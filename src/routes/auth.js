@@ -5,6 +5,7 @@ import {
   verifyOtp,
   resendOtp,
   googleSignIn,
+  completeProfile,
   getMe,
   verifyAuth,
   logout,
@@ -53,6 +54,26 @@ router.post(
       .withMessage("OTP must be exactly 6 digits"),
   ]),
   verifyOtp,
+);
+
+router.post(
+  "/complete-profile",
+  validate([
+    body("mobile")
+      .notEmpty()
+      .withMessage("Mobile number is required")
+      .bail()
+      .matches(/^\d{10}$/)
+      .withMessage("Mobile number must be exactly 10 digits"),
+    body("name")
+      .trim()
+      .notEmpty()
+      .withMessage("Name is required")
+      .bail()
+      .isLength({ min: 2, max: 100 })
+      .withMessage("Name must be between 2 and 100 characters"),
+  ]),
+  completeProfile,
 );
 
 router.post(
