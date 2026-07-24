@@ -6,6 +6,13 @@ const ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const OTP_TEMPLATE_NAME = process.env.META_OTP_TEMPLATE_NAME;
 const OTP_LANGUAGE_CODE = process.env.META_OTP_LANGUAGE_CODE || "en_US";
 
+// Authentication templates with a "Copy Code" / one-tap autofill URL button
+// require a button component (sub_type: "url") whose parameter is the OTP
+// itself, since Meta appends it to the template's registered URL suffix.
+// Default true because this is what the reported #131008 error requires;
+// set META_OTP_HAS_URL_BUTTON=false if your template has no button.
+const OTP_HAS_URL_BUTTON = process.env.META_OTP_HAS_URL_BUTTON !== "false";
+
 const validateConfig = () => {
   if (!PHONE_NUMBER_ID) {
     throw new Error("META_PHONE_NUMBER_ID is missing.");
@@ -27,40 +34,68 @@ export const sendWhatsAppOtp = async (mobile, otp) => {
   validateConfig();
 
   const formattedMobile = mobile.startsWith("91") ? mobile : `91${mobile}`;
+  const apiUrl = getApiUrl();
+
+  // Authentication (OTP) templates only accept a single body parameter (the
+  // code itself) plus, if the template was configured with a one-tap
+  // autofill button, a matching button component. They do NOT support
+  // header/footer parameters the way Utility templates do.
+  const components = [
+    {
+      type: "body",
+      parameters: [
+        {
+          type: "text",
+          text: otp,
+        },
+      ],
+    },
+  ];
+
+  if (OTP_HAS_URL_BUTTON) {
+    components.push({
+      type: "button",
+      sub_type: "url",
+      index: "0",
+      parameters: [
+        {
+          type: "text",
+          text: otp,
+        },
+      ],
+    });
+  }
+
+  const payload = {
+    messaging_product: "whatsapp",
+    to: formattedMobile,
+    type: "template",
+    template: {
+      name: OTP_TEMPLATE_NAME,
+      language: {
+        code: OTP_LANGUAGE_CODE,
+      },
+      components,
+    },
+  };
+
+  console.log("[WhatsApp OTP] Template Name:", OTP_TEMPLATE_NAME);
+  console.log("[WhatsApp OTP] Language:", OTP_LANGUAGE_CODE);
+  console.log("[WhatsApp OTP] Mobile Number:", formattedMobile);
+  console.log("[WhatsApp OTP] API URL:", apiUrl);
+  console.log(
+    "[WhatsApp OTP] Request Payload:",
+    JSON.stringify(payload, null, 2),
+  );
 
   try {
-    const response = await axios.post(
-      getApiUrl(),
-      {
-        messaging_product: "whatsapp",
-        to: formattedMobile,
-        type: "template",
-        template: {
-          name: OTP_TEMPLATE_NAME,
-          language: {
-            code: OTP_LANGUAGE_CODE,
-          },
-          components: [
-            {
-              type: "body",
-              parameters: [
-                {
-                  type: "text",
-                  text: otp,
-                },
-              ],
-            },
-          ],
-        },
+    const response = await axios.post(apiUrl, payload, {
+      headers: {
+        Authorization: `Bearer ${ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
       },
-      {
-        headers: {
-          Authorization: `Bearer ${ACCESS_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        timeout: 30000,
-      },
-    );
+      timeout: 30000,
+    });
 
     console.log(`[WhatsApp OTP] OTP sent successfully to ${formattedMobile}`);
 
