@@ -3163,13 +3163,21 @@ export const verifyPayment = async (req, res) => {
   console.log("==============================");
 
   if (resolvedPhone) {
+    // TEMP DEBUG — remove once orderUuid fix is confirmed stable in production
+    console.log("Order Object:", order);
+    console.log("Order UUID:", order.id);
+    console.log("Order Number:", order.order_number);
+
     await safelySendWhatsApp("Order Confirmed", () =>
       sendOrderConfirmationWhatsApp({
         mobile: resolvedPhone,
         customerName: resolvedName,
         orderNumber: order.order_number || order.id,
         orderAmount: dbTotal,
-        orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString("en-IN"),
+        orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString(
+          "en-IN",
+        ),
+        orderUuid: order.id,
       }),
     );
   } else {
