@@ -28,6 +28,8 @@ const LANGUAGE_CODE = process.env.META_DEFAULT_LANGUAGE || "en";
 |
 | META_TEMPLATE_SUBSCRIPTION_STATUS=subscription_status_update
 |
+| META_TEMPLATE_PAYMENT_STATUS=payment_status
+|
 */
 
 const TEMPLATES = {
@@ -37,9 +39,7 @@ const TEMPLATES = {
 
   SUBSCRIPTION_STATUS: process.env.META_TEMPLATE_SUBSCRIPTION_STATUS,
 
-  PAYMENT_SUCCESS: process.env.META_TEMPLATE_PAYMENT_SUCCESS,
-
-  PAYMENT_FAILED: process.env.META_TEMPLATE_PAYMENT_FAILED,
+  PAYMENT_STATUS: process.env.META_TEMPLATE_PAYMENT_STATUS,
 };
 
 /*
@@ -625,48 +625,100 @@ export const sendSubscriptionStatusUpdateWhatsApp = async ({
 */
 
 /**
- * Sends the "payment success" WhatsApp notification.
+ * Maps an internal payment status value to the human-readable label
+ * shown in template variable {{3}} of `payment_status`.
  *
- * @param {Object} params
- * @param {string|number} params.mobile - Recipient's mobile number.
- * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
- * @param {number|string} params.amount - Payment amount (without currency symbol).
- * @returns {Promise<Object>} The Meta API response data.
+ * @param {string} status - Internal payment status value (e.g. "refunded").
+ * @returns {string} The readable label, or a title-cased fallback if
+ * the status is unrecognized.
  */
-export const sendPaymentSuccessWhatsApp = async ({
-  mobile,
-  customerName,
-  orderNumber,
-  amount,
-}) => {
-  return sendTemplateMessage({
-    mobile,
-    templateName: TEMPLATES.PAYMENT_SUCCESS,
-    parameters: [customerName, orderNumber, `₹${amount}`],
-  });
+export const getReadablePaymentStatus = (status) => {
+  const labels = {
+    success: "Success",
+    failed: "Failed",
+    pending: "Pending",
+    refunded: "Refunded",
+  };
+
+  if (labels[status]) {
+    return labels[status];
+  }
+
+  return String(status || "Updated")
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 };
 
 /**
- * Sends the "payment failed" WhatsApp notification.
+ * Maps an internal payment status value to the body message shown in
+ * template variable {{5}} of `payment_status`.
+ *
+ * @param {string} status - Internal payment status value (e.g. "pending").
+ * @returns {string} The status message line, or a generic fallback if
+ * the status is unrecognized.
+ */
+export const buildPaymentStatusMessage = (status) => {
+  const messages = {
+    success: "Your payment has been received successfully.",
+    failed: "Your payment could not be completed. Please try again.",
+    pending: "Your payment is currently pending confirmation.",
+    refunded: "Your payment has been refunded successfully.",
+  };
+
+  return messages[status] || "Your payment status has been updated.";
+};
+
+/**
+ * Sends the consolidated payment status update WhatsApp notification via
+ * the `payment_status` template. This single function replaces the
+ * previous per-outcome senders (success, failed) and should be called
+ * for every payment status change. `referenceNumber` works for both
+ * order numbers and subscription numbers.
  *
  * @param {Object} params
  * @param {string|number} params.mobile - Recipient's mobile number.
  * @param {string} params.customerName - Customer's display name.
- * @param {string} params.orderNumber - Order reference number.
+ * @param {string} params.referenceNumber - Order number or subscription number.
  * @param {number|string} params.amount - Payment amount (without currency symbol).
+ * @param {string} params.status - Internal payment status value (e.g. "success").
  * @returns {Promise<Object>} The Meta API response data.
+ * @throws {Error} If `customerName`, `referenceNumber`, `amount`, or `status` is missing.
  */
-export const sendPaymentFailedWhatsApp = async ({
+export const sendPaymentStatusWhatsApp = async ({
   mobile,
   customerName,
-  orderNumber,
+  referenceNumber,
   amount,
+  status,
 }) => {
+  if (!customerName || !String(customerName).trim()) {
+    throw new Error("customerName is required");
+  }
+
+  if (!referenceNumber || !String(referenceNumber).trim()) {
+    throw new Error("referenceNumber is required");
+  }
+
+  if (amount === undefined || amount === null || amount === "") {
+    throw new Error("amount is required");
+  }
+
+  if (!status || !String(status).trim()) {
+    throw new Error("status is required");
+  }
+
   return sendTemplateMessage({
     mobile,
-    templateName: TEMPLATES.PAYMENT_FAILED,
-    parameters: [customerName, orderNumber, `₹${amount}`],
+    templateName: TEMPLATES.PAYMENT_STATUS,
+    parameters: [
+      customerName,
+      referenceNumber,
+      getReadablePaymentStatus(status),
+      `₹${amount}`,
+      buildPaymentStatusMessage(status),
+    ],
   });
 };
 
@@ -909,14 +961,15 @@ export default {
   buildOrderStatusMessage,
   getReadableOrderStatus,
 
-  // Payment Notifications
-  sendPaymentSuccessWhatsApp,
-  sendPaymentFailedWhatsApp,
-
   // Subscription Notifications
   sendSubscriptionStatusUpdateWhatsApp,
   buildSubscriptionStatusMessage,
   getReadableSubscriptionStatus,
+
+  // Payment Notifications
+  sendPaymentStatusWhatsApp,
+  buildPaymentStatusMessage,
+  getReadablePaymentStatus,
 
   // Helpers
   safelySendWhatsApp,
