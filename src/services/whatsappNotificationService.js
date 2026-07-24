@@ -348,9 +348,12 @@ export const sendTemplateMessage = async ({
 /**
  * Sends the "order confirmed" WhatsApp notification.
  *
- * The `order_confirmed` template now carries a dynamic "Track Order"
- * URL button, so an optional `orderUuid` is accepted and passed as the
- * button's dynamic suffix. Existing body parameters are unchanged.
+ * The `order_confirmed_v2` template has a mandatory dynamic "Track Order"
+ * URL button, so `orderUuid` is required (not optional) and is always
+ * sent as that button's dynamic suffix. The template rejects the
+ * message entirely if the button parameter is missing
+ * ((#131008) Required parameter is missing), so we fail fast here
+ * instead of silently sending a payload Meta will reject.
  *
  * @param {Object} params
  * @param {string|number} params.mobile - Recipient's mobile number.
@@ -358,9 +361,12 @@ export const sendTemplateMessage = async ({
  * @param {string} params.orderNumber - Order reference number.
  * @param {number|string} params.orderAmount - Order total amount (without currency symbol).
  * @param {string} params.orderDate - Order date.
- * @param {string} [params.orderUuid] - Order UUID for the Track Order button
- * (https://www.breefit.in/order/{orderUuid}/tracking). Button is omitted if not provided.
+ * @param {string} params.orderUuid - Order UUID (the `orders.id` primary key,
+ * NOT the human-readable order number) for the Track Order button
+ * (https://www.breefit.in/order/{orderUuid}/tracking). Required.
  * @returns {Promise<Object>} The Meta API response data.
+ * @throws {Error} "Order UUID is required for the Track Order WhatsApp button."
+ * if `orderUuid` is missing or empty.
  */
 export const sendOrderConfirmationWhatsApp = async ({
   mobile,
@@ -370,19 +376,28 @@ export const sendOrderConfirmationWhatsApp = async ({
   orderDate,
   orderUuid,
 }) => {
+  if (!orderUuid || !String(orderUuid).trim()) {
+    throw new Error(
+      "Order UUID is required for the Track Order WhatsApp button.",
+    );
+  }
+
+  const buttonParameters = [
+    {
+      subType: "url",
+      index: 0,
+      parameters: [orderUuid],
+    },
+  ];
+
+  console.log("Order UUID:", orderUuid);
+  console.log("Button Parameters:", buttonParameters);
+
   return sendTemplateMessage({
     mobile,
     templateName: TEMPLATES.ORDER_CONFIRMED,
     parameters: [customerName, orderNumber, `₹${orderAmount}`, orderDate],
-    buttonParameters: orderUuid
-      ? [
-          {
-            subType: "url",
-            index: 0,
-            parameters: [orderUuid],
-          },
-        ]
-      : undefined,
+    buttonParameters,
   });
 };
 
