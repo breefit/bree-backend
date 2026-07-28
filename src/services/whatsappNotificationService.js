@@ -302,7 +302,7 @@ const formatBodyData = (values) => {
 
 /**
  * Converts the legacy Meta-style `buttonParameters` (dynamic URL button
- * suffixes) into Waplify's indexed `button_data` format, so callers that
+ * suffixes) into Waplify's indexed `url_button_data` format, so callers that
  * pass a tracking-link suffix (e.g. an order/subscription UUID) keep
  * working unchanged.
  *
@@ -319,11 +319,19 @@ const formatButtonData = (buttonParameters) => {
     return undefined;
   }
 
-  const flatValues = buttonParameters
-    .filter((button) => button && Array.isArray(button.parameters))
-    .flatMap((button) => button.parameters);
+  const data = {};
 
-  return formatBodyData(flatValues);
+  buttonParameters.forEach((button) => {
+    if (
+      button &&
+      Array.isArray(button.parameters) &&
+      button.parameters.length > 0
+    ) {
+      data[String(button.index ?? 0)] = String(button.parameters[0]);
+    }
+  });
+
+  return Object.keys(data).length ? data : undefined;
 };
 
 /**
@@ -510,7 +518,7 @@ export const sendTemplateMessage = async ({
 
     ...(headerData ? { header_data: headerData } : {}),
 
-    ...(buttonData ? { button_data: buttonData } : {}),
+    ...(buttonData ? { url_button_data: buttonData } : {}),
 
     ...(mediaUrl ? { media_url: mediaUrl } : {}),
   };
