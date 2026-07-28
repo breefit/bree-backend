@@ -16,7 +16,6 @@ const client = axios.create({
   timeout: Number(process.env.DELHIVERY_TIMEOUT || 30000),
   headers: {
     Authorization: `Token ${API_TOKEN}`,
-    "Content-Type": "application/json",
     Accept: "application/json",
   },
 });
@@ -92,7 +91,21 @@ class DelhiveryService {
   // ===== Modified =====
   async createShipment(payload) {
     try {
-      const response = await client.post("/api/cmu/create.json", payload);
+      const formData = new URLSearchParams();
+
+      formData.append("format", "json");
+      formData.append("data", JSON.stringify(payload));
+
+      const response = await client.post(
+        "/api/cmu/create.json",
+        formData.toString(),
+        {
+          headers: {
+            Authorization: `Token ${API_TOKEN}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+        },
+      );
 
       if (!response.data) {
         throw new Error("Empty response received from Delhivery.");
