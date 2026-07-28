@@ -336,10 +336,20 @@ export const createShipment = async (req, res) => {
 
     // ── 1. Fetch the order ───────────────────────────────────────────────────
     const { rows: orderRows } = await client.query(
-      `SELECT id, user_id, address_id, order_number, order_status, payment_status,
-              contact_name, contact_email, contact_phone, shipping_address,
-              subtotal, total, payment_method
-       FROM orders
+      `SELECT
+          id,
+          user_id,
+          address_id,
+          order_number,
+          order_status,
+          payment_status,
+          contact_name,
+          contact_email,
+          contact_phone,
+          shipping_address,
+          subtotal,
+          total
+      FROM orders
        WHERE id = ?
        LIMIT 1`,
       [orderId],
