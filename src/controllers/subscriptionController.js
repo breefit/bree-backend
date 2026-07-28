@@ -779,11 +779,15 @@ export const cancelSubscription = async (req, res) => {
 
   try {
     const { rows } = await query(
-      `SELECT id, razorpay_subscription_id, order_status, contact_email, contact_name, contact_phone
-       FROM orders
-       WHERE razorpay_subscription_id = ?
-         AND user_id = ?
-         AND is_subscription = 1`,
+      `SELECT o.id, o.razorpay_subscription_id, o.order_status,
+              o.contact_email, o.contact_name, o.contact_phone,
+              p.name AS product_name
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.razorpay_subscription_id = ?
+         AND o.user_id = ?
+         AND o.is_subscription = 1`,
       [razorpaySubscriptionId, userId],
     );
 
@@ -841,7 +845,7 @@ export const cancelSubscription = async (req, res) => {
         {
           to: order.contact_phone,
           name: order.contact_name,
-          planName: "Subscription",
+          planName: order.product_name,
           subscriptionId: order.razorpay_subscription_id,
           status: "cancelled",
         },
@@ -882,11 +886,15 @@ export const pauseSubscription = async (req, res) => {
 
   try {
     const { rows } = await query(
-      `SELECT id, razorpay_subscription_id, contact_email, contact_name, contact_phone
-       FROM orders
-       WHERE razorpay_subscription_id = ?
-         AND user_id = ?
-         AND is_subscription = 1`,
+      `SELECT o.id, o.razorpay_subscription_id,
+              o.contact_email, o.contact_name, o.contact_phone,
+              p.name AS product_name
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.razorpay_subscription_id = ?
+         AND o.user_id = ?
+         AND o.is_subscription = 1`,
       [razorpaySubscriptionId, userId],
     );
 
@@ -944,7 +952,7 @@ export const pauseSubscription = async (req, res) => {
         {
           to: order.contact_phone,
           name: order.contact_name,
-          planName: "Subscription",
+          planName: order.product_name,
           subscriptionId: order.razorpay_subscription_id,
           status: "paused",
         },
@@ -978,11 +986,15 @@ export const resumeSubscription = async (req, res) => {
 
   try {
     const { rows } = await query(
-      `SELECT id, razorpay_subscription_id, contact_email, contact_name, contact_phone
-       FROM orders
-       WHERE razorpay_subscription_id = ?
-         AND user_id = ?
-         AND is_subscription = 1`,
+      `SELECT o.id, o.razorpay_subscription_id,
+              o.contact_email, o.contact_name, o.contact_phone,
+              p.name AS product_name
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.razorpay_subscription_id = ?
+         AND o.user_id = ?
+         AND o.is_subscription = 1`,
       [razorpaySubscriptionId, userId],
     );
 
@@ -1045,7 +1057,7 @@ export const resumeSubscription = async (req, res) => {
         {
           to: order.contact_phone,
           name: order.contact_name,
-          planName: "Subscription",
+          planName: order.product_name,
           subscriptionId: order.razorpay_subscription_id,
           status: response.status || SUBSCRIPTION_STATUS.ACTIVE,
         },
