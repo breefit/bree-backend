@@ -48,7 +48,7 @@ import {
   getTestimonials,
   submitTestimonial,
 } from "../controllers/testimonialController.js";
-import shippingRouter from "./shippingRouter.js";
+import shippingRouter from "./shippingRoutes.js";
 import auth from "../middleware/auth.js";
 import { optionalAuth } from "../middleware/auth.js";
 
