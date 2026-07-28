@@ -11,6 +11,7 @@ import {
   sendOrderDeliveredEmail,
   sendOrderCancelledEmail,
 } from "../../services/orderEmailService.js";
+import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 
 const VALID_SORTS = [
   "created_at",
@@ -500,6 +501,23 @@ export const updateOrderStatus = async (req, res) => {
       });
     }
 
+    // ===== Added: WhatsApp order status notification =====
+    // Fire-and-forget, same status gating as the email notification above.
+    // Never awaited so a WhatsApp failure can never block the API response.
+    const recipientPhone = updated.contact_phone || updated.mobile_number;
+    if (status && status !== "pending_payment" && recipientPhone) {
+      sendOrderStatusUpdateWhatsApp({
+        customerName: recipientName,
+        mobile: recipientPhone,
+        orderNumber: updated.order_number,
+        orderUuid: updated.id,
+        status,
+      }).catch((error) => {
+        console.warn("Order status WhatsApp failed", error?.message || error);
+      });
+    }
+    // ===== End Added =====
+
     try {
       const io = req.app?.locals?.io;
       if (io) io.emit("order:updated", updated);
@@ -726,6 +744,27 @@ export const bulkUpdateStatus = async (req, res) => {
 
       Promise.allSettled(emailPromises).catch(() => {});
     }
+
+    // ===== Added: WhatsApp order status notifications (bulk) =====
+    // Fire-and-forget, mirrors the email notification block above.
+    const whatsappPromises = updated.map((orderItem) => {
+      const recipientPhone = orderItem.contact_phone || orderItem.mobile_number;
+      const recipientName =
+        orderItem.contact_name || orderItem.customer_name || "Customer";
+      if (!recipientPhone) {
+        return Promise.resolve();
+      }
+      return sendOrderStatusUpdateWhatsApp({
+        customerName: recipientName,
+        mobile: recipientPhone,
+        orderNumber: orderItem.order_number,
+        orderUuid: orderItem.id,
+        status,
+      });
+    });
+
+    Promise.allSettled(whatsappPromises).catch(() => {});
+    // ===== End Added =====
 
     // Emit socket events
     try {
