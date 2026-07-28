@@ -880,7 +880,7 @@ export const getReadableSubscriptionStatus = (status) => {
  * if `mobile` is invalid, or if the underlying API call fails after retries.
  *
  * @example
- * await sendSubscriptionStatusUpdateWhatsApp({
+ * await sendSubscriptionStatusWhatsApp({
  *   mobile: "9876543210",
  *   customerName: "Jane Doe",
  *   planName: "Wellness Monthly",
@@ -888,7 +888,7 @@ export const getReadableSubscriptionStatus = (status) => {
  *   status: "renewed",
  * });
  */
-export const sendSubscriptionStatusUpdateWhatsApp = async ({
+export const sendSubscriptionStatusWhatsApp = async ({
   mobile,
   customerName,
   planName,
@@ -1346,7 +1346,7 @@ export default {
   getReadableOrderStatus,
 
   // Subscription Notifications
-  sendSubscriptionStatusUpdateWhatsApp,
+  sendSubscriptionStatusWhatsApp,
   buildSubscriptionStatusMessage,
   getReadableSubscriptionStatus,
 
