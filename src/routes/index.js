@@ -48,7 +48,7 @@ import {
   getTestimonials,
   submitTestimonial,
 } from "../controllers/testimonialController.js";
-import { createShipment } from "../controllers/shippingController.js";
+import shippingRouter from "./shippingRouter.js";
 import auth from "../middleware/auth.js";
 import { optionalAuth } from "../middleware/auth.js";
 
@@ -124,6 +124,6 @@ contactRouter.post("/", submitInquiry);
 export const testimonialRouter = Router();
 testimonialRouter.get("/", getTestimonials);
 testimonialRouter.post("/", optionalAuth, submitTestimonial);
+
 // ── Shipping (authenticated) ──────────────────────────────────────────────────
-export const shippingRouter = Router();
-shippingRouter.post("/:orderId", auth, createShipment);
+export { shippingRouter };
