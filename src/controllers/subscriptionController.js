@@ -11,11 +11,8 @@ import {
   sendSubscriptionResumeEmail,
 } from "../services/orderEmailService.js";
 import {
-  sendSubscriptionCreatedWhatsApp,
-  sendSubscriptionPaymentSuccessWhatsApp,
-  sendSubscriptionPausedWhatsApp,
-  sendSubscriptionResumedWhatsApp,
-  sendSubscriptionCancelledWhatsApp,
+  sendSubscriptionStatusWhatsApp,
+  sendPaymentStatusWhatsApp,
 } from "../services/whatsappNotificationService.js";
 
 // ── Shared logger ────────────────────────────────────────────────────────────
@@ -547,14 +544,20 @@ export const createSubscription = async (req, res) => {
     // WhatsApp: Subscription Created — fired after commit, never awaited
     // before the response, failure is logged only.
     sendWhatsAppSafe(
-      sendSubscriptionCreatedWhatsApp,
+      (payload) =>
+        sendSubscriptionStatusWhatsApp({
+          customerName: payload.name,
+          mobile: payload.to,
+          planName: payload.planName,
+          subscriptionUuid: payload.subscriptionId,
+          status: payload.status,
+        }),
       {
         to: mobileNumber,
         name: customerName,
-        orderId,
-        orderNumber,
+        planName: validatedItems[0].name,
         subscriptionId: subscription.id,
-        amount: serverTotal,
+        status: "created",
       },
       "Subscription Created",
     );
@@ -827,12 +830,20 @@ export const cancelSubscription = async (req, res) => {
       // WhatsApp: Subscription Cancelled — only fired once the DB update
       // above has succeeded.
       sendWhatsAppSafe(
-        sendSubscriptionCancelledWhatsApp,
+        (payload) =>
+          sendSubscriptionStatusWhatsApp({
+            customerName: payload.name,
+            mobile: payload.to,
+            planName: payload.planName,
+            subscriptionUuid: payload.subscriptionId,
+            status: payload.status,
+          }),
         {
           to: order.contact_phone,
           name: order.contact_name,
-          orderId: order.id,
+          planName: "Subscription",
           subscriptionId: order.razorpay_subscription_id,
+          status: "cancelled",
         },
         "Subscription Cancelled",
       );
@@ -922,12 +933,20 @@ export const pauseSubscription = async (req, res) => {
       // WhatsApp: Subscription Paused — only fired once the DB update
       // above has succeeded.
       sendWhatsAppSafe(
-        sendSubscriptionPausedWhatsApp,
+        (payload) =>
+          sendSubscriptionStatusWhatsApp({
+            customerName: payload.name,
+            mobile: payload.to,
+            planName: payload.planName,
+            subscriptionUuid: payload.subscriptionId,
+            status: payload.status,
+          }),
         {
           to: order.contact_phone,
           name: order.contact_name,
-          orderId: order.id,
+          planName: "Subscription",
           subscriptionId: order.razorpay_subscription_id,
+          status: "paused",
         },
         "Subscription Paused",
       );
@@ -1015,13 +1034,20 @@ export const resumeSubscription = async (req, res) => {
       // WhatsApp: Subscription Resumed — only fired once the DB update
       // above has succeeded.
       sendWhatsAppSafe(
-        sendSubscriptionResumedWhatsApp,
+        (payload) =>
+          sendSubscriptionStatusWhatsApp({
+            customerName: payload.name,
+            mobile: payload.to,
+            planName: payload.planName,
+            subscriptionUuid: payload.subscriptionId,
+            status: payload.status,
+          }),
         {
           to: order.contact_phone,
           name: order.contact_name,
-          orderId: order.id,
+          planName: "Subscription",
           subscriptionId: order.razorpay_subscription_id,
-          nextBillingDate,
+          status: response.status || SUBSCRIPTION_STATUS.ACTIVE,
         },
         "Subscription Resumed",
       );
