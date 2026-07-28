@@ -929,7 +929,7 @@ export const sendSubscriptionStatusWhatsApp = async ({
           {
             subType: "url",
             index: 0,
-            parameters: [`${subscriptionUuid}/manage`],
+            parameters: [subscriptionUuid],
           },
         ]
       : undefined,
