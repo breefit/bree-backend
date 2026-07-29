@@ -480,6 +480,17 @@ export const createShipment = async (req, res) => {
         items,
         warehouse,
       });
+
+      console.log("========== SHIPPING ADDRESS ==========");
+      console.log(shippingAddress);
+
+      console.log("========== WAREHOUSE ==========");
+      console.log(warehouse);
+
+      console.log("========== DELHIVERY PAYLOAD ==========");
+      console.log(JSON.stringify(payload, null, 2));
+
+      console.log("=======================================");
     } catch (error) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -490,6 +501,9 @@ export const createShipment = async (req, res) => {
 
     // ── 6. Call Delhivery API to create shipment ─────────────────────────────
     let delhiveryResponse;
+    console.log("========== DELHIVERY SHIPMENT PAYLOAD ==========");
+    console.log(JSON.stringify(payload, null, 2));
+    console.log("===============================================");
     try {
       delhiveryResponse = await delhiveryService.createShipment(payload);
     } catch (error) {
