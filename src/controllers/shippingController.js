@@ -23,6 +23,59 @@ const getWarehouseConfig = () => {
   };
 };
 
+// ===== Modified =====
+// ─────────────────────────────────────────────────────────────────────────────
+// Validates a structured shipping address before it is sent to Delhivery.
+// Checks presence of full_name, mobile, address_line_1, city, state, and
+// pincode, and validates that pincode is a 6-digit Indian PIN code.
+// Never throws — always returns a { valid, missing, reason } object so the
+// caller can log exactly which fields failed and return a clean 400.
+// ─────────────────────────────────────────────────────────────────────────────
+const isValidPincode = (pincode) =>
+  /^\d{6}$/.test(String(pincode || "").trim());
+
+const validateShippingAddress = (shippingAddress) => {
+  const missing = {
+    full_name: !shippingAddress?.full_name,
+    mobile: !shippingAddress?.mobile,
+    address_line_1: !shippingAddress?.address_line_1,
+    city: !shippingAddress?.city,
+    state: !shippingAddress?.state,
+    pincode: !shippingAddress?.pincode,
+  };
+
+  const hasMissingField = Object.values(missing).some(Boolean);
+
+  if (hasMissingField) {
+    return { valid: false, missing, reason: "incomplete" };
+  }
+
+  if (!isValidPincode(shippingAddress.pincode)) {
+    return { valid: false, missing, reason: "invalid_pincode" };
+  }
+
+  return { valid: true, missing };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Validates that the warehouse (pickup/origin) address is complete enough
+// for Delhivery to accept a shipment. Missing warehouse city/state/pincode
+// causes the exact same class of failure as a missing consignee address,
+// so it's checked the same way.
+// ─────────────────────────────────────────────────────────────────────────────
+const validateWarehouseConfig = (warehouse) => {
+  const missing = {
+    city: !warehouse?.city,
+    state: !warehouse?.state,
+    pincode: !warehouse?.pincode,
+  };
+
+  const hasMissingField = Object.values(missing).some(Boolean);
+
+  return { valid: !hasMissingField, missing };
+};
+// ===== End Modified =====
+
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Build the pickup request payload for delhiveryService.requestPickup().
@@ -311,6 +364,7 @@ export const extractDelhiveryTrackingDetails = (trackingResponse) => {
 };
 // ===== End Modified =====
 
+// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/shipping/create-shipment/:orderId
 //
@@ -364,6 +418,14 @@ export const createShipment = async (req, res) => {
     }
 
     const order = orderRows[0];
+
+    // The orders query above (and the orders table) expose the order total
+    // as `total`, but buildDelhiveryShipmentPayload() reads `total_amount`
+    // off the order object. Without this alias, `Number(order.total_amount)`
+    // resolves to `Number(undefined)` → NaN inside the payload builder.
+    // Aliasing here (not inside buildDelhiveryShipmentPayload, which stays
+    // unchanged) keeps the correct DB field as the single source of truth.
+    order.total_amount = order.total;
 
     // ── 2. Validate order status is "ready_to_ship" ──────────────────────────
     if (order.order_status !== "ready_to_ship") {
@@ -423,29 +485,50 @@ export const createShipment = async (req, res) => {
       }
     }
 
-    // Fall back to stored shipping_address snapshot if address lookup fails
-    if (!shippingAddress && order.shipping_address) {
-      // Parse the snapshot format (comma-separated values)
-      // This is a last resort — the snapshot doesn't have pincode/city/state separately
-      shippingAddress = {
-        full_name: order.contact_name || "",
-        mobile: order.contact_phone || "",
-        address_line_1: order.shipping_address,
-        address_line_2: "",
-        city: "",
-        state: "",
-        pincode: "",
-        country: "India",
-      };
-    }
-
+    // ===== Modified =====
+    // No structured address record was found for this order. We
+    // deliberately do NOT fall back to parsing the comma-separated
+    // `shipping_address` snapshot string — it has no reliable city/state/
+    // pincode boundaries, and guessing at them is exactly what produced
+    // the empty pin/city/state values Delhivery rejected. Fail gracefully
+    // with a clear validation error instead.
     if (!shippingAddress) {
       await client.query("ROLLBACK");
+      console.warn(
+        `[CREATE_SHIPMENT] No structured address record found for order ${orderId} (address_id: ${
+          order.address_id || "none"
+        })`,
+      );
       return res.status(400).json({
         success: false,
-        message: "Shipping address not found for this order",
+        message: "Address record not found.",
       });
     }
+
+    // ── 3a. Validate shipping address is complete before doing more work ──────
+    const addressValidation = validateShippingAddress(shippingAddress);
+
+    if (!addressValidation.valid) {
+      await client.query("ROLLBACK");
+      console.warn(
+        `[CREATE_SHIPMENT] Missing shipping fields for order ${orderId}:`,
+        addressValidation.missing,
+      );
+
+      if (addressValidation.reason === "invalid_pincode") {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid customer pincode.",
+        });
+      }
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "Customer address is incomplete. City, State and Pincode are required before creating a shipment.",
+      });
+    }
+    // ===== End Modified =====
 
     // ── 4. Fetch order items ─────────────────────────────────────────────────
     const { rows: items } = await client.query(
@@ -465,6 +548,24 @@ export const createShipment = async (req, res) => {
 
     // ── 5. Build Delhivery shipment payload ──────────────────────────────────
     const warehouse = getWarehouseConfig();
+
+    // ===== Modified =====
+    // ── 5a. Validate warehouse (pickup/origin) config before proceeding ──────
+    const warehouseValidation = validateWarehouseConfig(warehouse);
+
+    if (!warehouseValidation.valid) {
+      await client.query("ROLLBACK");
+      console.warn(
+        `[CREATE_SHIPMENT] Warehouse configuration incomplete for order ${orderId}:`,
+        warehouseValidation.missing,
+      );
+      return res.status(400).json({
+        success: false,
+        message: "Warehouse configuration is incomplete.",
+      });
+    }
+    // ===== End Modified =====
+
     const customer = {
       name: order.contact_name || "",
       email: order.contact_email || "",
@@ -499,6 +600,27 @@ export const createShipment = async (req, res) => {
       });
     }
 
+    // ===== Modified =====
+    // ── 5b. Log key shipment-creation context (no full PII) before calling
+    //        Delhivery, to make failures like invalid-pincode traceable.
+    console.log("[CREATE_SHIPMENT] Preparing to create shipment", {
+      orderId: order.id,
+      orderNumber: order.order_number,
+      addressId: order.address_id || null,
+      shippingAddress: {
+        city: shippingAddress.city,
+        state: shippingAddress.state,
+        pincode: shippingAddress.pincode,
+        country: shippingAddress.country,
+      },
+      warehouse: {
+        city: warehouse.city,
+        state: warehouse.state,
+        pincode: warehouse.pincode,
+      },
+    });
+    // ===== End Modified =====
+
     // ── 6. Call Delhivery API to create shipment ─────────────────────────────
     let delhiveryResponse;
     console.log("========== DELHIVERY SHIPMENT PAYLOAD ==========");
@@ -511,7 +633,7 @@ export const createShipment = async (req, res) => {
       console.error("[CREATE_SHIPMENT] Delhivery API error", error);
       return res.status(500).json({
         success: false,
-        message: "Failed to create shipment with Delhivery",
+        message: "Unable to create Delhivery shipment.",
         error: error.message || error,
       });
     }
@@ -526,7 +648,7 @@ export const createShipment = async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          delhiveryResponse?.message || "Delhivery API returned an error",
+          delhiveryResponse?.message || "Unable to create Delhivery shipment.",
         delhiveryError: delhiveryResponse,
       });
     }
@@ -664,6 +786,7 @@ export const createShipment = async (req, res) => {
     client.release();
   }
 };
+// ===== End Modified =====
 
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────
