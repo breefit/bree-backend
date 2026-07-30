@@ -493,6 +493,126 @@ const formatRazorpayShippingAddress = (addr) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Find-or-create a structured row in the existing `addresses` table for the
+// customer address returned by Razorpay Magic Checkout's
+// customer_details.shipping_address.
+//
+// WHY THIS EXISTS: verifyPayment() previously only ever wrote a flattened
+// string into orders.shipping_address. Nothing wrote a row into `addresses`
+// or set orders.address_id, so the shipping cron's "No structured address
+// record found (address_id: none)" failure was guaranteed for every Magic
+// Checkout order.
+//
+// Schema (existing table, untouched):
+//   addresses(id, user_id, label, address_line1, address_line2, city,
+//             state, pincode, country, is_default, created_at)
+//
+// Dedup rule ("identical address"): same user_id (or same NULL-user guest
+// bucket) AND same address_line1/address_line2/city/state/pincode/country,
+// compared case- and whitespace-insensitively.
+//
+// Runs inside the CALLER's transaction (uses `client`, never the bare
+// `query` import) and takes a row lock via FOR UPDATE on the dedup lookup so
+// two concurrent verifyPayment() calls for the same customer can't both miss
+// the dedup check and insert duplicate rows.
+//
+// is_default is set to 1 only when this is the very first address on file
+// for the user (i.e. no other addresses row exists for that user_id yet).
+// Never throws internally — a failure here propagates to the caller's own
+// try/catch, which already rolls back the whole verifyPayment() transaction.
+// ─────────────────────────────────────────────────────────────────────────────
+const upsertStructuredAddressForOrder = async (
+  client,
+  { userId, line1, line2, city, state, pincode, country },
+) => {
+  const normLine1 = String(line1 || "").trim();
+  const normLine2 = String(line2 || "").trim();
+  const normCity = String(city || "").trim();
+  const normState = String(state || "").trim();
+  const normPincode = String(pincode || "").trim();
+  const normCountry = String(country || "")
+    .trim()
+    .toUpperCase();
+
+  // Not enough structured data to build a usable, shippable address row —
+  // bail out rather than persisting a half-populated record.
+  if (!normLine1 || !normCity || !normPincode) {
+    return null;
+  }
+
+  // ── Dedup lookup, row-locked ────────────────────────────────────────────
+  const { rows: existing } = await client.query(
+    `SELECT id FROM addresses
+     WHERE (user_id = ? OR (user_id IS NULL AND ? IS NULL))
+       AND UPPER(TRIM(address_line1)) = UPPER(?)
+       AND UPPER(TRIM(COALESCE(address_line2, ''))) = UPPER(?)
+       AND UPPER(TRIM(city)) = UPPER(?)
+       AND UPPER(TRIM(state)) = UPPER(?)
+       AND TRIM(pincode) = ?
+       AND UPPER(TRIM(country)) = UPPER(?)
+     LIMIT 1
+     FOR UPDATE`,
+    [
+      userId || null,
+      userId || null,
+      normLine1,
+      normLine2,
+      normCity,
+      normState,
+      normPincode,
+      normCountry,
+    ],
+  );
+
+  if (existing.length) {
+    console.info("[VERIFY_PAYMENT] Existing address reused", {
+      addressId: existing[0].id,
+      userId: userId || null,
+    });
+    return existing[0].id;
+  }
+
+  // ── is_default: only true if the user has no addresses yet ────────────
+  let isDefault = 0;
+  if (userId) {
+    const { rows: countRows } = await client.query(
+      "SELECT COUNT(*) AS cnt FROM addresses WHERE user_id = ?",
+      [userId],
+    );
+    const existingCount = Number(countRows?.[0]?.cnt ?? 0);
+    isDefault = existingCount === 0 ? 1 : 0;
+  }
+
+  const addressId = randomUUID();
+  await client.query(
+    `INSERT INTO addresses (
+       id, user_id, label, address_line1, address_line2,
+       city, state, pincode, country, is_default, created_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
+    [
+      addressId,
+      userId || null,
+      "Home",
+      normLine1,
+      normLine2 || null,
+      normCity,
+      normState || null,
+      normPincode,
+      normCountry || null,
+      isDefault,
+    ],
+  );
+
+  console.info("[VERIFY_PAYMENT] New address inserted", {
+    addressId,
+    userId: userId || null,
+    isDefault: Boolean(isDefault),
+  });
+
+  return addressId;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Normalise a Delhivery serviceability response into a boolean.
 //
 // Delhivery's REAL pincode serviceability response looks like:
@@ -830,6 +950,13 @@ export const verifyPayment = async (req, res) => {
     }
   }
 
+  console.log("========== RAZORPAY SHIPPING OBJECT ==========");
+  console.dir(razorpayCustomerDetails?.shipping_address, { depth: null });
+  console.log(
+    JSON.stringify(razorpayCustomerDetails?.shipping_address, null, 2),
+  );
+  console.log("=============================================");
+
   // ── Already paid? ─────────────────────────────────────────────────────────
   if (order.payment_status === "paid") {
     if (order.razorpay_payment_id === razorpay_payment_id) {
@@ -858,6 +985,7 @@ export const verifyPayment = async (req, res) => {
   let resolvedEmail;
   let resolvedPhone;
   let resolvedAddress;
+  let resolvedAddressId;
 
   // ── Transaction: confirm order, reduce stock, record payment history ──────
   const client = await getClient();
@@ -885,14 +1013,15 @@ export const verifyPayment = async (req, res) => {
     // 1. Razorpay's customer_details (Magic Checkout) — source of truth
     // 2. Frontend-supplied values from this request (legacy/Standard Checkout)
     // 3. Whatever was stored at create-order time — final fallback
+    const razorpayShippingAddrObj = razorpayCustomerDetails?.shipping_address;
     const razorpayShippingAddress = formatRazorpayShippingAddress(
-      razorpayCustomerDetails?.shipping_address,
+      razorpayShippingAddrObj,
     );
 
     // Assign to hoisted variables (not const) so they are visible outside
     // this try block when the confirmation email is sent.
     resolvedName =
-      razorpayCustomerDetails?.shipping_address?.name ||
+      razorpayShippingAddrObj?.name ||
       customerName ||
       lockedOrder.customer_name ||
       lockedOrder.contact_name;
@@ -911,6 +1040,43 @@ export const verifyPayment = async (req, res) => {
       shippingAddress ||
       lockedOrder.shipping_address ||
       null;
+
+    // ── Structured address (addresses table) ────────────────────────────────
+    // If the order already has an address_id (e.g. legacy checkout, which
+    // sets it at create-order time), keep using it — never overwrite with a
+    // different address behind the scenes. Only resolve/create a structured
+    // address when address_id is NULL, which is the Magic Checkout case this
+    // fix targets.
+    resolvedAddressId = lockedOrder.address_id || null;
+
+    console.log("Address values received:", {
+      userId,
+      line1,
+      line2,
+      city,
+      state,
+      pincode,
+      country,
+    });
+
+    if (!resolvedAddressId && razorpayShippingAddrObj) {
+      resolvedAddressId = await upsertStructuredAddressForOrder(client, {
+        userId: lockedOrder.user_id || null,
+        line1: razorpayShippingAddrObj.line1,
+        line2: razorpayShippingAddrObj.line2,
+        city: razorpayShippingAddrObj.city,
+        state: razorpayShippingAddrObj.state,
+        pincode: razorpayShippingAddrObj.zipcode,
+        country: razorpayShippingAddrObj.country,
+      });
+
+      if (resolvedAddressId) {
+        console.info("[VERIFY_PAYMENT] Updated orders.address_id", {
+          orderId: order.id,
+          addressId: resolvedAddressId,
+        });
+      }
+    }
 
     // Validate email format if present
     if (resolvedEmail && !/^\S+@\S+\.\S+$/.test(resolvedEmail)) {
@@ -931,11 +1097,14 @@ export const verifyPayment = async (req, res) => {
     const newOrderStatus = "paid";
     const newPaymentStatus = "paid";
 
-    // Update order row — write back customer details from Magic Checkout popup
+    // Update order row — write back customer details from Magic Checkout popup,
+    // now including address_id so downstream (shipping cron) can resolve the
+    // structured address instead of finding NULL.
     await client.query(
       `UPDATE orders SET
         payment_status   = ?,
         order_status     = ?,
+        address_id       = ?,
         customer_name    = ?,
         email            = ?,
         mobile_number    = ?,
@@ -952,6 +1121,7 @@ export const verifyPayment = async (req, res) => {
       [
         newPaymentStatus,
         newOrderStatus,
+        resolvedAddressId,
         resolvedName,
         resolvedEmail,
         resolvedPhone,
@@ -1063,6 +1233,7 @@ export const verifyPayment = async (req, res) => {
       orderId: order.id,
       razorpay_payment_id,
       razorpay_order_id,
+      addressId: resolvedAddressId,
     });
 
     // Broadcast to admin dashboard
