@@ -23,7 +23,6 @@ const getWarehouseConfig = () => {
   };
 };
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Validates a structured shipping address before it is sent to Delhivery.
 // Checks presence of full_name, mobile, address_line_1, city, state, and
@@ -74,7 +73,6 @@ const validateWarehouseConfig = (warehouse) => {
 
   return { valid: !hasMissingField, missing };
 };
-// ===== End Modified =====
 
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +105,6 @@ const buildPickupRequestPayload = (
 };
 // ===== End Delhivery Pickup Integration =====
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Returns the base URL used to build Delhivery tracking links.
 // Configurable via DELHIVERY_TRACKING_URL; falls back to the existing
@@ -120,9 +117,7 @@ const getTrackingBaseUrl = () => {
     "https://tracking.delhivery.com/track/shipment/"
   );
 };
-// ===== End Modified =====
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Robust Delhivery shipment-response parser.
 // Delhivery's API is inconsistent across environments/versions — it may
@@ -203,9 +198,7 @@ const extractDelhiveryShipmentDetails = (delhiveryResponse) => {
     trackingUrl,
   };
 };
-// ===== End Modified =====
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Delhivery tracking-status → internal order_status mapping.
 // Expanded to cover the common Delhivery lifecycle statuses. Keys are
@@ -257,9 +250,7 @@ export const mapTrackingStatusToOrderStatus = (trackingStatus) => {
   if (!normalized) return null;
   return DELHIVERY_STATUS_TO_ORDER_STATUS[normalized] || null;
 };
-// ===== End Modified =====
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Robust Delhivery tracking-response parser.
 // Supports ShipmentData[0].Shipment, Shipment, data.ShipmentData,
@@ -362,9 +353,7 @@ export const extractDelhiveryTrackingDetails = (trackingResponse) => {
     shipmentId: shipmentId || null,
   };
 };
-// ===== End Modified =====
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/shipping/create-shipment/:orderId
 //
@@ -485,7 +474,6 @@ export const createShipment = async (req, res) => {
       }
     }
 
-    // ===== Modified =====
     // No structured address record was found for this order. We
     // deliberately do NOT fall back to parsing the comma-separated
     // `shipping_address` snapshot string — it has no reliable city/state/
@@ -528,7 +516,6 @@ export const createShipment = async (req, res) => {
           "Customer address is incomplete. City, State and Pincode are required before creating a shipment.",
       });
     }
-    // ===== End Modified =====
 
     // ── 4. Fetch order items ─────────────────────────────────────────────────
     const { rows: items } = await client.query(
@@ -549,7 +536,6 @@ export const createShipment = async (req, res) => {
     // ── 5. Build Delhivery shipment payload ──────────────────────────────────
     const warehouse = getWarehouseConfig();
 
-    // ===== Modified =====
     // ── 5a. Validate warehouse (pickup/origin) config before proceeding ──────
     const warehouseValidation = validateWarehouseConfig(warehouse);
 
@@ -564,7 +550,6 @@ export const createShipment = async (req, res) => {
         message: "Warehouse configuration is incomplete.",
       });
     }
-    // ===== End Modified =====
 
     const customer = {
       name: order.contact_name || "",
@@ -581,17 +566,6 @@ export const createShipment = async (req, res) => {
         items,
         warehouse,
       });
-
-      console.log("========== SHIPPING ADDRESS ==========");
-      console.log(shippingAddress);
-
-      console.log("========== WAREHOUSE ==========");
-      console.log(warehouse);
-
-      console.log("========== DELHIVERY PAYLOAD ==========");
-      console.log(JSON.stringify(payload, null, 2));
-
-      console.log("=======================================");
     } catch (error) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -600,9 +574,14 @@ export const createShipment = async (req, res) => {
       });
     }
 
-    // ===== Modified =====
     // ── 5b. Log key shipment-creation context (no full PII) before calling
     //        Delhivery, to make failures like invalid-pincode traceable.
+    // NOTE: the previous version of this log dumped the full shipping
+    // address, warehouse object, and complete Delhivery payload (including
+    // customer name/phone/full address) straight to stdout — that is
+    // customer PII in plaintext application logs. Trimmed to the same
+    // non-PII city/state/pincode/country fields already used elsewhere in
+    // this file for traceability without leaking PII.
     console.log("[CREATE_SHIPMENT] Preparing to create shipment", {
       orderId: order.id,
       orderNumber: order.order_number,
@@ -619,13 +598,9 @@ export const createShipment = async (req, res) => {
         pincode: warehouse.pincode,
       },
     });
-    // ===== End Modified =====
 
     // ── 6. Call Delhivery API to create shipment ─────────────────────────────
     let delhiveryResponse;
-    console.log("========== DELHIVERY SHIPMENT PAYLOAD ==========");
-    console.log(JSON.stringify(payload, null, 2));
-    console.log("===============================================");
     try {
       delhiveryResponse = await delhiveryService.createShipment(payload);
     } catch (error) {
@@ -786,7 +761,6 @@ export const createShipment = async (req, res) => {
     client.release();
   }
 };
-// ===== End Modified =====
 
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1026,7 +1000,6 @@ export const schedulePickup = async (req, res) => {
 };
 // ===== End Delhivery Pickup Integration =====
 
-// ===== Modified =====
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/shipping/track/:awb
 //
@@ -1229,7 +1202,6 @@ export const trackShipment = async (req, res) => {
     client.release();
   }
 };
-// ===== End Modified =====
 
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────

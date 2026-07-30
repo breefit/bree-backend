@@ -20,7 +20,6 @@ const client = axios.create({
   },
 });
 
-// ===== Delhivery Pickup Integration =====
 // Centralized request/response logging via axios interceptors.
 // Applies to ALL existing methods on this client (serviceability, shipment,
 // tracking, cancellation, label, pickup) so no per-method duplication is needed.
@@ -63,7 +62,6 @@ client.interceptors.response.use(
     return Promise.reject(error);
   },
 );
-// ===== End Delhivery Pickup Integration =====
 
 class DelhiveryService {
   /**
@@ -88,7 +86,6 @@ class DelhiveryService {
    * @returns {Promise<Object>} Raw Delhivery response data.
    * @throws {Object} Formatted error via handleError() if the request fails or the response is empty.
    */
-  // ===== Modified =====
   async createShipment(payload) {
     try {
       const formData = new URLSearchParams();
@@ -116,7 +113,6 @@ class DelhiveryService {
       throw this.handleError(error);
     }
   }
-  // ===== End Modified =====
 
   /**
    * Track Shipment
@@ -125,7 +121,6 @@ class DelhiveryService {
    * @returns {Promise<Object>} Raw Delhivery response data.
    * @throws {Object} Formatted error via handleError() if the request fails or the response is empty.
    */
-  // ===== Modified =====
   async trackShipment(awb) {
     try {
       const response = await client.get(
@@ -141,7 +136,6 @@ class DelhiveryService {
       throw this.handleError(error);
     }
   }
-  // ===== End Modified =====
 
   /**
    * Cancel Shipment
@@ -238,7 +232,6 @@ class DelhiveryService {
    * @throws {Object} Formatted error via handleError()/buildValidationError() if validation fails,
    *                   the request fails, or the response is empty.
    */
-  // ===== Modified =====
   async requestPickup(data) {
     // Safe logging: only non-sensitive scheduling metadata is logged.
     // Never log customer names, addresses, phone numbers, or other PII.
@@ -273,7 +266,6 @@ class DelhiveryService {
       throw formattedError;
     }
   }
-  // ===== End Modified =====
 
   /**
    * Download Shipping Label

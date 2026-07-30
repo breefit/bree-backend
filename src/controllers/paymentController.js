@@ -35,12 +35,7 @@ const getProductShippingColumnsAvailable = async () => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Normalise any error thrown by the Razorpay Node SDK into a flat, loggable
-// object. The SDK throws either a plain Error (network/timeout) or an
-// API error shaped like { statusCode, error: { code, description, field,
-// source, step, reason } }. Logging the raw error often prints
-// "[object Object]" or hides the fields Razorpay support actually asks for
-// when triaging — this guarantees every catch block logs the same,
-// grep-able shape.
+// object.
 // ─────────────────────────────────────────────────────────────────────────────
 const describeRazorpayError = (err) => ({
   message: err?.message || String(err),
@@ -54,14 +49,7 @@ const describeRazorpayError = (err) => ({
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Build Razorpay Magic Checkout line_items from server-validated cart items
-// (DB-verified price/name/image from `validatedItems` — never the frontend's
-// own line_items, to stay consistent with this endpoint's existing "don't
-// trust frontend pricing" pattern).
-//
-// NOTE: variant_id is mandatory per Razorpay's docs. BREE's products table
-// has no distinct variant concept today, so this falls back to product id.
-// Update if/when real product variants are introduced.
+// Build Razorpay Magic Checkout line_items from server-validated cart items.
 // ─────────────────────────────────────────────────────────────────────────────
 const buildLineItemsFromValidatedItems = (validatedItems) =>
   validatedItems.map((item) => {
@@ -80,13 +68,6 @@ const buildLineItemsFromValidatedItems = (validatedItems) =>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/create-order
-//
-// Magic Checkout flow: frontend sends cart items plus line_items/
-// line_items_total. Customer name/email/phone/address are collected inside
-// the Razorpay popup and returned after payment in the verify call.
-//
-// Legacy flow (non-Magic): frontend sends customerName, email, mobileNumber,
-// shippingAddress upfront — still supported for backward compat.
 // ─────────────────────────────────────────────────────────────────────────────
 export const createOrder = async (req, res) => {
   console.info("[CREATE_ORDER] Received request", {
@@ -96,23 +77,19 @@ export const createOrder = async (req, res) => {
 
   const {
     items,
-    // Optional pre-fill / legacy fields — may be absent in Magic Checkout flow
     amount,
     customerName,
     email,
     mobileNumber,
     shippingAddress,
     addressId,
-    line_items, // presence/non-empty signals a Magic Checkout request
+    line_items,
   } = req.body;
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: "Cart is empty" });
   }
 
-  // ── Server-side cart validation & total calculation ───────────────────────
-  // Hoisted out of the loop: this is memoized internally after the first
-  // call, but there's no reason to re-invoke it once per cart item.
   const hasShippingColumns = await getProductShippingColumnsAvailable();
   const shippingSelect = hasShippingColumns
     ? ", is_free_shipping, shipping_charge, estimated_delivery"
@@ -186,14 +163,9 @@ export const createOrder = async (req, res) => {
     });
   }
 
-  // Presence of a non-empty line_items array from the frontend signals this
-  // is a Magic Checkout request. The values themselves are NOT trusted; see
-  // buildLineItemsFromValidatedItems above.
   const isMagicCheckout = Array.isArray(line_items) && line_items.length > 0;
   console.info("[CREATE_ORDER] isMagicCheckout:", isMagicCheckout);
 
-  // If frontend supplied an amount, sanity-check it (allow ₹1 tolerance for
-  // floating-point rounding). If absent (Magic Checkout), skip the check.
   if (amount !== undefined && Math.abs(serverTotal - Number(amount)) > 1) {
     console.warn("[CREATE_ORDER] Price mismatch", {
       frontend: amount,
@@ -205,18 +177,6 @@ export const createOrder = async (req, res) => {
     });
   }
 
-  // ── Idempotency: reuse a recent pending order for the same user & amount ──
-  // Only applies to the legacy flow. Magic Checkout orders always create a
-  // fresh Razorpay order — reusing a cached order here risks handing back
-  // one that was never created with line_items/line_items_total, which
-  // silently downgrades the customer to Standard Checkout (Razorpay then
-  // never calls our shipping-info/promotions endpoints at all).
-  //
-  // The cached Razorpay order is verified with the Razorpay API before reuse.
-  // Razorpay orders expire after ~15 minutes (status becomes 'attempted' or
-  // the popup rejects it). Returning an expired order causes silent failures,
-  // so we fall through to create a fresh one whenever the cached order is no
-  // longer in 'created' status.
   if (req.user?.id && !isMagicCheckout) {
     const { rows: existingOrders } = await query(
       `SELECT id, razorpay_order_id FROM orders
@@ -230,17 +190,12 @@ export const createOrder = async (req, res) => {
     if (existingOrders.length) {
       const existing = existingOrders[0];
 
-      // Verify the Razorpay order is still open before returning it
       let rzpOrderStillValid = false;
       try {
         const rzp = getRazorpay();
         const rzpExisting = await rzp.orders.fetch(existing.razorpay_order_id);
-        // 'created' = open and accepting payment; anything else means it was
-        // attempted, expired, or paid — do not reuse
         rzpOrderStillValid = rzpExisting.status === "created";
       } catch (err) {
-        // If the fetch fails (network blip, order not found), fall through
-        // and create a fresh order rather than blocking the customer
         console.warn(
           "[CREATE_ORDER] Could not verify existing Razorpay order — creating fresh",
           {
@@ -265,7 +220,6 @@ export const createOrder = async (req, res) => {
         });
       }
 
-      // Stale or unverifiable — fall through to create a new Razorpay order
       console.info(
         "[CREATE_ORDER] Existing Razorpay order no longer valid — creating fresh",
         {
@@ -276,11 +230,6 @@ export const createOrder = async (req, res) => {
     }
   }
 
-  // ── Open DB transaction first ─────────────────────────────────────────────
-  // orderNumber must exist before the Razorpay order is created, because the
-  // Razorpay `receipt` field is set to orderNumber. So the sequence is now:
-  // BEGIN -> generate orderId/orderNumber -> create Razorpay order -> persist
-  // everything -> COMMIT.
   const client = await getClient();
   let orderId;
   let orderNumber;
@@ -290,39 +239,17 @@ export const createOrder = async (req, res) => {
     await client.query("BEGIN");
 
     orderId = randomUUID();
-
-    // Generate the human-friendly order_number in the same transaction as
-    // order creation. Does not touch rzpOrder.id, the Razorpay order
-    // payload, or any other Razorpay mapping field — purely an additional
-    // column on our own orders row.
     orderNumber = await getNextOrderNumber(client);
 
-    // ── Create Razorpay order ───────────────────────────────────────────────
     try {
       const rzp = getRazorpay();
 
       const orderPayload = {
         amount: Math.round(serverTotal * 100), // paise
         currency: "INR",
-        receipt: orderNumber, // BREE-100048 ----------------------------------------------------
+        receipt: orderNumber,
       };
 
-      // Magic Checkout requires line_items + line_items_total on the actual
-      // Razorpay order, or Razorpay silently serves Standard Checkout instead,
-      // regardless of any client-side option.
-      //
-      // BUG FIX — amount mismatch / payment cancelled:
-      // line_items_total must equal ONLY the sum of price*quantity across
-      // `line_items` (i.e. the product subtotal). Shipping is reported
-      // separately via getShippingInfo() below and must NOT be folded into
-      // line_items_total — orderPayload.amount already includes shipping,
-      // so reusing it here silently double-declared the shipping charge
-      // inside line_items_total. Magic Checkout then added the ₹49 shipping
-      // fee from getShippingInfo() on top of a line_items_total that had
-      // already secretly included it (and again on address confirm),
-      // producing a popup total (e.g. ₹643) that no longer matched the
-      // actual Razorpay order amount (₹545) — triggering "Payment amount is
-      // different from your order amount" and the payment being cancelled.
       if (isMagicCheckout) {
         orderPayload.line_items =
           buildLineItemsFromValidatedItems(validatedItems);
@@ -342,10 +269,6 @@ export const createOrder = async (req, res) => {
       });
     }
 
-    // ── Persist pending order ─────────────────────────────────────────────────
-    // For Magic Checkout, customer details are unknown at this point — stored
-    // as NULL and updated after payment verification.
-    // For legacy flow, they are provided upfront.
     await client.query(
       `INSERT INTO orders (
         id,
@@ -394,8 +317,6 @@ export const createOrder = async (req, res) => {
       ],
     );
 
-    // Persist cart snapshot so verify-payment can rebuild order items without
-    // trusting frontend data a second time.
     for (const item of validatedItems) {
       await client.query(
         `INSERT INTO order_items (
@@ -415,7 +336,6 @@ export const createOrder = async (req, res) => {
       );
     }
 
-    // Payment record — status 'created' until captured
     await client.query(
       `INSERT INTO payments (id, order_id, razorpay_order_id, amount, status)
        VALUES (?, ?, ?, ?, 'created')`,
@@ -438,7 +358,6 @@ export const createOrder = async (req, res) => {
       isMagicCheckout,
     });
 
-    // Broadcast to admin dashboard if socket.io is available
     try {
       req.app?.locals?.io?.emit("order:updated", {
         id: orderId,
@@ -446,15 +365,13 @@ export const createOrder = async (req, res) => {
       });
     } catch (_) {}
 
-    // Response matches Magic Checkout expected shape:
-    // { success, order_id (Razorpay order ID), amount (paise), currency, key_id }
     return res.json({
       success: true,
       order_id: rzpOrder.id,
       amount: rzpOrder.amount,
       currency: rzpOrder.currency,
       key_id: process.env.RAZORPAY_KEY_ID,
-      order_db_id: orderId, // internal DB id for frontend tracking
+      order_db_id: orderId,
     });
   } catch (err) {
     await client.query("ROLLBACK");
@@ -471,9 +388,7 @@ export const createOrder = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Format a Razorpay Magic Checkout `customer_details.shipping_address` object
-// into the single-string format this codebase's `orders.shipping_address`
-// column already expects (matches the comma-joined snapshot format used
-// elsewhere in the orders controller).
+// into the single-string format `orders.shipping_address` already expects.
 // ─────────────────────────────────────────────────────────────────────────────
 const formatRazorpayShippingAddress = (addr) => {
   if (!addr) return null;
@@ -497,19 +412,30 @@ const formatRazorpayShippingAddress = (addr) => {
 // customer address returned by Razorpay Magic Checkout's
 // customer_details.shipping_address.
 //
-// WHY THIS EXISTS: verifyPayment() previously only ever wrote a flattened
-// string into orders.shipping_address. Nothing wrote a row into `addresses`
-// or set orders.address_id, so the shipping cron's "No structured address
-// record found (address_id: none)" failure was guaranteed for every Magic
-// Checkout order.
+// Schema (existing table, untouched — confirmed against the uploaded dump):
+//   addresses(id, user_id CHAR(36) NOT NULL, label, address_line1,
+//             address_line2, city, state, pincode, country, is_default,
+//             created_at)
 //
-// Schema (existing table, untouched):
-//   addresses(id, user_id, label, address_line1, address_line2, city,
-//             state, pincode, country, is_default, created_at)
+// *** FIX ***: addresses.user_id is NOT NULL. The previous implementation
+// wrote `userId || null` straight into the INSERT and built a dedup WHERE
+// clause with an `(user_id IS NULL AND ? IS NULL)` branch that could never
+// match a NOT NULL column. For any guest / unauthenticated order (orders.
+// user_id IS NULL — these exist in production, e.g. the "Guest" order in the
+// dump) this would have thrown a MySQL "Column 'user_id' cannot be null"
+// error, rolling back the ENTIRE verifyPayment() transaction — i.e. a
+// successfully-charged guest order would fail to be marked paid.
 //
-// Dedup rule ("identical address"): same user_id (or same NULL-user guest
-// bucket) AND same address_line1/address_line2/city/state/pincode/country,
-// compared case- and whitespace-insensitively.
+// Fix: this function now refuses to run (returns null, no DB write) unless
+// it is given a real, non-null userId. The caller (verifyPayment) only
+// invokes it when the order has an owning user; guest orders keep their
+// flattened `shipping_address` string on the order row and simply have no
+// addresses-table row / address_id, which is the correct behaviour given
+// the schema constraint.
+//
+// Dedup rule ("identical address"): same user_id AND same
+// address_line1/address_line2/city/state/pincode/country, compared
+// case- and whitespace-insensitively.
 //
 // Runs inside the CALLER's transaction (uses `client`, never the bare
 // `query` import) and takes a row lock via FOR UPDATE on the dedup lookup so
@@ -517,14 +443,22 @@ const formatRazorpayShippingAddress = (addr) => {
 // the dedup check and insert duplicate rows.
 //
 // is_default is set to 1 only when this is the very first address on file
-// for the user (i.e. no other addresses row exists for that user_id yet).
-// Never throws internally — a failure here propagates to the caller's own
-// try/catch, which already rolls back the whole verifyPayment() transaction.
+// for the user. Never throws internally — a failure here propagates to the
+// caller's own try/catch, which already rolls back the whole verifyPayment()
+// transaction.
 // ─────────────────────────────────────────────────────────────────────────────
 const upsertStructuredAddressForOrder = async (
   client,
   { userId, line1, line2, city, state, pincode, country },
 ) => {
+  // Guard the NOT NULL constraint on addresses.user_id.
+  if (!userId) {
+    console.info(
+      "[VERIFY_PAYMENT] Skipping structured address persistence — no user_id (guest order); addresses.user_id is NOT NULL",
+    );
+    return null;
+  }
+
   const normLine1 = String(line1 || "").trim();
   const normLine2 = String(line2 || "").trim();
   const normCity = String(city || "").trim();
@@ -543,7 +477,7 @@ const upsertStructuredAddressForOrder = async (
   // ── Dedup lookup, row-locked ────────────────────────────────────────────
   const { rows: existing } = await client.query(
     `SELECT id FROM addresses
-     WHERE (user_id = ? OR (user_id IS NULL AND ? IS NULL))
+     WHERE user_id = ?
        AND UPPER(TRIM(address_line1)) = UPPER(?)
        AND UPPER(TRIM(COALESCE(address_line2, ''))) = UPPER(?)
        AND UPPER(TRIM(city)) = UPPER(?)
@@ -553,8 +487,7 @@ const upsertStructuredAddressForOrder = async (
      LIMIT 1
      FOR UPDATE`,
     [
-      userId || null,
-      userId || null,
+      userId,
       normLine1,
       normLine2,
       normCity,
@@ -567,21 +500,18 @@ const upsertStructuredAddressForOrder = async (
   if (existing.length) {
     console.info("[VERIFY_PAYMENT] Existing address reused", {
       addressId: existing[0].id,
-      userId: userId || null,
+      userId,
     });
     return existing[0].id;
   }
 
   // ── is_default: only true if the user has no addresses yet ────────────
-  let isDefault = 0;
-  if (userId) {
-    const { rows: countRows } = await client.query(
-      "SELECT COUNT(*) AS cnt FROM addresses WHERE user_id = ?",
-      [userId],
-    );
-    const existingCount = Number(countRows?.[0]?.cnt ?? 0);
-    isDefault = existingCount === 0 ? 1 : 0;
-  }
+  const { rows: countRows } = await client.query(
+    "SELECT COUNT(*) AS cnt FROM addresses WHERE user_id = ?",
+    [userId],
+  );
+  const existingCount = Number(countRows?.[0]?.cnt ?? 0);
+  const isDefault = existingCount === 0 ? 1 : 0;
 
   const addressId = randomUUID();
   await client.query(
@@ -591,7 +521,7 @@ const upsertStructuredAddressForOrder = async (
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())`,
     [
       addressId,
-      userId || null,
+      userId,
       "Home",
       normLine1,
       normLine2 || null,
@@ -605,7 +535,7 @@ const upsertStructuredAddressForOrder = async (
 
   console.info("[VERIFY_PAYMENT] New address inserted", {
     addressId,
-    userId: userId || null,
+    userId,
     isDefault: Boolean(isDefault),
   });
 
@@ -614,42 +544,6 @@ const upsertStructuredAddressForOrder = async (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Normalise a Delhivery serviceability response into a boolean.
-//
-// Delhivery's REAL pincode serviceability response looks like:
-//   {
-//     "delivery_codes": [
-//       {
-//         "postal_code": {
-//           "pin": 500072,
-//           "pre_paid": "Y",
-//           "pickup": "Y",
-//           "cash": "Y",
-//           "repl": "Y",
-//           "country_code": "IN",
-//           "state_code": "TS"
-//         }
-//       }
-//     ]
-//   }
-//
-// There is NO `success` field anywhere in this payload — a previous version
-// of this parser incorrectly looked for `postal_code.success`, which never
-// exists, so every response was silently treated as not serviceable.
-//
-// A pincode is considered serviceable when Delhivery indicates it can accept
-// prepaid shipments AND pick up from that pincode:
-//   postal_code.pre_paid === "Y"  AND  postal_code.pickup === "Y"
-// `cash` (COD support) and `repl` (reverse pickup / replacement support) are
-// NOT required — BREE doesn't offer COD on this flow, and requiring them
-// would incorrectly reject pincodes that are otherwise perfectly serviceable
-// for a standard prepaid shipment.
-//
-// If ANY entry in `delivery_codes` passes this check, the pincode is
-// serviceable.
-//
-// Legacy/alternate response shapes (boolean, `serviceable` flags, status
-// strings, nested `data`) are still supported as a fallback, in case this
-// endpoint is ever called against a different Delhivery API surface.
 // ─────────────────────────────────────────────────────────────────────────────
 const isPostalCodeServiceable = (postalCode) => {
   if (!postalCode || typeof postalCode !== "object") return false;
@@ -659,7 +553,6 @@ const isPostalCodeServiceable = (postalCode) => {
   const pickup = String(postalCode.pickup ?? "")
     .trim()
     .toUpperCase();
-  // Core requirement: prepaid shipments accepted AND pickup available.
   return prePaid === "Y" && pickup === "Y";
 };
 
@@ -669,14 +562,11 @@ const readDeliveryCodes = (obj) => {
   if (!Array.isArray(deliveryCodes) || deliveryCodes.length === 0) {
     return null;
   }
-  // Serviceable if ANY entry's postal_code passes the pre_paid + pickup check
   return deliveryCodes.some((entry) =>
     isPostalCodeServiceable(entry?.postal_code),
   );
 };
 
-// Legacy/fallback flag shapes — retained for backward compatibility with any
-// other Delhivery-shaped response this endpoint may still receive.
 const readFlags = (obj) => {
   if (!obj || typeof obj !== "object") return null;
   if (typeof obj.serviceable === "boolean") return obj.serviceable;
@@ -727,14 +617,6 @@ const parseDelhiveryServiceability = (delhiveryResponse) => {
   return false;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Extract the raw postal_code flags from a Delhivery response purely for
-// logging purposes (pre_paid / pickup / cash / repl), so ops can see exactly
-// what Delhivery returned without having to re-derive it from the full raw
-// payload dump. Only inspects the first delivery_codes entry — sufficient
-// for a single-pincode lookup, which is how this endpoint calls Delhivery.
-// Never throws; returns null if the shape doesn't match.
-// ─────────────────────────────────────────────────────────────────────────────
 const extractPostalCodeLogFields = (delhiveryResponse) => {
   try {
     const source = Array.isArray(delhiveryResponse)
@@ -759,10 +641,6 @@ const extractPostalCodeLogFields = (delhiveryResponse) => {
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Normalise a country value to check whether it represents India.
-// Accepts (case-insensitively): IN, IND, INDIA.
-// ─────────────────────────────────────────────────────────────────────────────
 const isIndiaCountry = (country) => {
   const normalized = String(country || "")
     .trim()
@@ -770,11 +648,6 @@ const isIndiaCountry = (country) => {
   return normalized === "IN" || normalized === "IND" || normalized === "INDIA";
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Race a promise against a timeout. Never throws on timeout — resolves with
-// a sentinel object instead, so callers can distinguish "timed out" from
-// "rejected" from "resolved normally" without try/catch gymnastics.
-// ─────────────────────────────────────────────────────────────────────────────
 const withTimeout = (promise, ms) => {
   let timeoutHandle;
   const timeoutPromise = new Promise((resolve) => {
@@ -788,15 +661,6 @@ const withTimeout = (promise, ms) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/verify
-//
-// Called by frontend after Razorpay Magic Checkout popup closes successfully.
-// Magic Checkout populates handler.response with:
-//   razorpay_payment_id, razorpay_order_id, razorpay_signature
-//   (and optionally) razorpay_subscription_id
-//
-// For one-time (non-subscription) orders, customer/address details are
-// fetched directly from Razorpay's Order API as the source of truth — see
-// the block below — rather than trusted from the frontend request body.
 // ─────────────────────────────────────────────────────────────────────────────
 export const verifyPayment = async (req, res) => {
   const {
@@ -804,7 +668,6 @@ export const verifyPayment = async (req, res) => {
     razorpay_payment_id,
     razorpay_signature,
     razorpay_subscription_id,
-    // Customer fields populated by Magic Checkout (may be absent for legacy)
     customerName,
     email,
     mobileNumber,
@@ -831,7 +694,6 @@ export const verifyPayment = async (req, res) => {
     });
   }
 
-  // ── HMAC signature verification ───────────────────────────────────────────
   const isValid = verifyPaymentSignature({
     razorpay_order_id,
     razorpay_payment_id,
@@ -849,7 +711,6 @@ export const verifyPayment = async (req, res) => {
       .json({ success: false, message: "Invalid payment signature" });
   }
 
-  // ── Idempotency — already processed? ─────────────────────────────────────
   const { rows: alreadyProcessed } = await query(
     "SELECT id FROM orders WHERE razorpay_payment_id = ?",
     [razorpay_payment_id],
@@ -870,7 +731,6 @@ export const verifyPayment = async (req, res) => {
     });
   }
 
-  // ── Load the pending order ────────────────────────────────────────────────
   const lookupField = razorpay_subscription_id
     ? "razorpay_subscription_id"
     : "razorpay_order_id";
@@ -893,12 +753,6 @@ export const verifyPayment = async (req, res) => {
   const dbTotal = Number(order.total ?? order.amount ?? 0);
   const isSubscriptionOrder = Boolean(order.is_subscription);
 
-  // ── Verify payment amount against Razorpay API ────────────────────────────
-  // Fetches the authoritative amount from Razorpay to prevent tampering.
-  // Skipped for subscription orders (amount is set by the plan, not order total).
-  // If the Razorpay API call fails due to a transient network/API issue, log
-  // the error and continue — the HMAC signature above already proves the
-  // payment is authentic. Do not return 502 and block a confirmed payment.
   if (!isSubscriptionOrder) {
     try {
       const rzp = getRazorpay();
@@ -915,25 +769,13 @@ export const verifyPayment = async (req, res) => {
         });
       }
     } catch (err) {
-      // Transient Razorpay API failure — HMAC signature already verified above.
-      // Do NOT block the customer. Log for ops follow-up; webhook will reconcile.
       console.error(
         "[VERIFY_PAYMENT] Razorpay payment fetch failed — continuing on HMAC trust",
         { orderId: order.id, ...describeRazorpayError(err) },
       );
-      // Fall through; amount check skipped on API error only.
     }
   }
 
-  // ── Fetch authoritative customer/address details from Razorpay ────────────
-  // Magic Checkout (One-time orders only)
-  //
-  // Only applicable to one-time orders. For legacy/Standard Checkout orders,
-  // Razorpay's Fetch Order response simply won't contain `customer_details`,
-  // so this stays null and every downstream fallback below behaves exactly
-  // as it did before this change. Intentionally non-fatal: a failure here
-  // must not block payment confirmation — the payment is already verified
-  // by signature + amount above.
   let razorpayCustomerDetails = null;
   if (!isSubscriptionOrder && razorpay_order_id) {
     try {
@@ -950,14 +792,11 @@ export const verifyPayment = async (req, res) => {
     }
   }
 
-  console.log("========== RAZORPAY SHIPPING OBJECT ==========");
-  console.dir(razorpayCustomerDetails?.shipping_address, { depth: null });
-  console.log(
-    JSON.stringify(razorpayCustomerDetails?.shipping_address, null, 2),
-  );
-  console.log("=============================================");
+  console.info("[VERIFY_PAYMENT] Razorpay shipping address received", {
+    orderId: order.id,
+    shippingAddress: razorpayCustomerDetails?.shipping_address || null,
+  });
 
-  // ── Already paid? ─────────────────────────────────────────────────────────
   if (order.payment_status === "paid") {
     if (order.razorpay_payment_id === razorpay_payment_id) {
       return res.json({
@@ -978,21 +817,16 @@ export const verifyPayment = async (req, res) => {
     });
   }
 
-  // Hoisted resolved customer detail variables outside the transaction block
-  // so they are accessible when sending the confirmation email below. These
-  // are populated inside the transaction and used after it commits.
   let resolvedName;
   let resolvedEmail;
   let resolvedPhone;
   let resolvedAddress;
   let resolvedAddressId;
 
-  // ── Transaction: confirm order, reduce stock, record payment history ──────
   const client = await getClient();
   try {
     await client.query("BEGIN");
 
-    // Re-read with row lock to prevent duplicate concurrent verifications
     const { rows: lockedRows } = await client.query(
       "SELECT * FROM orders WHERE id = ? FOR UPDATE",
       [order.id],
@@ -1009,17 +843,11 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    // Merge customer details with priority order:
-    // 1. Razorpay's customer_details (Magic Checkout) — source of truth
-    // 2. Frontend-supplied values from this request (legacy/Standard Checkout)
-    // 3. Whatever was stored at create-order time — final fallback
     const razorpayShippingAddrObj = razorpayCustomerDetails?.shipping_address;
     const razorpayShippingAddress = formatRazorpayShippingAddress(
       razorpayShippingAddrObj,
     );
 
-    // Assign to hoisted variables (not const) so they are visible outside
-    // this try block when the confirmation email is sent.
     resolvedName =
       razorpayShippingAddrObj?.name ||
       customerName ||
@@ -1042,26 +870,39 @@ export const verifyPayment = async (req, res) => {
       null;
 
     // ── Structured address (addresses table) ────────────────────────────────
-    // If the order already has an address_id (e.g. legacy checkout, which
-    // sets it at create-order time), keep using it — never overwrite with a
-    // different address behind the scenes. Only resolve/create a structured
-    // address when address_id is NULL, which is the Magic Checkout case this
-    // fix targets.
+    // Keep an existing address_id untouched if the order already has one
+    // (legacy checkout sets it at create-order time). Only resolve/create a
+    // structured address when address_id is NULL — the Magic Checkout case.
     resolvedAddressId = lockedOrder.address_id || null;
 
-    console.log("Address values received:", {
-      userId,
-      line1,
-      line2,
-      city,
-      state,
-      pincode,
-      country,
+    // *** FIX (ReferenceError) ***: this used to log an object built from
+    // `userId, line1, line2, city, state, pincode, country` — none of which
+    // were ever declared in this scope. That threw a ReferenceError on
+    // every single verifyPayment() call (not conditionally — this line
+    // always executed), which meant the transaction below never ran and
+    // NO Magic Checkout payment could ever be finalised. Fixed to log the
+    // actual resolved values instead.
+    //
+    // addresses.user_id is NOT NULL in the schema, so a structured address
+    // row can only be created/reused when the order belongs to a real user.
+    // Guest orders (lockedOrder.user_id === null) keep the flattened
+    // `resolvedAddress` string but intentionally get no addresses-table row.
+    const addressUserId = lockedOrder.user_id || null;
+
+    console.info("[VERIFY_PAYMENT] Address values received", {
+      orderId: order.id,
+      userId: addressUserId,
+      line1: razorpayShippingAddrObj?.line1 || null,
+      line2: razorpayShippingAddrObj?.line2 || null,
+      city: razorpayShippingAddrObj?.city || null,
+      state: razorpayShippingAddrObj?.state || null,
+      pincode: razorpayShippingAddrObj?.zipcode || null,
+      country: razorpayShippingAddrObj?.country || null,
     });
 
-    if (!resolvedAddressId && razorpayShippingAddrObj) {
+    if (!resolvedAddressId && razorpayShippingAddrObj && addressUserId) {
       resolvedAddressId = await upsertStructuredAddressForOrder(client, {
-        userId: lockedOrder.user_id || null,
+        userId: addressUserId,
         line1: razorpayShippingAddrObj.line1,
         line2: razorpayShippingAddrObj.line2,
         city: razorpayShippingAddrObj.city,
@@ -1076,9 +917,17 @@ export const verifyPayment = async (req, res) => {
           addressId: resolvedAddressId,
         });
       }
+    } else if (
+      !resolvedAddressId &&
+      razorpayShippingAddrObj &&
+      !addressUserId
+    ) {
+      console.info(
+        "[VERIFY_PAYMENT] Skipping structured address persistence — guest order (no user_id)",
+        { orderId: order.id },
+      );
     }
 
-    // Validate email format if present
     if (resolvedEmail && !/^\S+@\S+\.\S+$/.test(resolvedEmail)) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -1087,19 +936,9 @@ export const verifyPayment = async (req, res) => {
       });
     }
 
-    // Determine new statuses.
-    // Both one-time and subscription orders move to order_status = 'paid'
-    // when payment is verified. 'paid' means payment received and the order
-    // is ready for fulfillment — it is NOT a billing concept.
-    //
-    // subscription_status is updated separately (set to 'active' below via the
-    // conditional SQL fragment) and is the correct place for billing state.
     const newOrderStatus = "paid";
     const newPaymentStatus = "paid";
 
-    // Update order row — write back customer details from Magic Checkout popup,
-    // now including address_id so downstream (shipping cron) can resolve the
-    // structured address instead of finding NULL.
     await client.query(
       `UPDATE orders SET
         payment_status   = ?,
@@ -1135,7 +974,6 @@ export const verifyPayment = async (req, res) => {
       ],
     );
 
-    // Update payments row (created at create-order time)
     const paymentUpdate = await client.query(
       `UPDATE payments SET
         razorpay_payment_id = ?,
@@ -1146,10 +984,6 @@ export const verifyPayment = async (req, res) => {
       [razorpay_payment_id, razorpay_signature, lookupValue],
     );
 
-    // Fallback: insert payment row if the UPDATE matched nothing (edge case
-    // when the create-order transaction failed silently or was skipped).
-    // Use affectedRows for MySQL compatibility — the database wrapper
-    // normalises to rowCount as well, so we check both defensively.
     if (!paymentUpdate.affectedRows && !paymentUpdate.rowCount) {
       console.info(
         "[VERIFY_PAYMENT] No existing payment row — inserting fallback",
@@ -1172,12 +1006,6 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    // ── Reduce stock ────────────────────────────────────────────────────────
-    // Guarded by `stock_deducted` so this can never double-deduct against
-    // the payment.captured webhook (or itself, on a retried request) —
-    // whichever of the two paths processes the order first flips the flag
-    // atomically inside this same row-locked transaction; the other sees
-    // stockGuardAffected === 0 and skips.
     const stockGuard = await client.query(
       `UPDATE orders SET stock_deducted = 1 WHERE id = ? AND stock_deducted = 0`,
       [order.id],
@@ -1219,7 +1047,6 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    // ── Order status history ────────────────────────────────────────────────
     await client.query(
       `INSERT INTO order_status_history
          (order_id, previous_status, new_status, changed_by, notes)
@@ -1236,7 +1063,6 @@ export const verifyPayment = async (req, res) => {
       addressId: resolvedAddressId,
     });
 
-    // Broadcast to admin dashboard
     try {
       req.app?.locals?.io?.emit("order:updated", {
         id: order.id,
@@ -1256,10 +1082,6 @@ export const verifyPayment = async (req, res) => {
     client.release();
   }
 
-  // ── Send confirmation email (non-blocking) ────────────────────────────────
-  // Uses the resolved variables populated during the transaction. These
-  // correctly reflect Magic Checkout customer_details from Razorpay (or
-  // legacy/DB fallbacks), not the stale pre-transaction order snapshot.
   const { rows: itemRows } = await query(
     `SELECT product_name AS name, quantity, product_price AS price, subtotal
      FROM order_items WHERE order_id = ?`,
@@ -1280,19 +1102,13 @@ export const verifyPayment = async (req, res) => {
     });
   });
 
-  console.log("========== WHATSAPP ==========");
-  console.log("Name :", resolvedName);
-  console.log("Phone:", resolvedPhone);
-  console.log("Email:", resolvedEmail);
-  console.log("Order:", order.order_number);
-  console.log("==============================");
+  console.info("[WHATSAPP] Preparing order confirmation", {
+    orderId: order.id,
+    orderNumber: order.order_number,
+    hasPhone: Boolean(resolvedPhone),
+  });
 
   if (resolvedPhone) {
-    // TEMP DEBUG — remove once orderUuid fix is confirmed stable in production
-    console.log("Order Object:", order);
-    console.log("Order UUID:", order.id);
-    console.log("Order Number:", order.order_number);
-
     await safelySendWhatsApp("Order Confirmed", () =>
       sendOrderConfirmationWhatsApp({
         mobile: resolvedPhone,
@@ -1309,9 +1125,6 @@ export const verifyPayment = async (req, res) => {
     console.warn("[WhatsApp] Skipped: No mobile number found.");
   }
 
-  // ── For subscriptions: fetch charge_at from Razorpay and write
-  // next_billing_date so SubscriptionSuccess and MySubscriptions pages can
-  // display it immediately without waiting for a webhook.
   let nextBillingDate = null;
   if (isSubscriptionOrder && razorpay_subscription_id) {
     try {
@@ -1320,7 +1133,6 @@ export const verifyPayment = async (req, res) => {
         razorpay_subscription_id,
       );
       if (liveSub?.charge_at) {
-        // charge_at is a Unix timestamp — convert to MySQL-compatible datetime
         nextBillingDate = new Date(liveSub.charge_at * 1000).toLocaleString(
           "sv-SE",
           { timeZone: "Asia/Kolkata" },
@@ -1336,7 +1148,6 @@ export const verifyPayment = async (req, res) => {
         });
       }
     } catch (billingErr) {
-      // Non-blocking — the webhook (subscription.charged) will sync it later.
       console.warn("[VERIFY_PAYMENT] Could not fetch charge_at from Razorpay", {
         orderId: order.id,
         ...describeRazorpayError(billingErr),
@@ -1358,11 +1169,7 @@ export const verifyPayment = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/shipping-info
-// Magic Checkout callback — returns available shipping methods per address,
-// per Razorpay's documented Shipping Info API contract.
 // ─────────────────────────────────────────────────────────────────────────────
-// Delhivery API must never be allowed to hold the Magic Checkout popup open
-// indefinitely — cap every serviceability check at this many milliseconds.
 const DELHIVERY_SERVICEABILITY_TIMEOUT_MS = 5000;
 
 export const getShippingInfo = async (req, res) => {
@@ -1387,10 +1194,6 @@ export const getShippingInfo = async (req, res) => {
         })()
       : body;
 
-  // Single consolidated request log. Deliberately logs only the headers we
-  // actually inspect when debugging (not the full header set) — full
-  // headers can include internal proxy metadata and shouldn't be dumped to
-  // logs on every request in production.
   console.info("[SHIPPING_INFO] Incoming request", {
     method: req.method,
     url: req.originalUrl,
@@ -1402,7 +1205,6 @@ export const getShippingInfo = async (req, res) => {
     body: parsedBody,
   });
 
-  // ── Razorpay Magic Checkout Shipping Info payload ──────────────────────────
   const {
     order_id: receiptOrderId,
     razorpay_order_id: razorpayOrderId,
@@ -1410,7 +1212,6 @@ export const getShippingInfo = async (req, res) => {
     addresses,
   } = parsedBody;
 
-  // ── Validate request ────────────────────────────────────────────────────
   if (!receiptOrderId && !razorpayOrderId) {
     return res.status(400).json({
       message: "order_id or razorpay_order_id is required",
@@ -1429,9 +1230,6 @@ export const getShippingInfo = async (req, res) => {
     });
   }
 
-  // Per Razorpay's Shipping Info API contract, only id / zipcode / country
-  // are mandatory per address — state_code is explicitly optional and must
-  // NOT be required here, or valid Magic Checkout requests get rejected.
   for (const [index, address] of addresses.entries()) {
     const missingFields = ["id", "zipcode", "country"].filter(
       (field) => !address?.[field],
@@ -1449,11 +1247,6 @@ export const getShippingInfo = async (req, res) => {
     }
   }
 
-  // ── Resolve the order lookup key ────────────────────────────────────────
-  // razorpay_order_id and order_number map to different columns — never
-  // reuse one value to search the other's column. If only one identifier is
-  // present, search on that column alone. If both are present, search either
-  // column (OR) since either could be the one Razorpay actually populated.
   let lookupSql;
   let lookupParams;
   let lookupKeyUsed;
@@ -1478,7 +1271,6 @@ export const getShippingInfo = async (req, res) => {
     lookupKeyUsed,
   });
 
-  // ── Load order-level shipping data (never recomputed from cart items) ─────
   const { rows: orderRows } = await query(
     `SELECT
        id,
@@ -1538,7 +1330,6 @@ export const getShippingInfo = async (req, res) => {
     estimatedDelivery,
   });
 
-  // ── Check Delhivery serviceability per address, in parallel ───────────────
   const responseAddresses = await Promise.all(
     addresses.map(async (address) => {
       const zipcode = address.zipcode;
@@ -1561,13 +1352,6 @@ export const getShippingInfo = async (req, res) => {
           );
 
           if (delhiveryResult?.__timedOut) {
-            // ── Delhivery timed out ──────────────────────────────────────────
-            // A timeout is NOT evidence the pincode is unserviceable — it's a
-            // transient infrastructure issue on Delhivery's side (or ours).
-            // Fail OPEN (assume serviceable) rather than incorrectly showing
-            // "Pincode not serviceable" to a customer on a perfectly valid
-            // Indian pincode. This matches existing business logic of never
-            // blocking checkout on a Delhivery outage.
             serviceable = true;
             console.warn(
               "[SHIPPING_INFO] Delhivery request timed out — assuming serviceable (fail-open)",
@@ -1595,12 +1379,6 @@ export const getShippingInfo = async (req, res) => {
             });
           }
         } catch (error) {
-          // ── Delhivery request failed (network error / 5xx / parse error) ──
-          // Same reasoning as the timeout branch above: a Delhivery-side
-          // failure is not proof the pincode is unserviceable. Fail OPEN so
-          // Magic Checkout doesn't incorrectly reject a valid Indian pincode
-          // because of a transient upstream error. Log loudly for ops to
-          // investigate the underlying Delhivery issue.
           serviceable = true;
           console.error(
             "[SHIPPING_INFO] Delhivery error — assuming serviceable (fail-open)",
@@ -1661,24 +1439,6 @@ const parsePromotionRequestBody = (req) => {
   return { body: parsedBody };
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FIX — Razorpay amount mismatch root cause
-//
-// getPromotions()/applyPromotions() previously derived the cart subtotal from
-// body.amount / body.items / body.line_items — i.e. whatever Magic Checkout
-// happened to send on THIS callback. That payload is not guaranteed to match
-// the amount actually locked into the Razorpay order at create-order time
-// (orderPayload.amount / line_items_total, built from server-validated
-// products+shipping). Any drift between the two shows up as an incorrect
-// total in the Magic Checkout popup and, at payment time, as Razorpay's
-// "Payment amount is different from your order amount" error.
-//
-// Fix: resolve the order from order_id / razorpay_order_id (same lookup
-// precedence getShippingInfo() already uses) and read subtotal directly off
-// the orders row. The DB subtotal is the single source of truth — it can
-// never disagree with the Razorpay order because create-order() derives both
-// from the same server-validated cart calculation.
-// ─────────────────────────────────────────────────────────────────────────────
 const loadOrderForPromotionCallback = async (body) => {
   const receiptOrderId = body.order_id;
   const razorpayOrderId = body.razorpay_order_id;
@@ -1763,12 +1523,6 @@ const normalizePromotionCode = (value) =>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/promotions
-// Magic Checkout callback — returns applicable coupon offers.
-//
-// Subtotal is read from the DB order (see loadOrderForPromotionCallback
-// above), never recalculated from body.amount/items/line_items. Free
-// shipping stays admin-controlled via orders.is_free_shipping — this
-// endpoint never touches shipping, so that behavior is unaffected.
 // ─────────────────────────────────────────────────────────────────────────────
 export const getPromotions = async (req, res) => {
   const { body } = parsePromotionRequestBody(req);
@@ -1808,10 +1562,6 @@ export const getPromotions = async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/apply-promotions
-// Magic Checkout callback — applies a specific promotion code to the cart.
-//
-// Subtotal is read from the DB order, same as getPromotions() above — never
-// recalculated from body.amount/items/line_items.
 // ─────────────────────────────────────────────────────────────────────────────
 export const applyPromotions = async (req, res) => {
   const { body } = parsePromotionRequestBody(req);
@@ -1921,9 +1671,6 @@ export const getPaymentStatus = async (req, res) => {
 
   const order = rows[0];
 
-  // ── PII guard ───────────────────────────────────────────────────────────
-  // This endpoint is publicly accessible (Razorpay Magic Checkout redirects
-  // here without a session). PII is only returned to the order owner or admin.
   const isAuthorized =
     (req.user?.id && req.user.id === order.user_id) ||
     req.user?.role === "admin";
@@ -2018,11 +1765,6 @@ export const handleWebhook = async (req, res) => {
     );
 
   const loadBySubscription = async () => {
-    // Always load the ORIGINAL subscription order (is_renewal_order = 0).
-    // After Phase 2, multiple rows share razorpay_subscription_id — the origin
-    // plus one renewal order per charge. Webhook handlers that update
-    // subscription_status / next_billing_date must target the origin row; the
-    // renewal rows are fulfillment orders whose status is managed by the admin.
     const { rows } = await query(
       `SELECT * FROM orders
        WHERE razorpay_subscription_id = ?
@@ -2045,11 +1787,6 @@ export const handleWebhook = async (req, res) => {
   switch (event) {
     case "payment.captured": {
       if (rzpSubscriptionId) {
-        // Subscription renewal — update billing/subscription fields ONLY.
-        // CRITICAL: order_status is a fulfillment field and must NEVER be
-        // overwritten by a billing event. The fulfillment team manages
-        // order_status independently (pending → confirmed → processing →
-        // dispatched → delivered).
         const order = await loadBySubscription();
         if (order) {
           await query(
@@ -2069,27 +1806,20 @@ export const handleWebhook = async (req, res) => {
           emitUpdate(order.id, order.order_status);
         }
       } else if (rzpOrderId) {
-        // One-time order fallback (Magic Checkout may also fire this)
         const order = await loadByRazorpayOrder();
         if (order && order.payment_status === "paid") {
-          // Already finalised by verifyPayment — nothing to do
           return res.json({ status: "already_processed" });
         }
         if (order && order.payment_status !== "paid") {
-          // Wrapped in a transaction with a FOR UPDATE row lock so that
-          // concurrent webhook deliveries (Razorpay retries) cannot both pass
-          // the payment_status check and write duplicate history rows.
           const whClient = await getClient();
           try {
             await whClient.query("BEGIN");
 
-            // Re-read with row lock — prevents duplicate concurrent processing
             const { rows: lockedWh } = await whClient.query(
               "SELECT payment_status, order_status FROM orders WHERE id = ? FOR UPDATE",
               [order.id],
             );
             if (lockedWh[0]?.payment_status === "paid") {
-              // Already processed (by verifyPayment or a concurrent webhook)
               await whClient.query("COMMIT");
               break;
             }
@@ -2101,7 +1831,6 @@ export const handleWebhook = async (req, res) => {
               [order.id],
             );
 
-            // Keep payments table in sync with orders table
             await whClient.query(
               `UPDATE payments
                SET status = 'captured', razorpay_payment_id = ?, updated_at = NOW()
@@ -2109,11 +1838,6 @@ export const handleWebhook = async (req, res) => {
               [rzpPaymentId, rzpOrderId],
             );
 
-            // Deduct stock here too, guarded by `stock_deducted` so this can
-            // never double-deduct against verifyPayment() (or a concurrent
-            // webhook retry) — whichever path reaches this row first under
-            // FOR UPDATE wins the flag; the other sees 0 affected rows and
-            // skips deduction entirely.
             const whStockGuard = await whClient.query(
               `UPDATE orders SET stock_deducted = 1 WHERE id = ? AND stock_deducted = 0`,
               [order.id],
@@ -2128,10 +1852,6 @@ export const handleWebhook = async (req, res) => {
               );
 
               for (const item of whItems) {
-                // Note: unlike verifyPayment, the webhook cannot reject the
-                // payment if stock is insufficient (Razorpay already
-                // captured the charge). Clamp at 0 instead of blocking, and
-                // log loudly for manual reconciliation.
                 const whStockResult = await whClient.query(
                   `UPDATE products
                    SET stock_qty = GREATEST(stock_qty - ?, 0)
@@ -2215,11 +1935,6 @@ export const handleWebhook = async (req, res) => {
       break;
     }
 
-    // ── Subscription lifecycle events ────────────────────────────────────────
-    // These update the DB so subscription status stays consistent even when
-    // the frontend verifyPayment call is missed (e.g. popup closed early,
-    // network failure).
-
     case "subscription.activated": {
       const order = await loadBySubscription();
       if (order) {
@@ -2229,8 +1944,6 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
-        // CRITICAL: Only update subscription_status and billing fields.
-        // order_status is a fulfillment field — NEVER overwrite it here.
         await query(
           `UPDATE orders SET
              subscription_status = 'active',
@@ -2252,30 +1965,11 @@ export const handleWebhook = async (req, res) => {
     }
 
     case "subscription.created": {
-      // Razorpay fires this when the subscription object is first created.
-      // We already write status='created' at createSubscription time; nothing to do.
       console.info("[WEBHOOK] subscription.created — no DB action needed");
       break;
     }
 
     case "subscription.charged": {
-      // ── Phase 2: create a new fulfillment order for this renewal charge ────
-      //
-      // Every successful recurring charge creates an independent fulfillment
-      // order so the warehouse team can pack and ship the renewal separately
-      // from previous cycles. The renewal order:
-      //   • gets its own BREE-XXXXXX order number
-      //   • copies all product items from the original subscription order
-      //   • copies all customer / address fields
-      //   • starts at order_status='paid', payment_status='paid'
-      //   • is linked back to the origin via parent_order_id
-      //
-      // The ORIGINAL order's subscription_status and next_billing_date are
-      // updated inside createRenewalOrder's transaction — we do NOT issue a
-      // separate UPDATE here to avoid a race condition.
-      //
-      // CRITICAL: order_status on the original order is NEVER touched here.
-      // Fulfillment state is managed independently by the admin.
       if (!rzpSubscriptionId) {
         console.warn(
           "[WEBHOOK] subscription.charged fired without subscription ID — skipping",
@@ -2297,16 +1991,12 @@ export const handleWebhook = async (req, res) => {
           rzpPaymentId,
         });
 
-        // Emit socket update so admin order lists refresh in real-time
         emitUpdate(renewalOrderId, "paid");
 
-        // Non-blocking renewal confirmation email
         const { sendSubscriptionChargeReceiptEmail } =
           await import("../services/orderEmailService.js").catch(() => ({}));
 
         if (sendSubscriptionChargeReceiptEmail) {
-          // Load the origin order to get contact details (renewal order has them
-          // too, but loadBySubscription() is already scoped to the origin)
           const originOrder = await loadBySubscription();
           if (originOrder) {
             sendSubscriptionChargeReceiptEmail({
@@ -2325,9 +2015,6 @@ export const handleWebhook = async (req, res) => {
           }
         }
       } catch (err) {
-        // Log and continue — Razorpay expects a 200 OK regardless.
-        // The webhook will retry; idempotency guard in createRenewalOrder
-        // prevents duplicate renewal orders on retry.
         console.error(
           "[WEBHOOK] subscription.charged — createRenewalOrder failed",
           {
@@ -2372,8 +2059,6 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
-        // CRITICAL: Only update subscription_status and billing fields.
-        // order_status is a fulfillment field — NEVER overwrite it here.
         await query(
           `UPDATE orders SET
              subscription_status = 'active',
@@ -2418,15 +2103,7 @@ export const handleWebhook = async (req, res) => {
     case "subscription.cancelled": {
       const order = await loadBySubscription();
       if (order) {
-        // Only update if not already marked cancelled — preserves idempotency.
         if (order.subscription_status !== "cancelled") {
-          // CRITICAL: Only update subscription_status and billing fields.
-          // order_status is a fulfillment field — NEVER overwrite it here.
-          // The fulfillment team may have already progressed order_status to
-          // 'delivered' or 'dispatched' — that history must be preserved.
-          // Example of CORRECT end state:
-          //   subscription_status = 'cancelled'  (billing ended)
-          //   order_status        = 'delivered'  (fulfillment history intact)
           await query(
             `UPDATE orders SET
                subscription_status = 'cancelled',
