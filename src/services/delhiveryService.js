@@ -308,31 +308,36 @@ class DelhiveryService {
    */
   handleError(error) {
     if (error.response) {
+      const responseData = error.response.data;
+
       const formatted = {
         success: false,
         status: error.response.status,
-        message: error.response.data?.message || error.response.statusText,
-        data: error.response.data,
+        message:
+          responseData?.message ||
+          responseData?.rmk ||
+          responseData?.error ||
+          error.response.statusText ||
+          "Unknown Delhivery API error",
+        data: responseData,
       };
+
       console.error("[Delhivery] API error response:", formatted);
+
       return formatted;
     }
 
     if (error.request) {
-      const formatted = {
+      return {
         success: false,
         message: "No response received from Delhivery.",
       };
-      console.error("[Delhivery] No response error:", formatted);
-      return formatted;
     }
 
-    const formatted = {
+    return {
       success: false,
       message: error.message,
     };
-    console.error("[Delhivery] Unexpected error:", formatted);
-    return formatted;
   }
 }
 

@@ -386,13 +386,14 @@ export const createShipment = async (req, res) => {
           order_number,
           order_status,
           payment_status,
+          payment_method,
           contact_name,
           contact_email,
           contact_phone,
           shipping_address,
           subtotal,
           total
-      FROM orders
+        FROM orders
        WHERE id = ?
        LIMIT 1`,
       [orderId],
@@ -461,7 +462,7 @@ export const createShipment = async (req, res) => {
 
         if (legacyAddressRows.length) {
           shippingAddress = {
-            full_name: legacyAddressRows[0].label,
+            full_name: order.contact_name || legacyAddressRows[0].label,
             mobile: order.contact_phone || "",
             address_line_1: legacyAddressRows[0].address_line1,
             address_line_2: legacyAddressRows[0].address_line2,
