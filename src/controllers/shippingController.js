@@ -386,7 +386,6 @@ export const createShipment = async (req, res) => {
           order_number,
           order_status,
           payment_status,
-          payment_method,
           contact_name,
           contact_email,
           contact_phone,
