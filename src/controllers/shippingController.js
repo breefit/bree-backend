@@ -601,6 +601,9 @@ export const createShipment = async (req, res) => {
 
     // ── 6. Call Delhivery API to create shipment ─────────────────────────────
     let delhiveryResponse;
+    console.log("\n========== DELHIVERY PAYLOAD ==========\n");
+    console.log(JSON.stringify(payload, null, 2));
+    console.log("\n=======================================\n");
     try {
       delhiveryResponse = await delhiveryService.createShipment(payload);
     } catch (error) {
