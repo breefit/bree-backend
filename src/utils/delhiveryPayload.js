@@ -12,7 +12,7 @@ export const buildDelhiveryShipmentPayload = ({
   if (!items?.length) throw new Error("Order items are required");
 
   const totalWeight = items.reduce(
-    (sum, item) => sum + Number(item.weight || 0.5),
+    (sum, item) => sum + Number(item.weight || 1),
     0,
   );
 
