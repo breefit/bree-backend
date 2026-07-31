@@ -12,7 +12,7 @@ export const buildDelhiveryShipmentPayload = ({
   if (!items?.length) throw new Error("Order items are required");
 
   const totalWeight = items.reduce(
-    (sum, item) => sum + Number(item.weight || 1),
+    (sum, item) => sum + Number(item.weight || 10),
     0,
   );
 
@@ -98,6 +98,7 @@ export const buildDelhiveryShipmentPayload = ({
   if (order.waybill?.trim()) {
     shipment.waybill = order.waybill;
   }
+  shipment.pickup_location = "BREE FIT";
 
   return {
     shipments: [shipment],
