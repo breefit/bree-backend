@@ -44,9 +44,15 @@ export const buildDelhiveryShipmentPayload = ({
     0,
   );
 
-  const orderDate = order.created_at
-    ? new Date(order.created_at).toISOString().split("T")[0]
-    : new Date().toISOString().split("T")[0];
+  const orderDateBase = order.created_at
+    ? new Date(order.created_at)
+    : new Date();
+
+  const orderDateObj = Number.isFinite(orderDateBase.getTime())
+    ? orderDateBase
+    : new Date();
+
+  const orderDate = orderDateObj.toISOString().replace(/\.\d{3}Z$/, ".000000");
 
   const shipment = {
     // -----------------------------
@@ -76,16 +82,19 @@ export const buildDelhiveryShipmentPayload = ({
     // -----------------------------
     order: order.order_number,
 
+    waybill: "",
+
     payment_mode: order.payment_method === "COD" ? "COD" : "Prepaid",
 
     order_date: orderDate,
 
     total_amount: getNumber(order.total_amount, 0),
 
-    cod_amount:
+    cod_amount: String(
       order.payment_method === "COD" ? getNumber(order.total_amount, 0) : 0,
+    ),
 
-    quantity: totalQuantity,
+    quantity: String(totalQuantity),
 
     products_desc: items.map((item) => item.product_name).join(", "),
 
@@ -130,8 +139,6 @@ export const buildDelhiveryShipmentPayload = ({
     shipping_mode: "Surface",
 
     address_type: "home",
-
-    pickup_location: "BREE FIT",
 
     // -----------------------------
     // Invoice (recommended)
@@ -178,7 +185,6 @@ export const buildDelhiveryShipmentPayload = ({
     "shipment_width",
     "shipment_height",
     "weight",
-    "pickup_location",
   ];
 
   for (const field of requiredFields) {
@@ -198,6 +204,9 @@ export const buildDelhiveryShipmentPayload = ({
 
   const payload = {
     shipments: [shipment],
+    pickup_location: {
+      name: warehouse.name,
+    },
   };
 
   console.log(

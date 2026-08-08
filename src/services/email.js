@@ -1,9 +1,9 @@
-import nodemailer from 'nodemailer';
+import nodemailer from "nodemailer";
 
 const createTransporter = () =>
   nodemailer.createTransport({
-    host:   process.env.SMTP_HOST || 'smtp.gmail.com',
-    port:   Number(process.env.SMTP_PORT) || 587,
+    host: process.env.SMTP_HOST || "smtp.gmail.com",
+    port: Number(process.env.SMTP_PORT) || 587,
     secure: false,
     auth: {
       user: process.env.SMTP_USER,
@@ -11,15 +11,28 @@ const createTransporter = () =>
     },
   });
 
-export const sendOrderConfirmation = async ({ to, name, orderId, amount, items }) => {
+// Single shared transporter instance, reused by every function in this
+// file and by any other service that imports { transporter }.
+const transporter = createTransporter();
+
+export const sendOrderConfirmation = async ({
+  to,
+  name,
+  orderId,
+  amount,
+  items,
+}) => {
   if (!process.env.SMTP_USER) return; // Skip if not configured
 
   const itemRows = items
-    .map((i) => `<tr><td>${i.name}</td><td>${i.quantity}</td><td>₹${i.price}</td></tr>`)
-    .join('');
+    .map(
+      (i) =>
+        `<tr><td>${i.name}</td><td>${i.quantity}</td><td>₹${i.price}</td></tr>`,
+    )
+    .join("");
 
-  await createTransporter().sendMail({
-    from:    `"BREE Wellness" <${process.env.SMTP_USER}>`,
+  await transporter.sendMail({
+    from: `"BREE Wellness" <${process.env.SMTP_USER}>`,
     to,
     subject: `Order Confirmed — BREE #${orderId.slice(-8).toUpperCase()}`,
     html: `
@@ -44,15 +57,13 @@ export const sendOrderConfirmation = async ({ to, name, orderId, amount, items }
 
 export const sendContactAck = async ({ to, name }) => {
   if (!process.env.SMTP_USER) return;
-  await createTransporter().sendMail({
-    from:    `"BREE Wellness" <${process.env.SMTP_USER}>`,
+  await transporter.sendMail({
+    from: `"BREE Wellness" <${process.env.SMTP_USER}>`,
     to,
-    subject: 'We received your message — BREE',
+    subject: "We received your message — BREE",
     html: `<p>Hi ${name},<br>Thanks for reaching out! We'll get back to you within 24 hours.<br><br>— The BREE Team</p>`,
   });
 };
-
-
 
 export const sendBulkBookingNotification = async ({
   companyName,
@@ -65,7 +76,7 @@ export const sendBulkBookingNotification = async ({
 }) => {
   if (!process.env.SMTP_USER) return;
 
-  await createTransporter().sendMail({
+  await transporter.sendMail({
     from: `"BREE Wellness" <${process.env.SMTP_USER}>`,
     to: "bree.fit.india@gmail.com",
     subject: "New Bulk Booking Request",
@@ -83,4 +94,5 @@ export const sendBulkBookingNotification = async ({
   });
 };
 
-export default createTransporter();
+export { transporter };
+export default transporter;

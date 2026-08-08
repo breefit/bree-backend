@@ -46,6 +46,19 @@ import { upload } from "../../config/cloudinary.js";
 import bulkRoutes from "../../controllers/admin/bulkRoutes.js";
 import { updateInquiryStatus } from "../../controllers/contactController.js";
 
+import {
+  approveReturn,
+  rejectReturn,
+  createReverseShipment,
+  scheduleReversePickup,
+  markReturned,
+  approveInspection,
+  rejectInspection,
+  approveRefund,
+  rejectRefund,
+  completeRefund,
+} from "../../controllers/admin/returnController.js";
+
 const router = Router();
 
 // ── Login (no auth, strict rate limit) ───────────────────────────────────────
@@ -72,8 +85,44 @@ router.get("/dashboard", getDashboardStats);
 // Orders
 router.get("/orders", getOrders);
 router.get("/orders/:id", getOrder);
-router.patch("/orders/bulk-status", bulkUpdateStatus); // Must be before /:id route
+router.patch("/orders/bulk-status", bulkUpdateStatus);
 router.patch("/orders/:id/status", updateOrderStatus);
+
+/* ==========================================================================
+   Return Management
+   ========================================================================== */
+
+// Approve Return
+router.patch("/orders/:orderId/return/approve", approveReturn);
+
+// Reject Return
+router.patch("/orders/:orderId/return/reject", rejectReturn);
+
+// Create Reverse Shipment
+router.post("/orders/:orderId/return/reverse-shipment", createReverseShipment);
+
+// Schedule Reverse Pickup
+router.patch("/orders/:orderId/return/schedule-pickup", scheduleReversePickup);
+
+// Mark Product Returned
+router.patch("/orders/:orderId/return/mark-returned", markReturned);
+
+// Quality Check / Inspection (requirement 10 — new)
+router.patch("/orders/:orderId/return/inspection/approve", approveInspection);
+router.patch("/orders/:orderId/return/inspection/reject", rejectInspection);
+
+/* ==========================================================================
+   Refund Management
+   ========================================================================== */
+
+// Approve Refund
+router.patch("/orders/:orderId/refund/approve", approveRefund);
+
+// Reject Refund
+router.patch("/orders/:orderId/refund/reject", rejectRefund);
+
+// Complete Refund
+router.patch("/orders/:orderId/refund/complete", completeRefund);
 
 // Products
 router.get("/products", getProducts);

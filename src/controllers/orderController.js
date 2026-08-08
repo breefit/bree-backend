@@ -1164,6 +1164,7 @@ export const getOrderTracking = async (req, res) => {
     const orderQuery = isNewOrderSchema
       ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
+           o.delivered_at, o.return_status,
            o.contact_name, o.contact_email,
            ua.full_name AS ua_full_name,
            ua.phone AS ua_phone,
@@ -1186,6 +1187,7 @@ export const getOrderTracking = async (req, res) => {
          WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`
       : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
+           o.delivered_at, o.return_status,
            o.customer_name AS contact_name, o.email AS contact_email,
            ua.full_name AS ua_full_name,
            ua.phone AS ua_phone,

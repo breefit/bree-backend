@@ -10,7 +10,7 @@ import { appendStatusHistory } from "../models/Order.js";
 // ─────────────────────────────────────────────────────────────────────────────
 // Get warehouse configuration from environment variables
 // ─────────────────────────────────────────────────────────────────────────────
-const getWarehouseConfig = () => {
+export const getWarehouseConfig = () => {
   return {
     name: process.env.WAREHOUSE_NAME || "BREE Warehouse",
     address: process.env.WAREHOUSE_ADDRESS || "",
@@ -33,7 +33,7 @@ const getWarehouseConfig = () => {
 const isValidPincode = (pincode) =>
   /^\d{6}$/.test(String(pincode || "").trim());
 
-const validateShippingAddress = (shippingAddress) => {
+export const validateShippingAddress = (shippingAddress) => {
   const missing = {
     full_name: !shippingAddress?.full_name,
     mobile: !shippingAddress?.mobile,
@@ -62,7 +62,7 @@ const validateShippingAddress = (shippingAddress) => {
 // causes the exact same class of failure as a missing consignee address,
 // so it's checked the same way.
 // ─────────────────────────────────────────────────────────────────────────────
-const validateWarehouseConfig = (warehouse) => {
+export const validateWarehouseConfig = (warehouse) => {
   const missing = {
     city: !warehouse?.city,
     state: !warehouse?.state,
@@ -89,7 +89,7 @@ const getDefaultPickupDate = () => {
   return `${yyyy}-${mm}-${dd}`;
 };
 
-const buildPickupRequestPayload = (
+export const buildPickupRequestPayload = (
   warehouse,
   overrides = {},
   expectedPackageCount = 1,
@@ -127,7 +127,7 @@ const getTrackingBaseUrl = () => {
 // every known shape safely, never assumes structure, and never throws —
 // it returns a { success, message } error object instead of crashing.
 // ─────────────────────────────────────────────────────────────────────────────
-const extractDelhiveryShipmentDetails = (delhiveryResponse) => {
+export const extractDelhiveryShipmentDetails = (delhiveryResponse) => {
   if (!delhiveryResponse || typeof delhiveryResponse !== "object") {
     return {
       success: false,
@@ -390,6 +390,12 @@ export const createShipment = async (req, res) => {
           contact_email,
           contact_phone,
           shipping_address,
+          shipping_address_line1,
+          shipping_address_line2,
+          shipping_city,
+          shipping_state,
+          shipping_pincode,
+          shipping_country,
           subtotal,
           total
         FROM orders
@@ -472,6 +478,36 @@ export const createShipment = async (req, res) => {
           };
         }
       }
+    }
+
+    // FIX (Magic Checkout for Bulk Orders): orders created from a Bulk
+    // Booking (bulkOrderService.createOrderFromBulkBooking) have no
+    // address_id — bulk bookings have no user_id, and addresses.user_id is
+    // NOT NULL, so they can never get a row in the addresses table (see
+    // upsertStructuredAddressForOrder in paymentController.js, which has the
+    // identical constraint for guest normal-checkout orders). Their
+    // structured address instead lives directly on the orders row
+    // (orders.shipping_address_line1/2/city/state/pincode/country — added
+    // alongside is_bulk_order/bulk_booking_id). This is purely additive: it
+    // only ever finds data for orders that populated these columns (bulk
+    // orders today), so every existing address_id-based order above is
+    // completely unaffected.
+    if (
+      !shippingAddress &&
+      order.shipping_address_line1 &&
+      order.shipping_city &&
+      order.shipping_pincode
+    ) {
+      shippingAddress = {
+        full_name: order.contact_name || "",
+        mobile: order.contact_phone || "",
+        address_line_1: order.shipping_address_line1,
+        address_line_2: order.shipping_address_line2,
+        city: order.shipping_city,
+        state: order.shipping_state,
+        pincode: order.shipping_pincode,
+        country: order.shipping_country || "India",
+      };
     }
 
     // No structured address record was found for this order. We
@@ -573,6 +609,18 @@ export const createShipment = async (req, res) => {
         message: `Failed to build shipment payload: ${error.message}`,
       });
     }
+
+    console.log("Warehouse Config:", {
+      name: warehouse.name,
+      address: warehouse.address,
+      city: warehouse.city,
+      state: warehouse.state,
+      pincode: warehouse.pincode,
+      phone: warehouse.phone,
+      gst: warehouse.gst,
+    });
+    console.log("Pickup Location Sent:", payload.pickup_location);
+    console.log("Seller Name Sent:", payload.shipments?.[0]?.seller_name);
 
     // ── 5b. Log key shipment-creation context (no full PII) before calling
     //        Delhivery, to make failures like invalid-pincode traceable.
@@ -1130,6 +1178,19 @@ export const trackShipment = async (req, res) => {
       if (shouldTransitionOrderStatus) {
         updateColumns.push("order_status = ?");
         updateParams.push(mappedOrderStatus);
+
+        // FIX (Return/Refund audit — 48-hour window): this is the one place
+        // an order genuinely, live, becomes "delivered" — Delhivery's own
+        // tracking sync. delivered_at is the source of truth the 48-hour
+        // return-eligibility window is computed from
+        // (isReturnWindowOpen() in returnController.js), so it has to be
+        // stamped exactly here, not approximated later from created_at/
+        // shipped_at. Only ever set once: shouldTransitionOrderStatus is
+        // already false on any later ping once order_status is already
+        // "delivered", so this never overwrites a real value.
+        if (mappedOrderStatus === "delivered") {
+          updateColumns.push("delivered_at = NOW()");
+        }
       }
 
       updateParams.push(order.id);

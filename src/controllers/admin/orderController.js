@@ -113,9 +113,13 @@ export const getOrders = async (req, res) => {
       ${emailExpr} LIKE ? OR
       ${phoneExpr} LIKE ? OR
       o.order_number LIKE ? OR
+      o.bulk_booking_number LIKE ? OR
+      o.company_name LIKE ? OR
       o.id LIKE ?
     )`);
     params.push(
+      `%${search}%`,
+      `%${search}%`,
       `%${search}%`,
       `%${search}%`,
       `%${search}%`,
@@ -180,6 +184,26 @@ export const getOrders = async (req, res) => {
               ${amountExpr}       AS amount,
               o.order_status,
               o.payment_status,
+              o.is_bulk_order,
+              o.bulk_booking_id,
+              o.bulk_booking_number,
+              o.company_name,
+              o.contact_person,
+              o.delivered_at,
+              o.return_status,
+              o.return_reason,
+              o.return_notes,
+              o.return_requested_at,
+              o.return_approved_at,
+              o.reverse_awb,
+              o.reverse_tracking_url,
+              o.reverse_pickup_request_id,
+              o.returned_at,
+              o.inspection_status,
+              o.refund_status,
+              o.refund_amount,
+              o.refund_reference,
+              o.refund_completed_at,
               ${transactionExpr}  AS transaction_id,
               ${notesExpr}        AS notes,
               o.created_at,
@@ -297,6 +321,26 @@ export const getOrder = async (req, res) => {
             ${amountExpr}                    AS amount,
             o.order_status,
             o.payment_status,
+            o.is_bulk_order,
+            o.bulk_booking_id,
+            o.bulk_booking_number,
+            o.company_name,
+            o.contact_person,
+            o.delivered_at,
+            o.return_status,
+            o.return_reason,
+            o.return_notes,
+            o.return_requested_at,
+            o.return_approved_at,
+            o.reverse_awb,
+            o.reverse_tracking_url,
+            o.reverse_pickup_request_id,
+            o.returned_at,
+            o.inspection_status,
+            o.refund_status,
+            o.refund_amount,
+            o.refund_reference,
+            o.refund_completed_at,
             ${transactionExpr}               AS transaction_id,
             ${notesExpr}                     AS notes,
             o.created_at,
@@ -411,6 +455,17 @@ export const updateOrderStatus = async (req, res) => {
 
       updates.push(`order_status = ?`);
       params.push(status);
+
+      // FIX (Return/Refund audit — 48-hour window): manual admin transition
+      // to "delivered" only ever reaches here when there's no Delhivery AWB
+      // on the order (DELHIVERY_LOCKED_STATUSES blocks this path otherwise,
+      // above) — i.e. there's no Delhivery-reported delivery timestamp to
+      // rely on at all, so NOW() is the best available truth, stamped
+      // exactly at the moment of the real event, same as every other
+      // *_at column in this codebase. Only set on the actual transition.
+      if (status === "delivered" && prev !== "delivered") {
+        updates.push("delivered_at = NOW()");
+      }
     }
 
     if (paymentStatus) {
@@ -678,10 +733,22 @@ export const bulkUpdateStatus = async (req, res) => {
       }
     }
 
-    // Apply update to all selected orders
+    // Apply update to all selected orders.
+    // FIX (Return/Refund audit — 48-hour window): same delivered_at stamping
+    // as updateOrderStatus's single-order path, expressed as a CASE so a
+    // batch containing a mix of previous statuses only stamps the orders
+    // that are actually transitioning into "delivered" right now, and never
+    // overwrites an order that was already delivered.
     await client.query(
-      `UPDATE orders SET order_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders})`,
-      [status, ...ids],
+      `UPDATE orders
+       SET order_status = ?,
+           delivered_at = CASE
+             WHEN ? = 'delivered' AND order_status <> 'delivered' THEN NOW()
+             ELSE delivered_at
+           END,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id IN (${placeholders})`,
+      [status, status, ...ids],
     );
 
     const { rows: updated } = await client.query(

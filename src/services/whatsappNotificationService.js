@@ -682,6 +682,31 @@ export const sendOrderConfirmationWhatsApp = async ({
  * @example
  * buildOrderStatusMessage("shipped"); // -> "Your order has been shipped."
  */
+// FIX (Return/Refund audit — requirement 14): returnController.js's
+// notifyReturnEvent() has always passed already-human-readable labels like
+// "Return Approved" / "Return Shipment Created" into this same lookup —
+// but none of them were keys here, so every single return/refund WhatsApp
+// message fell back to the generic "Your order status has been updated."
+// regardless of what actually happened. Reuses the exact same
+// order_status_update template (still 4 params: name, order number,
+// readable status, message) — no new template, no new client.
+const RETURN_STATUS_MESSAGES = {
+  "Return Approved":
+    "Your return request has been approved. We will arrange the pickup shortly.",
+  "Return Shipment Created":
+    "Your return shipment has been created. Our courier partner will pick up the item shortly.",
+  "Return Pickup Scheduled": "A pickup has been scheduled for your return.",
+  "Return Received":
+    "We have received your returned item and are reviewing it.",
+  "Return Inspection Approved":
+    "Your returned item has passed our quality check and is approved for a refund.",
+  "Return Rejected":
+    "Your return request could not be approved. Please contact BREE Support for details.",
+  "Refund Initiated":
+    "Your refund has been initiated and will reflect in your account soon.",
+  "Refund Completed": "Your refund has been completed successfully.",
+};
+
 export const buildOrderStatusMessage = (status) => {
   const messages = {
     pending_payment: "Your order has been placed and is awaiting payment.",
@@ -693,6 +718,7 @@ export const buildOrderStatusMessage = (status) => {
     delivered: "Your order has been delivered successfully.",
     cancelled: "Your order has been cancelled.",
     returned: "Your returned order has been received.",
+    ...RETURN_STATUS_MESSAGES,
   };
 
   return messages[status] || "Your order status has been updated.";
@@ -720,6 +746,18 @@ export const getReadableOrderStatus = (status) => {
     delivered: "Delivered",
     cancelled: "Cancelled",
     returned: "Returned",
+    // Return/refund events already arrive pre-formatted (see
+    // RETURN_STATUS_MESSAGES above) — listed explicitly rather than relying
+    // solely on the title-case fallback below, which only capitalizes the
+    // first word of a space-separated string, not each word.
+    "Return Approved": "Return Approved",
+    "Return Shipment Created": "Return Shipment Created",
+    "Return Pickup Scheduled": "Return Pickup Scheduled",
+    "Return Received": "Return Received",
+    "Return Inspection Approved": "Return Inspection Approved",
+    "Return Rejected": "Return Rejected",
+    "Refund Initiated": "Refund Initiated",
+    "Refund Completed": "Refund Completed",
   };
 
   if (labels[status]) {

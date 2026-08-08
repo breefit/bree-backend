@@ -1,11 +1,16 @@
 import dotenv from "dotenv";
+import path from "path";
+import { fileURLToPath } from "url";
 import { createServer } from "http";
 import { Server } from "socket.io";
 import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 
 // console.log("STEP 1 - Server file loaded");
 // console.log("STEP 4 - Environment variables loaded");
