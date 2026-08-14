@@ -5,7 +5,6 @@ import {
   getBulkBooking,
   updateBulkBooking,
   getBulkBookingStats,
-  sharePaymentLink,
   sendBulkConfirmation,
   sendBulkDispatch,
 } from "../../controllers/bulkController.js";
@@ -37,14 +36,12 @@ router.get("/bulk-bookings/:id", getBulkBooking);
 // workflow (see bulkController.updateBulkBooking).
 router.put("/bulk-bookings/:id", updateBulkBooking);
 
-// POST /api/admin/bulk-bookings/:id/share-payment-link
-// Generate a Razorpay order for the approved quote and notify the customer.
-// New route — additive only, existing routes above are unchanged.
-router.post("/bulk-bookings/:id/share-payment-link", sharePaymentLink);
-
-// FIX (audit): the admin UI (BulkOrders.js COMMUNICATION_ENDPOINTS) has
-// always called these two — they just never existed on the backend.
+// POST /api/admin/bulk-bookings/:id/send-confirmation
+// Manually resend the bulk order confirmation notification.
 router.post("/bulk-bookings/:id/send-confirmation", sendBulkConfirmation);
+
+// POST /api/admin/bulk-bookings/:id/send-dispatch
+// Manually send the bulk order dispatch notification.
 router.post("/bulk-bookings/:id/send-dispatch", sendBulkDispatch);
 
 export default router;
