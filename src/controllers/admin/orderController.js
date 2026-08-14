@@ -204,6 +204,12 @@ export const getOrders = async (req, res) => {
               o.refund_amount,
               o.refund_reference,
               o.refund_completed_at,
+              o.parent_package_id,
+              o.fulfillment_cycle,
+              pkg.package_number,
+              pkg.total_cycles AS package_total_cycles,
+              pkg.next_fulfillment_date AS package_next_fulfillment_date,
+              pkg.status AS package_status,
               ${transactionExpr}  AS transaction_id,
               ${notesExpr}        AS notes,
               o.created_at,
@@ -217,6 +223,7 @@ export const getOrders = async (req, res) => {
        FROM orders o
        LEFT JOIN user_addresses ua ON ua.id = o.address_id
        LEFT JOIN addresses la ON la.id = o.address_id
+       LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
        ${where}
        ORDER BY ${sortColumn} ${safeDir}
        LIMIT ? OFFSET ?`;
@@ -341,6 +348,12 @@ export const getOrder = async (req, res) => {
             o.refund_amount,
             o.refund_reference,
             o.refund_completed_at,
+            o.parent_package_id,
+            o.fulfillment_cycle,
+            pkg.package_number,
+            pkg.total_cycles AS package_total_cycles,
+            pkg.next_fulfillment_date AS package_next_fulfillment_date,
+            pkg.status AS package_status,
             ${transactionExpr}               AS transaction_id,
             ${notesExpr}                     AS notes,
             o.created_at,
@@ -354,6 +367,7 @@ export const getOrder = async (req, res) => {
      FROM orders o
      LEFT JOIN user_addresses ua ON ua.id = o.address_id
      LEFT JOIN addresses la ON la.id = o.address_id
+     LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
      WHERE o.id = ?`,
     [req.params.id],
   );

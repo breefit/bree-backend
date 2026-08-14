@@ -13,7 +13,6 @@ import {
 import {
   notifyBulkEnquirySubmitted,
   notifyQuoteReady,
-  notifyPaymentLinkShared,
   notifyBulkOrderConfirmation,
   notifyBulkDispatch,
 } from "../services/bulkNotificationService.js";
@@ -1274,114 +1273,7 @@ const ensureBulkRazorpayOrder = async (id) => {
   return { ok: true, booking, razorpayOrderId, created };
 };
 
-export const sharePaymentLink = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const booking = await findBulkBooking(id);
 
-    if (!booking) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Bulk booking not found" });
-    }
-    if (rejectIfReadOnly(res, booking)) return;
-
-    if (!booking.quote_price || Number(booking.quote_price) <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot share a payment link without a valid quote price.",
-      });
-    }
-    if (!booking.quote_approved) {
-      return res.status(400).json({
-        success: false,
-        message: "Customer has not approved the quotation yet.",
-      });
-    }
-    if (booking.payment_status === "paid") {
-      return res.status(400).json({
-        success: false,
-        message: "This booking has already been paid for.",
-      });
-    }
-
-    let result;
-    try {
-      result = await ensureBulkRazorpayOrder(id);
-    } catch (err) {
-      console.error("❌ Error sharing bulk payment link:", err);
-      return res
-        .status(500)
-        .json({ success: false, message: "Failed to share payment link" });
-    }
-
-    if (!result.ok) {
-      switch (result.code) {
-        case "NOT_FOUND":
-          return res
-            .status(404)
-            .json({ success: false, message: "Bulk booking not found" });
-        case "READ_ONLY":
-          return res.status(409).json({
-            success: false,
-            message:
-              "This bulk booking is read-only — an order has already been created from it.",
-            data: {
-              bulkBookingId: result.booking.id,
-              orderId: result.booking.created_order_id,
-            },
-          });
-        case "NOT_APPROVED":
-          return res.status(400).json({
-            success: false,
-            message: "Customer has not approved the quotation yet.",
-          });
-        case "ALREADY_PAID":
-          return res.status(400).json({
-            success: false,
-            message: "This booking has already been paid for.",
-          });
-        case "INVALID_QUOTE":
-        default:
-          return res.status(400).json({
-            success: false,
-            message: "Cannot share a payment link without a valid quote price.",
-          });
-      }
-    }
-
-    // Notification is sent only once the Razorpay order id is durably
-    // persisted, and only for the admin who actually created it (never on
-    // reuse), matching the original behavior.
-    if (result.created) {
-      notifyPaymentLinkShared({
-        email: booking.email,
-        mobileNumber: booking.mobile_number,
-        contactPerson: booking.contact_person,
-        quotePrice: booking.quote_price,
-        bookingId: id,
-      }).catch((err) =>
-        console.error("[BULK] payment-link notification failed", err?.message),
-      );
-      logBulkCommunication(id, "payment_link", "Payment Link Sent", req.admin?.id);
-    }
-
-    res.status(200).json({
-      success: true,
-      message: "Payment link shared successfully",
-      data: {
-        razorpayOrderId: result.razorpayOrderId,
-        amount: Number(booking.quote_price),
-        currency: "INR",
-      },
-    });
-  } catch (error) {
-    console.error("❌ Error sharing bulk payment link:", error);
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to share payment link" });
-  }
-};
 
 // ==========================================================================
 // SEND CONFIRMATION (admin only)

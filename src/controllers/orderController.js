@@ -1060,21 +1060,31 @@ export const getMyOrders = async (req, res) => {
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
     const orderQuery = isNewOrderSchema
-      ? `SELECT id, order_number, contact_name, contact_email, contact_phone, total,
-           payment_status, order_status, is_free_shipping, shipping_charge, estimated_delivery,
-           razorpay_order_id, razorpay_subscription_id,
-           subscription_status, next_billing_date, created_at
-         FROM orders
-         WHERE user_id = ?
-         ORDER BY created_at DESC`
-      : `SELECT id, order_number, customer_name AS contact_name, email AS contact_email,
-           mobile_number AS contact_phone, amount AS total,
-           payment_status, order_status, is_free_shipping, shipping_charge, estimated_delivery,
-           razorpay_order_id, razorpay_subscription_id,
-           subscription_status, next_billing_date, created_at
-         FROM orders
-         WHERE user_id = ?
-         ORDER BY created_at DESC`;
+      ? `SELECT o.id, o.order_number, o.contact_name, o.contact_email, o.contact_phone, o.total,
+           o.payment_status, o.order_status, o.is_free_shipping, o.shipping_charge, o.estimated_delivery,
+           o.razorpay_order_id, o.razorpay_subscription_id,
+           o.subscription_status, o.next_billing_date, o.created_at,
+           o.parent_package_id, o.fulfillment_cycle,
+           pkg.package_number, pkg.total_cycles AS package_total_cycles,
+           pkg.next_fulfillment_date AS package_next_fulfillment_date,
+           pkg.status AS package_status
+         FROM orders o
+         LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
+         WHERE o.user_id = ?
+         ORDER BY o.created_at DESC`
+      : `SELECT o.id, o.order_number, o.customer_name AS contact_name, o.email AS contact_email,
+           o.mobile_number AS contact_phone, o.amount AS total,
+           o.payment_status, o.order_status, o.is_free_shipping, o.shipping_charge, o.estimated_delivery,
+           o.razorpay_order_id, o.razorpay_subscription_id,
+           o.subscription_status, o.next_billing_date, o.created_at,
+           o.parent_package_id, o.fulfillment_cycle,
+           pkg.package_number, pkg.total_cycles AS package_total_cycles,
+           pkg.next_fulfillment_date AS package_next_fulfillment_date,
+           pkg.status AS package_status
+         FROM orders o
+         LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
+         WHERE o.user_id = ?
+         ORDER BY o.created_at DESC`;
 
     const { rows: orderRows } = await query(orderQuery, [userId]);
 
@@ -1165,6 +1175,8 @@ export const getOrderTracking = async (req, res) => {
       ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
+           o.parent_package_id, o.fulfillment_cycle,
+           pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.contact_name, o.contact_email,
            ua.full_name AS ua_full_name,
            ua.phone AS ua_phone,
@@ -1184,10 +1196,13 @@ export const getOrderTracking = async (req, res) => {
          FROM orders o
          LEFT JOIN user_addresses ua ON ua.id = o.address_id AND ua.user_id = o.user_id
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
+         LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
          WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`
       : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
+           o.parent_package_id, o.fulfillment_cycle,
+           pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.customer_name AS contact_name, o.email AS contact_email,
            ua.full_name AS ua_full_name,
            ua.phone AS ua_phone,
@@ -1207,6 +1222,7 @@ export const getOrderTracking = async (req, res) => {
          FROM orders o
          LEFT JOIN user_addresses ua ON ua.id = o.address_id AND ua.user_id = o.user_id
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
+         LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
          WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`;
 
     const { rows: orderRows } = await query(orderQuery, [id, userId]);

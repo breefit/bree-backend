@@ -827,6 +827,203 @@ const ensureDeliveredAtBackfill = async () => {
   }
 };
 
+// FIX (Recurring package fulfillment): products gains an opt-in "recurring
+// package" mode, deliberately NOT reusing is_subscription/razorpay_plan_id —
+// those trigger Razorpay Plan creation in admin/productController.js and
+// mean "bill the customer repeatedly." A package is the opposite: pay once,
+// ship N times. package_duration_months is the number of fulfillment cycles
+// (kept generically named/typed as an integer count of cycles — not
+// hardcoded to 3/6/12). package_fulfillment_interval_days is the gap between
+// cycles (default 30, not hardcoded either). Both are NULL/inert for every
+// normal product. Idempotent information_schema pattern, safe on every boot.
+const ensurePackageProductColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'products'`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((c) => c.column_name));
+    const additions = [];
+
+    if (!existing.has("is_recurring_package")) {
+      additions.push(
+        "ADD COLUMN is_recurring_package TINYINT(1) NOT NULL DEFAULT 0",
+      );
+    }
+    if (!existing.has("package_duration_months")) {
+      additions.push(
+        "ADD COLUMN package_duration_months INT NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("package_fulfillment_interval_days")) {
+      additions.push(
+        "ADD COLUMN package_fulfillment_interval_days INT NOT NULL DEFAULT 30",
+      );
+    }
+
+    if (additions.length) {
+      await pool.query(`ALTER TABLE products ${additions.join(", ")}`);
+      console.log("✅ Added missing products recurring-package columns");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure products recurring-package columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
+// orders gains parent_package_id / fulfillment_cycle so a fulfillment order
+// (cycle 2+) is a completely normal `orders` row — same order_number,
+// status machine, Delhivery flow, tracking, notifications, admin/customer
+// Orders UI, and Task C's 48-hour return window (computed from THIS order's
+// own delivered_at) — just tagged with which package it belongs to and
+// which cycle it represents. Both are NULL for every non-package order.
+// The composite unique index is the hard DB-level idempotency backstop for
+// the fulfillment cron (belt-and-suspenders alongside its row lock): InnoDB
+// permits unlimited rows with NULL in a unique index, so ordinary orders
+// (parent_package_id IS NULL) never collide with each other or with this
+// constraint.
+const ensurePackageOrderColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders'`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((c) => c.column_name));
+    const additions = [];
+
+    if (!existing.has("parent_package_id")) {
+      additions.push("ADD COLUMN parent_package_id CHAR(36) NULL DEFAULT NULL");
+    }
+    if (!existing.has("fulfillment_cycle")) {
+      additions.push("ADD COLUMN fulfillment_cycle INT NULL DEFAULT NULL");
+    }
+
+    if (additions.length) {
+      await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
+      console.log("✅ Added missing orders package-fulfillment columns");
+    }
+
+    const [idx] = await pool.query(
+      `SELECT DISTINCT index_name FROM information_schema.statistics
+       WHERE table_schema = ? AND table_name = 'orders'
+         AND index_name = 'uq_orders_package_cycle'`,
+      [currentDb],
+    );
+
+    if (!idx.length) {
+      await pool.query(
+        `ALTER TABLE orders
+         ADD UNIQUE INDEX uq_orders_package_cycle (parent_package_id, fulfillment_cycle)`,
+      );
+      console.log("✅ Added orders.uq_orders_package_cycle unique index");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure orders package-fulfillment columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
+// New parent record for a multi-cycle package purchase. Deliberately a new
+// table rather than reuse of orders.is_subscription/razorpay_subscription_id
+// — those model recurring BILLING (repeated Razorpay charges via
+// renewalService.js); a package is paid once and only ever ships repeatedly.
+// origin_order_id is the checkout order itself, which doubles as cycle 1 —
+// no separate "cycle 1" order is ever created (that would ship box #1
+// twice). total_cycles / fulfillment_interval_days are snapshotted from the
+// product at purchase time so a later admin edit to the product never
+// changes an already-sold package's terms. status is 'active' | 'completed'
+// only for now — the column is a free-text VARCHAR specifically so a future
+// 'paused' / 'cancelled' state can be added later without a migration
+// (cancellation/pausing is explicitly out of scope for this implementation).
+const ensurePackagePurchasesTable = async () => {
+  try {
+    const [tables] = await pool.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = DATABASE() AND table_name = 'package_purchases'`,
+    );
+
+    if (!tables.length) {
+      await pool.query(`
+        CREATE TABLE package_purchases (
+          id                          CHAR(36)      NOT NULL PRIMARY KEY,
+          package_number              VARCHAR(30)   NULL UNIQUE,
+          user_id                     CHAR(36)      NULL,
+          product_id                  CHAR(36)      NOT NULL,
+          origin_order_id             CHAR(36)      NOT NULL UNIQUE,
+          total_cycles                INT           NOT NULL,
+          fulfillment_interval_days   INT           NOT NULL,
+          cycles_created              INT           NOT NULL DEFAULT 1,
+          next_fulfillment_date       DATETIME      NULL DEFAULT NULL,
+          status                      VARCHAR(20)   NOT NULL DEFAULT 'active',
+          created_at                  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at                  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                                     ON UPDATE CURRENT_TIMESTAMP,
+          CONSTRAINT fk_package_purchases_user
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+          CONSTRAINT fk_package_purchases_product
+            FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
+          CONSTRAINT fk_package_purchases_origin_order
+            FOREIGN KEY (origin_order_id) REFERENCES orders(id) ON DELETE CASCADE,
+          INDEX idx_package_purchases_status_next (status, next_fulfillment_date)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+      console.log("✅ Created package_purchases table");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure package_purchases table exists:",
+      err?.message || err,
+    );
+  }
+};
+
+// Same atomic-counter idiom as order_number_counter / bulk_booking_number_counter.
+const ensurePackageNumberSchema = async () => {
+  try {
+    const [tables] = await pool.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = DATABASE() AND table_name = 'package_number_counter'`,
+    );
+
+    if (!tables.length) {
+      await pool.query(`
+        CREATE TABLE package_number_counter (
+          id            TINYINT      NOT NULL PRIMARY KEY,
+          current_value INT          NOT NULL,
+          updated_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                      ON UPDATE CURRENT_TIMESTAMP
+        )
+      `);
+      console.log("✅ Created package_number_counter table");
+    }
+
+    await pool.query(
+      "INSERT IGNORE INTO package_number_counter (id, current_value) VALUES (1, 100000)",
+    );
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure package_number schema exists:",
+      err?.message || err,
+    );
+  }
+};
+
 // Run startup migrations in a fault-tolerant way: if one fails unexpectedly,
 // the remaining migrations still execute instead of the whole chain aborting.
 await ensureStockDeductedColumn().catch(console.error);
@@ -840,6 +1037,10 @@ await ensureOrderBulkColumns().catch(console.error);
 await ensureOrderShippingAddressColumns().catch(console.error);
 await ensureOrderReturnColumns().catch(console.error);
 await ensureDeliveredAtBackfill().catch(console.error);
+await ensurePackageProductColumns().catch(console.error);
+await ensurePackageOrderColumns().catch(console.error);
+await ensurePackagePurchasesTable().catch(console.error);
+await ensurePackageNumberSchema().catch(console.error);
 
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);

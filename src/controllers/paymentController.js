@@ -8,6 +8,7 @@ import { query, getClient } from "../config/database.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
+import { createPackagePurchaseFromOrder } from "../services/packageFulfillmentService.js";
 import delhiveryService from "../services/delhiveryService.js";
 import {
   safelySendWhatsApp,
@@ -1088,6 +1089,17 @@ export const verifyPayment = async (req, res) => {
     [order.id],
   );
 
+  // Recurring package detection — no-op for every normal order (only fires
+  // when the order actually contains an is_recurring_package product).
+  // Fire-and-forget: must never affect the already-successful payment
+  // response, and is itself idempotent (safe if the webhook already ran).
+  createPackagePurchaseFromOrder(order.id).catch((err) => {
+    console.error("[PACKAGE] createPackagePurchaseFromOrder failed", {
+      orderId: order.id,
+      message: err?.message || String(err),
+    });
+  });
+
   sendOrderConfirmationEmail({
     to: resolvedEmail,
     name: resolvedName,
@@ -1893,6 +1905,13 @@ export const handleWebhook = async (req, res) => {
           }
 
           emitUpdate(order.id, "paid");
+
+          createPackagePurchaseFromOrder(order.id).catch((err) => {
+            console.error("[PACKAGE] createPackagePurchaseFromOrder (webhook) failed", {
+              orderId: order.id,
+              message: err?.message || String(err),
+            });
+          });
         }
       }
       break;

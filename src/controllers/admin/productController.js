@@ -115,6 +115,17 @@ const normalizeShowRecommendations = (value) => {
   return 1;
 };
 
+// Recurring package: pay once, ship N times. Deliberately separate from
+// is_subscription (which bills the customer repeatedly via Razorpay Plans —
+// see the razorpay.plans.create() calls below). Same boolean-normalization
+// idiom as normalizeIsSubscription.
+const normalizeIsRecurringPackage = (value) => {
+  if (value === true || value === 1 || value === "true" || value === "1") {
+    return 1;
+  }
+  return 0;
+};
+
 const invalidateProductCache = () => {
   cache.delPrefix("products:");
   cache.del("home:data");
@@ -151,6 +162,8 @@ export const getProducts = async (req, res) => {
               status, is_active, is_subscription,
               journey_level, show_recommendations,
               is_free_shipping, shipping_charge, estimated_delivery,
+              is_recurring_package, package_duration_months,
+              package_fulfillment_interval_days,
               created_at
        FROM products ${where} ORDER BY display_order ASC, created_at DESC
        LIMIT ? OFFSET ?`,
@@ -196,7 +209,47 @@ export const createProduct = async (req, res) => {
     is_free_shipping,
     shipping_charge,
     estimated_delivery,
+    is_recurring_package,
+    package_duration_months,
+    package_fulfillment_interval_days,
   } = req.body;
+
+  const isSubscriptionValue = normalizeIsSubscription(is_subscription);
+  const isRecurringPackageValue = normalizeIsRecurringPackage(is_recurring_package);
+
+  if (isRecurringPackageValue === 1 && isSubscriptionValue === 1) {
+    return res.status(400).json({
+      success: false,
+      message:
+        "A product cannot be both a recurring-billing subscription and a recurring-package product — choose one.",
+    });
+  }
+
+  let packageDurationMonthsValue = null;
+  let packageIntervalDaysValue = 30;
+
+  if (isRecurringPackageValue === 1) {
+    const parsedDuration = parseInt(package_duration_months, 10);
+    if (!Number.isFinite(parsedDuration) || parsedDuration < 1) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Package duration (number of fulfillment cycles) is required and must be a positive whole number.",
+      });
+    }
+    packageDurationMonthsValue = parsedDuration;
+
+    if (package_fulfillment_interval_days !== undefined) {
+      const parsedInterval = parseInt(package_fulfillment_interval_days, 10);
+      if (!Number.isFinite(parsedInterval) || parsedInterval < 1) {
+        return res.status(400).json({
+          success: false,
+          message: "Fulfillment interval (days) must be a positive whole number.",
+        });
+      }
+      packageIntervalDaysValue = parsedInterval;
+    }
+  }
 
   const image =
     req.file?.path ||
@@ -211,7 +264,6 @@ export const createProduct = async (req, res) => {
 
   const stockQuantity = parseInt(stockQty || 0, 10);
   const productStatus = resolveProductStatus(stockQuantity, status);
-  const isSubscriptionValue = normalizeIsSubscription(is_subscription);
   const isFreeShippingValue =
     is_free_shipping === true ||
     is_free_shipping === 1 ||
@@ -242,8 +294,9 @@ export const createProduct = async (req, res) => {
      (id, name, slug, category, description, price, mrp, quantity,
       stock_qty, image, features, popular, status, display_order,
       recommended_product_ids, is_subscription, journey_level, show_recommendations,
-      is_free_shipping, shipping_charge, estimated_delivery)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      is_free_shipping, shipping_charge, estimated_delivery,
+      is_recurring_package, package_duration_months, package_fulfillment_interval_days)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       productId,
       name,
@@ -266,6 +319,9 @@ export const createProduct = async (req, res) => {
       isFreeShippingValue ? 1 : 0,
       normalizedShippingCharge,
       normalizedEstimatedDelivery,
+      isRecurringPackageValue,
+      packageDurationMonthsValue,
+      packageIntervalDaysValue,
     ],
   );
 
@@ -340,6 +396,9 @@ export const updateProduct = async (req, res) => {
       is_free_shipping,
       shipping_charge,
       estimated_delivery,
+      is_recurring_package,
+      package_duration_months,
+      package_fulfillment_interval_days,
     } = req.body;
 
     const { rows: existingRows } = await query(
@@ -350,7 +409,10 @@ export const updateProduct = async (req, res) => {
     description,
     price,
     is_subscription,
-    razorpay_plan_id
+    razorpay_plan_id,
+    is_recurring_package,
+    package_duration_months,
+    package_fulfillment_interval_days
   FROM products
   WHERE id = ?
   LIMIT 1
@@ -425,6 +487,52 @@ export const updateProduct = async (req, res) => {
           ? 0
           : normalizeShowRecommendations(show_recommendations);
       add("show_recommendations", showRecsValue);
+    }
+
+    const effectiveIsRecurringPackage =
+      is_recurring_package !== undefined
+        ? normalizeIsRecurringPackage(is_recurring_package)
+        : Number(existingProduct.is_recurring_package);
+
+    if (effectiveIsRecurringPackage === 1 && effectiveIsSubscription === 1) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "A product cannot be both a recurring-billing subscription and a recurring-package product — choose one.",
+      });
+    }
+
+    if (is_recurring_package !== undefined) {
+      add("is_recurring_package", effectiveIsRecurringPackage);
+    }
+
+    if (effectiveIsRecurringPackage === 1) {
+      const durationSource =
+        package_duration_months !== undefined
+          ? package_duration_months
+          : existingProduct.package_duration_months;
+      const parsedDuration = parseInt(durationSource, 10);
+      if (!Number.isFinite(parsedDuration) || parsedDuration < 1) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Package duration (number of fulfillment cycles) is required and must be a positive whole number.",
+        });
+      }
+      if (package_duration_months !== undefined) {
+        add("package_duration_months", parsedDuration);
+      }
+
+      if (package_fulfillment_interval_days !== undefined) {
+        const parsedInterval = parseInt(package_fulfillment_interval_days, 10);
+        if (!Number.isFinite(parsedInterval) || parsedInterval < 1) {
+          return res.status(400).json({
+            success: false,
+            message: "Fulfillment interval (days) must be a positive whole number.",
+          });
+        }
+        add("package_fulfillment_interval_days", parsedInterval);
+      }
     }
 
     const parsedStockQty =

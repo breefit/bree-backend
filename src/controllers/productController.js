@@ -26,7 +26,10 @@ const PRODUCT_SELECT = `
   p.status,
   p.is_subscription,
   p.journey_level,
-  p.show_recommendations
+  p.show_recommendations,
+  p.is_recurring_package,
+  p.package_duration_months,
+  p.package_fulfillment_interval_days
 `;
 
 const getProductShippingColumnsAvailable = async () => {

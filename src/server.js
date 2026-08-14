@@ -5,6 +5,7 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
+import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -39,6 +40,9 @@ const startServer = async () => {
 
       // Start Delhivery tracking cron
       startShippingTrackingCron();
+
+      // Recurring package fulfillment cron (creates cycle 2+ orders)
+      startPackageFulfillmentCron();
 
       // OTP cleanup cron (runs every hour)
       cron.schedule("0 * * * *", () => {
