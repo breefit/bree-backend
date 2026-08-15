@@ -5,6 +5,7 @@ import {
   extractDelhiveryTrackingDetails,
   normalizeTrackingStatus,
   mapTrackingStatusToOrderStatus,
+  isForwardOrderStatusTransition,
 } from "../src/controllers/shippingController.js";
 import { appendStatusHistory } from "../src/models/Order.js";
 import {
@@ -65,6 +66,21 @@ export const syncShippingTracking = async () => {
         normalizeTrackingStatus(order.tracking_status) !==
         normalizedTrackingStatus;
 
+      // FIX (Delhivery shipment audit — backward-transition bug + missing
+      // delivered_at): computed once, reused for both the UPDATE and the
+      // history entry below (previously each recomputed mappedOrderStatus
+      // independently and neither applied a forward-only guard, so a stale/
+      // out-of-order Delhivery status could regress order_status backwards).
+      // isForwardOrderStatusTransition() also blocks any further automatic
+      // transition once the order is already delivered/cancelled/returned.
+      const mappedOrderStatus = orderStatusChanged
+        ? mapTrackingStatusToOrderStatus(trackingStatus)
+        : null;
+      const shouldTransitionOrderStatus =
+        Boolean(mappedOrderStatus) &&
+        mappedOrderStatus !== order.order_status &&
+        isForwardOrderStatusTransition(order.order_status, mappedOrderStatus);
+
       const updateFields = [
         "tracking_status = ?",
         "delhivery_response = ?",
@@ -87,12 +103,18 @@ export const syncShippingTracking = async () => {
         updateParams.push(parsedTracking.lastUpdate || null);
       }
 
-      if (orderStatusChanged) {
-        const mappedOrderStatus =
-          mapTrackingStatusToOrderStatus(trackingStatus);
-        if (mappedOrderStatus) {
-          updateFields.push("order_status = ?");
-          updateParams.push(mappedOrderStatus);
+      if (shouldTransitionOrderStatus) {
+        updateFields.push("order_status = ?");
+        updateParams.push(mappedOrderStatus);
+
+        // FIX (Return/Refund audit — 48-hour window): the cron is the
+        // primary automatic path an order becomes "delivered" through, but
+        // it never stamped delivered_at (only the manual /track/:awb
+        // controller endpoint did) — silently breaking the 48-hour return
+        // window for every cron-driven delivery. Mirrors the same guarded
+        // stamp trackShipment() uses.
+        if (mappedOrderStatus === "delivered") {
+          updateFields.push("delivered_at = NOW()");
         }
       }
 
@@ -103,21 +125,23 @@ export const syncShippingTracking = async () => {
         updateParams,
       );
 
-      if (orderStatusChanged) {
-        const mappedOrderStatus =
-          mapTrackingStatusToOrderStatus(trackingStatus);
-        if (mappedOrderStatus) {
-          await appendStatusHistory({
-            orderId: order.id,
-            previousStatus: order.order_status,
-            newStatus: mappedOrderStatus,
-            changedBy: null,
-            notes: `Order status auto-synced from Delhivery tracking status "${trackingStatus}" for AWB ${awb}`,
-          });
-        }
+      if (shouldTransitionOrderStatus) {
+        await appendStatusHistory({
+          orderId: order.id,
+          previousStatus: order.order_status,
+          newStatus: mappedOrderStatus,
+          changedBy: null,
+          notes: `Order status auto-synced from Delhivery tracking status "${trackingStatus}" for AWB ${awb}`,
+        });
       }
 
-      if (orderStatusChanged) {
+      // FIX (Delhivery shipment audit — backward-transition bug): gated on
+      // shouldTransitionOrderStatus (not the raw orderStatusChanged text
+      // comparison) so a stale/regressive Delhivery status that the guard
+      // above just refused to apply can never trigger a misleading
+      // "out for delivery"/"delivered" email for a transition that didn't
+      // actually happen.
+      if (shouldTransitionOrderStatus) {
         if (normalizedTrackingStatus === "out for delivery") {
           try {
             await sendOutForDeliveryEmail({

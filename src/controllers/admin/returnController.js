@@ -1551,9 +1551,8 @@ export const rejectRefund = async (req, res) => {
  * no new config.
  *
  * Idempotent across three states, using the exact same
- * lock-off-transaction-lock shape as bulk's sharePaymentLink /
- * ensureBulkRazorpayOrder fix (never hold a row lock across a third-party
- * HTTP call):
+ * lock-off-transaction-lock shape as bulk's ensureBulkRazorpayOrder (never
+ * hold a row lock across a third-party HTTP call):
  *  - refund_status === "approved"  -> creates the Razorpay refund (mode: create)
  *  - refund_status === "initiated" -> re-fetches the existing refund's
  *    status instead of creating a second one (mode: recheck) — this is what

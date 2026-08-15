@@ -438,6 +438,18 @@ const ensureBulkBookingWorkflowColumns = async () => {
       );
     }
 
+    // Magic Checkout migration: the Bulk Request form now collects a single
+    // free-text "Enquiry Address" field instead of the structured
+    // address_line1/city/state/pincode/country fields above (those stay in
+    // the schema untouched, purely for existing bookings created before this
+    // migration to keep displaying correctly). The FINAL delivery address is
+    // now collected by Razorpay Magic Checkout at payment time and written
+    // straight onto the created Order's shipping_address_* columns — never
+    // onto this row.
+    if (!existing.has("enquiry_address")) {
+      additions.push("ADD COLUMN enquiry_address TEXT NULL DEFAULT NULL");
+    }
+
     if (additions.length) {
       await pool.query(`ALTER TABLE bulk_bookings ${additions.join(", ")}`);
       console.log("✅ Added missing bulk_bookings workflow columns");
@@ -787,6 +799,79 @@ const ensureOrderReturnColumns = async () => {
   }
 };
 
+// FIX (Delhivery shipment audit): the outbound/forward shipment columns
+// read and written throughout shippingController.js (createShipment,
+// schedulePickup, trackShipment, cancelShipment) and
+// cron/shippingTrackingCron.js were never actually added to the `orders`
+// table by any migration — only the *reverse* shipment columns (returns,
+// see ensureOrderReturnColumns above) exist. Every forward-shipment query
+// referencing these columns would fail with "Unknown column" against a
+// database built from mysql-schema.sql + the ensure* chain alone. Same
+// idempotent information_schema pattern as every other ensure* helper.
+const ensureOrderShipmentColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders'`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((c) => c.column_name));
+    const additions = [];
+
+    if (!existing.has("awb_number")) {
+      additions.push("ADD COLUMN awb_number VARCHAR(255) NULL DEFAULT NULL");
+      console.log("Will add missing orders.awb_number column");
+    }
+    if (!existing.has("shipment_id")) {
+      additions.push("ADD COLUMN shipment_id VARCHAR(255) NULL DEFAULT NULL");
+    }
+    if (!existing.has("tracking_number")) {
+      additions.push(
+        "ADD COLUMN tracking_number VARCHAR(255) NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("tracking_url")) {
+      additions.push("ADD COLUMN tracking_url TEXT NULL DEFAULT NULL");
+    }
+    if (!existing.has("tracking_status")) {
+      additions.push(
+        "ADD COLUMN tracking_status VARCHAR(100) NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("courier_name")) {
+      additions.push("ADD COLUMN courier_name VARCHAR(100) NULL DEFAULT NULL");
+    }
+    if (!existing.has("shipment_created_at")) {
+      additions.push(
+        "ADD COLUMN shipment_created_at DATETIME NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("delhivery_response")) {
+      additions.push("ADD COLUMN delhivery_response LONGTEXT NULL DEFAULT NULL");
+    }
+    if (!existing.has("pickup_request_id")) {
+      additions.push(
+        "ADD COLUMN pickup_request_id VARCHAR(255) NULL DEFAULT NULL",
+      );
+    }
+
+    if (additions.length) {
+      await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
+      console.log("✅ Added missing orders Delhivery shipment columns");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure orders Delhivery shipment columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
 // FIX (Return/Refund audit — 48-hour window): backfills delivered_at for
 // existing delivered orders that don't have it yet, from the one reliable
 // source available: order_status_history.created_at where new_status =
@@ -1035,6 +1120,7 @@ await ensureBulkBookingNumberSchema().catch(console.error);
 await ensureBulkBookingCommunicationsTable().catch(console.error);
 await ensureOrderBulkColumns().catch(console.error);
 await ensureOrderShippingAddressColumns().catch(console.error);
+await ensureOrderShipmentColumns().catch(console.error);
 await ensureOrderReturnColumns().catch(console.error);
 await ensureDeliveredAtBackfill().catch(console.error);
 await ensurePackageProductColumns().catch(console.error);

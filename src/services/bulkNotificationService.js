@@ -22,12 +22,13 @@
 // / safelySendWhatsApp from whatsappNotificationService.js). No new HTTP
 // clients, retry logic, or logging plumbing is introduced here.
 //
-// PAYMENT FLOW NOTE: Bulk Order payment goes through Razorpay Standard
+// PAYMENT FLOW NOTE: Bulk Order payment goes through Razorpay Magic
 // Checkout, triggered by the customer clicking "Make Payment" on the quote
 // page after approving their quote. There is no admin-side "send payment
 // link" step and no separate payment-link notification — the customer
 // goes straight from the quote-ready notification to the quote page,
-// approves, and pays via the standard checkout flow themselves.
+// approves, and pays via Magic Checkout themselves (which also collects
+// their final shipping address at that point).
 //
 // NOTE: There is deliberately no "payment successful" notification here.
 // bulkOrderService.js already sends the Order Confirmation notification
@@ -188,7 +189,7 @@ export const notifyBulkInProgress = async ({ mobileNumber, contactPerson }) => {
  * QUOTED — "Quote ready": sent to the customer when admin shares a
  * quote_price + delivery_date on the booking. Links to the quote/review
  * page, where the customer approves the quote and then pays via Razorpay
- * Standard Checkout ("Make Payment") themselves — this is a quote URL,
+ * Magic Checkout ("Make Payment") themselves — this is a quote URL,
  * NOT a payment URL.
  */
 export const notifyQuoteReady = async ({

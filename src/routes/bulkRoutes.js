@@ -1,4 +1,5 @@
 import express from "express";
+import auth from "../middleware/auth.js";
 import {
   createBulkBooking,
   approveBulkQuote,
@@ -13,8 +14,12 @@ const router = express.Router();
    Customer Bulk Booking
    ========================================================================== */
 
-// Create Bulk Booking
-router.post("/", createBulkBooking);
+// Create Bulk Booking — login required (same `auth` middleware every other
+// authenticated route uses; mirrors subscriptionRouter.post("/create", auth, ...)).
+// Everything downstream of an already-created booking (quote view/approval,
+// payment, verification — reached via the booking's own id, e.g. from an
+// emailed link) stays public/unauthenticated, unchanged.
+router.post("/", auth, createBulkBooking);
 
 // FIX (audit): the quote-approval email links here (bulkNotificationService
 // .notifyQuoteReady), but nothing served it — the only pre-approval GET was

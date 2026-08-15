@@ -185,23 +185,51 @@ export const buildBulkOrderItem = (booking, quotePrice, bookingRef) => {
  * @param {string} bookingId - bulk_bookings.id
  * @param {object} [options]
  * @param {string|null} [options.changedBy] - admin id, recorded on order_status_history
+ * @param {object|null} [options.magicCheckoutAddress] - the final shipping
+ *   address collected by Razorpay Magic Checkout ({ name, mobile, line1,
+ *   line2, city, state, pincode, country }), passed in by
+ *   bulkController.verifyBulkPayment. Preferred over the booking's own
+ *   (legacy) structured address columns when present and valid.
  * @returns {Promise<{orderId: string, orderNumber: string|null, alreadyExists: boolean}>}
  */
 /**
- * FIX (Standard Checkout for Bulk Orders): resolves the address to persist
- * on the created Order. The bulk booking's own structured address
- * (address_line1/city/state/pincode/country, collected at submission time)
- * is the sole source of truth — Razorpay Standard Checkout collects no
- * address, so there is no second, checkout-confirmed candidate to prefer
- * over it (that was Magic Checkout's job; this flow doesn't use it).
+ * Resolves the address to persist on the created Order.
  *
- * Returns null (not a partial address) when the booking is missing line1,
- * city, or pincode — a partially-populated address is worse than none: it
+ * MIGRATION (Standard Checkout → Magic Checkout): the FINAL delivery
+ * address is now collected by Razorpay Magic Checkout during payment
+ * (bulkController.verifyBulkPayment fetches it and passes it in as
+ * `magicCheckoutAddress`) — that is always preferred when present and
+ * valid. The booking's own legacy structured columns
+ * (address_line1/city/state/pincode/country) are kept only as a fallback
+ * for OLD bookings created before this migration; new bookings never
+ * populate those columns (they use the single `enquiry_address` field
+ * instead, which is reference-only and never used as a shipping address).
+ *
+ * Returns null (not a partial address) when neither candidate has line1,
+ * city, and pincode — a partially-populated address is worse than none: it
  * would pass the "was an address found at all" check in
  * shippingController.js but still fail Delhivery's own field validation
  * with a less obvious error.
  */
-const resolveBookingAddress = (booking) => {
+const isUsableAddress = (addr) =>
+  Boolean(addr && addr.line1 && addr.city && addr.pincode);
+
+const resolveOrderAddress = (booking, magicCheckoutAddress) => {
+  if (isUsableAddress(magicCheckoutAddress)) {
+    return {
+      name: magicCheckoutAddress.name || booking.contact_person,
+      mobile: magicCheckoutAddress.mobile || booking.mobile_number,
+      line1: magicCheckoutAddress.line1,
+      line2: magicCheckoutAddress.line2 || null,
+      city: magicCheckoutAddress.city,
+      state: magicCheckoutAddress.state || null,
+      pincode: magicCheckoutAddress.pincode,
+      country: magicCheckoutAddress.country || "India",
+    };
+  }
+
+  // Legacy fallback — only ever populated on bookings created before the
+  // single-field Enquiry Address migration.
   if (!booking.address_line1 || !booking.city || !booking.pincode) {
     return null;
   }
@@ -232,7 +260,7 @@ const flattenAddress = (addr) => {
 
 export const createOrderFromBulkBooking = async (
   bookingId,
-  { changedBy = null } = {},
+  { changedBy = null, magicCheckoutAddress = null } = {},
 ) => {
   // ── 0. Fast idempotency pre-check (outside any transaction) ──────────────
   const { rows: preRows } = await query(
@@ -290,13 +318,17 @@ export const createOrderFromBulkBooking = async (
     orderId = randomUUID();
     orderNumber = await getNextOrderNumber(client);
 
-    // FIX (Standard Checkout for Bulk Orders): the booking's own structured
-    // address is the delivery address; booking.location is only ever used
-    // as the flattened snapshot's last resort when no structured address
-    // was collected (legacy bookings predating this field).
-    const resolvedAddress = resolveBookingAddress(booking);
+    // Magic Checkout's final shipping address is the delivery address of
+    // record; the legacy structured columns are only a fallback for
+    // bookings created before this migration. booking.enquiry_address /
+    // booking.location are last-resort text for the flattened snapshot only
+    // — never treated as a structured, shippable address.
+    const resolvedAddress = resolveOrderAddress(booking, magicCheckoutAddress);
     const shippingAddressSnapshot =
-      flattenAddress(resolvedAddress) || booking.location || null;
+      flattenAddress(resolvedAddress) ||
+      booking.enquiry_address ||
+      booking.location ||
+      null;
     const orderItem = buildBulkOrderItem(booking, quotePrice, bookingRef);
 
     // ── 1a. Insert the order row ────────────────────────────────────────────

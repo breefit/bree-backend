@@ -6,6 +6,7 @@ import {
 } from "../services/orderEmailService.js";
 import { buildDelhiveryShipmentPayload } from "../utils/delhiveryPayload.js";
 import { appendStatusHistory } from "../models/Order.js";
+import { ORDER_STATUSES } from "../constants/orderStatus.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Get warehouse configuration from environment variables
@@ -252,6 +253,36 @@ export const mapTrackingStatusToOrderStatus = (trackingStatus) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FIX (Delhivery shipment audit — backward-transition bug): Delhivery's
+// tracking API can report a stale/out-of-order status on a given poll (hub
+// re-scans, delayed propagation between their systems) — e.g. reporting
+// "In Transit" (-> "shipped") again after an earlier poll already recorded
+// "Out for delivery" (-> "out_for_delivery"). Both trackShipment() below and
+// the cron (cron/shippingTrackingCron.js) only checked "is the mapped status
+// different from the current one", not "is it FORWARD progress" — a stale
+// read like that would silently regress the order backwards in the business
+// workflow (violates the one-way pending_payment -> ... -> delivered
+// pipeline). This is the single shared guard both call sites use before
+// applying an automatic order_status transition.
+//
+// Once an order is already in a terminal state (delivered/cancelled/
+// returned), no further automatic transition is ever applied — Delhivery
+// data arriving after that point is informational only.
+const TERMINAL_ORDER_STATUSES = ["delivered", "cancelled", "returned"];
+
+export const isForwardOrderStatusTransition = (currentStatus, nextStatus) => {
+  if (TERMINAL_ORDER_STATUSES.includes(currentStatus)) return false;
+
+  const currentIndex = ORDER_STATUSES.indexOf(currentStatus);
+  const nextIndex = ORDER_STATUSES.indexOf(nextStatus);
+
+  // Unrecognized status on either side — don't block on data we can't rank.
+  if (currentIndex === -1 || nextIndex === -1) return true;
+
+  return nextIndex > currentIndex;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Robust Delhivery tracking-response parser.
 // Supports ShipmentData[0].Shipment, Shipment, data.ShipmentData,
 // packages[], data.packages[] shapes via optional chaining, and now also
@@ -378,6 +409,13 @@ export const createShipment = async (req, res) => {
     await client.query("BEGIN");
 
     // ── 1. Fetch the order ───────────────────────────────────────────────────
+    // FIX (Delhivery shipment audit — idempotency): locked with FOR UPDATE so
+    // two near-simultaneous "Create Shipment" clicks (double-click, two admin
+    // tabs) can't both read order_status = "ready_to_ship" before either
+    // commits. The second request now blocks until the first's transaction
+    // finishes, then re-reads the row and correctly sees order_status =
+    // "shipped" — hitting the existing status-guard below instead of calling
+    // Delhivery a second time.
     const { rows: orderRows } = await client.query(
       `SELECT
           id,
@@ -400,7 +438,7 @@ export const createShipment = async (req, res) => {
           total
         FROM orders
        WHERE id = ?
-       LIMIT 1`,
+       FOR UPDATE`,
       [orderId],
     );
 
@@ -838,12 +876,16 @@ export const schedulePickup = async (req, res) => {
     await client.query("BEGIN");
 
     // ── 1. Fetch the order ───────────────────────────────────────────────────
+    // FIX (Delhivery shipment audit — idempotency): FOR UPDATE, same reasoning
+    // as createShipment above — prevents two concurrent "Schedule Pickup"
+    // clicks from both reading pickup_request_id = NULL and both calling
+    // Delhivery's pickup API.
     const { rows: orderRows } = await client.query(
       `SELECT id, order_number, order_status, tracking_status,
               awb_number, shipment_id, pickup_request_id, shipment_created_at
        FROM orders
        WHERE id = ?
-       LIMIT 1`,
+       FOR UPDATE`,
       [orderId],
     );
 
@@ -1165,8 +1207,12 @@ export const trackShipment = async (req, res) => {
 
     if (trackingStatusChanged) {
       mappedOrderStatus = mapTrackingStatusToOrderStatus(trackingStatus);
+      // FIX (Delhivery shipment audit — backward-transition bug): forward-only
+      // guard — see isForwardOrderStatusTransition() above.
       shouldTransitionOrderStatus =
-        Boolean(mappedOrderStatus) && mappedOrderStatus !== order.order_status;
+        Boolean(mappedOrderStatus) &&
+        mappedOrderStatus !== order.order_status &&
+        isForwardOrderStatusTransition(order.order_status, mappedOrderStatus);
 
       const updateColumns = [
         "tracking_status = ?",

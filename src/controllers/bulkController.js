@@ -237,51 +237,32 @@ export const createBulkBooking = async (req, res) => {
       location: locationRaw,
       quantity,
       requirements: requirementsRaw,
-      addressLine1: addressLine1Raw,
-      addressLine2: addressLine2Raw,
-      city: cityRaw,
-      state: stateRaw,
-      pincode: pincodeRaw,
-      country: countryRaw,
+      address: addressRaw,
     } = req.body;
 
     const companyName = trimOrNull(companyNameRaw);
     const contactPerson = trimOrNull(contactPersonRaw);
     // `location` is kept as-is for backward compatibility (free-text,
-    // optional) — it is no longer the delivery address of record; the
-    // structured fields below are.
+    // optional) — it was never the delivery address of record.
     const location = trimOrNull(locationRaw);
     const requirements = trimOrNull(requirementsRaw);
 
-    // The delivery address is collected once, here, at submission time —
-    // it's the sole source of truth for delivery. Razorpay Standard
-    // Checkout (the bulk payment flow) never asks for it again.
-    const addressLine1 = trimOrNull(addressLine1Raw);
-    const addressLine2 = trimOrNull(addressLine2Raw);
-    const city = trimOrNull(cityRaw);
-    const state = trimOrNull(stateRaw);
-    const pincode = trimOrNull(pincodeRaw);
-    const country = trimOrNull(countryRaw) || "India";
+    // The Bulk Request form no longer collects a separate "Address" field —
+    // `location` is the only place-related input at enquiry time. The FINAL
+    // delivery address is collected later by Razorpay Magic Checkout at
+    // payment time, not here. `enquiry_address` is kept as an optional
+    // column for backward compatibility with bookings submitted by older
+    // frontend builds (or direct API callers) that still send `address`;
+    // new submissions simply leave it null.
+    // `?? null` guards against mysql2 rejecting an `undefined` bind
+    // parameter — trimOrNull() returns `undefined` (not `null`) when the
+    // input itself is `undefined`, which is exactly the case now that the
+    // frontend omits `address` entirely rather than sending an empty string.
+    const enquiryAddress = trimOrNull(addressRaw) ?? null;
 
-    if (
-      !companyName ||
-      !contactPerson ||
-      !email ||
-      !mobileNumber ||
-      !addressLine1 ||
-      !city ||
-      !state ||
-      !pincode
-    ) {
+    if (!companyName || !contactPerson || !email || !mobileNumber) {
       return res.status(400).json({
         message: "Please fill all required fields",
-      });
-    }
-
-    if (!isValidPincodeFormat(pincode)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid pincode. Must be a 6-digit PIN code.",
       });
     }
 
@@ -340,14 +321,9 @@ export const createBulkBooking = async (req, res) => {
           quantity,
           requirements,
           status,
-          address_line1,
-          address_line2,
-          city,
-          state,
-          pincode,
-          country
+          enquiry_address
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
           bookingNumber,
@@ -359,12 +335,7 @@ export const createBulkBooking = async (req, res) => {
           quantity || null,
           requirements || null,
           "new",
-          addressLine1,
-          addressLine2,
-          city,
-          state,
-          pincode,
-          country,
+          enquiryAddress,
         ],
       );
     } finally {
@@ -1104,47 +1075,29 @@ export const getBulkQuoteForApproval = async (req, res) => {
 // ==========================================================================
 
 /**
- * Admin generates a Razorpay order (Standard Checkout — a plain Razorpay
- * Order, no Magic Checkout) for the approved quote and notifies the
- * customer. The frontend uses the returned razorpay_order_id to open
- * Razorpay Checkout; the customer's browser then calls verifyBulkPayment.
- * No address is collected here or in the checkout popup — the bulk
- * booking's own delivery address (collected at submission time) is what
- * the created Order uses.
+ * Creates (or reuses) the Razorpay Order backing a bulk booking's payment,
+ * called from getBulkPaymentDetails whenever the customer's payment page
+ * loads and no Razorpay order exists for the booking yet — there is no
+ * admin-side "share payment link" step; the customer pays directly once
+ * their quote is approved.
  *
- * If a Razorpay order already exists for this booking (payment still
- * pending), it's reused instead of creating a new one — and the
- * notification isn't re-sent, to avoid spamming the customer with repeat
- * "complete your payment" messages every time admin re-opens this action.
+ * MIGRATION (Standard Checkout → Magic Checkout): this now creates the
+ * Razorpay order with `line_items` / `line_items_total` set, which is what
+ * marks the order for Magic Checkout on Razorpay's side. The frontend opens
+ * the popup with `one_click_checkout: true`, and Magic Checkout — not this
+ * booking's own address fields — collects the customer's final shipping
+ * address during payment. No address is prefilled or sent here.
  *
- * @route POST /api/admin/bulk-bookings/:id/share-payment-link
- */
-/**
- * FIX (customer payment page 400): the only way a Razorpay order ever got
- * created for a bulk booking was the admin's explicit "Send Payment Link"
- * click — getBulkPaymentDetails (the customer-facing GET the payment page
- * calls) just hard-failed with "Payment link has not been shared yet." if
- * razorpay_order_id was still null. That's exactly the 400 a customer hits
- * landing on /bulk-order/:id/pay right after approving a quote, before any
- * admin has touched it.
- *
- * This is the shared "create-the-Razorpay-order-if-one-doesn't-exist-yet"
- * logic so BOTH callers — the admin's explicit action AND the customer's
- * page load — go through the exact same Razorpay Standard Checkout
- * mechanism (a plain Razorpay Order; no Magic Checkout, no line_items — the
- * delivery address comes from the bulk booking itself, collected once at
- * submission time, not from anything Razorpay's checkout UI collects).
+ * Idempotent: if a Razorpay order already exists for this booking (payment
+ * still pending), it's reused instead of creating a new one.
  *
  * Returns `{ ok: true, booking, razorpayOrderId, created }` on success —
  * `created` is true only when THIS call is the one that made a new Razorpay
- * order (false when an existing one was reused), so callers can decide
- * whether to fire a "payment link shared" notification.
+ * order (false when an existing one was reused).
  *
  * Returns `{ ok: false, code, booking }` on a validation failure — `code` is
  * one of NOT_FOUND / READ_ONLY / INVALID_QUOTE / NOT_APPROVED / ALREADY_PAID
- * so each caller can render its own wording for the same underlying
- * condition (an admin sharing a link and a customer loading a page warrant
- * different phrasing for "you can't pay yet").
+ * so the caller can render appropriate wording.
  *
  * Throws only on an unexpected DB/Razorpay error — callers should still
  * wrap calls in their own try/catch for a 500 response.
@@ -1212,19 +1165,36 @@ const ensureBulkRazorpayOrder = async (id) => {
   if (needsRazorpayOrder) {
     const amountPaise = Math.round(Number(lockedQuotePrice) * 100);
     const razorpay = getRazorpay();
+    const bookingRef =
+      lockedBookingSnapshot.bulk_booking_number || lockedBookingSnapshot.id;
 
-    // FIX (Standard Checkout for Bulk Orders): the customer already supplies
-    // the complete delivery address at booking-submission time — there is
-    // nothing for Razorpay's checkout UI to collect, so this is a plain
-    // Razorpay Order (Standard Checkout), not Magic Checkout. No line_items
-    // / line_items_total — those only mattered for Magic Checkout's
-    // in-popup order summary and its account-wide Shipping Info webhook
-    // dependency, neither of which applies here.
+    // Magic Checkout: line_items + line_items_total on the Razorpay Order
+    // itself are what mark it as a Magic Checkout order (mirrors
+    // paymentController.createOrder's isMagicCheckout branch). A bulk
+    // booking has no real per-product line items — a single synthetic item
+    // summarizing the bulk quote is enough for the in-popup order summary.
+    const lineItems = [
+      {
+        sku: `bulk-${bookingRef}`,
+        variant_id: `bulk-${bookingRef}`,
+        name: `Bulk Order — ${bookingRef}`,
+        description: lockedBookingSnapshot.requirements
+          ? String(lockedBookingSnapshot.requirements).slice(0, 255)
+          : `Bulk Order — ${bookingRef}`,
+        image_url: "",
+        price: amountPaise,
+        offer_price: amountPaise,
+        quantity: 1,
+      },
+    ];
+
     const rzpOrder = await razorpay.orders.create({
       amount: amountPaise,
       currency: "INR",
       receipt: buildBulkReceipt(lockedBookingSnapshot),
       notes: { bulk_booking_id: id },
+      line_items: lineItems,
+      line_items_total: amountPaise,
     });
 
     // ── Phase 2 transaction: persist it, guarding against a concurrent
@@ -1541,12 +1511,48 @@ export const verifyBulkPayment = async (req, res) => {
       });
     }
 
-    // FIX (Standard Checkout for Bulk Orders): no Magic Checkout
-    // customer_details fetch here anymore — the delivery address is the one
-    // the customer already supplied at booking time
-    // (bulk_bookings.address_line1..country), which createOrderFromBulkBooking
-    // below reads directly. Razorpay's Standard Checkout collects no address
-    // at all, so there is nothing to read back from the paid Order.
+    // ── Magic Checkout: fetch the final shipping address the customer
+    // entered/selected in the popup. Mirrors paymentController.verifyPayment's
+    // razorpayCustomerDetails fetch — the success handler's response only
+    // ever carries razorpay_order_id/payment_id/signature, never the address,
+    // so it must be read back from Razorpay's own Order record. This is the
+    // FINAL delivery address; the booking's own "Enquiry Address" (collected
+    // at submission time) is never used for the Order below when this is
+    // present and valid.
+    let magicCheckoutAddress = null;
+    try {
+      const razorpay = getRazorpay();
+      const rzpOrderDetails = await razorpay.orders.fetch(razorpay_order_id);
+      const shippingAddr = rzpOrderDetails?.customer_details?.shipping_address;
+      if (
+        shippingAddr?.line1 &&
+        shippingAddr?.city &&
+        isValidPincodeFormat(shippingAddr?.zipcode)
+      ) {
+        magicCheckoutAddress = {
+          name: shippingAddr.name || booking.contact_person,
+          mobile: rzpOrderDetails?.customer_details?.contact
+            ? String(rzpOrderDetails.customer_details.contact)
+            : booking.mobile_number,
+          line1: shippingAddr.line1,
+          line2: shippingAddr.line2 || null,
+          city: shippingAddr.city,
+          state: shippingAddr.state || null,
+          pincode: shippingAddr.zipcode,
+          country: shippingAddr.country || "India",
+        };
+      } else {
+        console.warn(
+          "[BULK] Magic Checkout order had no usable shipping address",
+          { bulkBookingId: id, razorpay_order_id },
+        );
+      }
+    } catch (err) {
+      console.error(
+        "[BULK] Could not fetch Razorpay order for Magic Checkout shipping address",
+        { bulkBookingId: id, error: err?.message },
+      );
+    }
 
     // ── Transaction: mark payment paid under a row lock, guarding against
     // concurrent/duplicate verification calls and a mid-flight admin confirm.
@@ -1630,6 +1636,7 @@ export const verifyBulkPayment = async (req, res) => {
       try {
         orderResult = await createOrderFromBulkBooking(id, {
           changedBy: null,
+          magicCheckoutAddress,
         });
       } catch (orderErr) {
         console.error(
@@ -1745,15 +1752,11 @@ export const getBulkPaymentDetails = async (req, res) => {
       });
     }
 
-    // FIX (root cause of the 400 after approve-quote): a Razorpay order
-    // previously had to already exist — created only by the admin's "Send
-    // Payment Link" click — or this endpoint hard-failed with "Payment link
-    // has not been shared yet." A customer landing here right after
-    // approving their own quote, before any admin action, always hit that
-    // 400. Now creates the Razorpay order on the fly via the same
-    // race-safe, idempotent helper sharePaymentLink uses — a page
-    // refresh (or two open tabs) re-locks and finds razorpay_order_id
-    // already set, so it's reused, never duplicated.
+    // Creates the Razorpay order on the fly, race-safe and idempotent — a
+    // page refresh (or two open tabs) re-locks and finds razorpay_order_id
+    // already set, so it's reused, never duplicated. There is no admin-side
+    // step involved: the customer reaches this page directly after
+    // approving their own quote.
     let effectiveBooking = booking;
     if (!booking.razorpay_order_id) {
       let result;
@@ -1815,11 +1818,11 @@ export const getBulkPaymentDetails = async (req, res) => {
       effectiveBooking = result.booking;
     }
 
-    // FIX (Standard Checkout for Bulk Orders): the address the customer
-    // already supplied at booking time is authoritative — returned here
-    // purely for the payment page to display "delivering to:", not for
-    // Razorpay to collect/confirm (that was the Magic Checkout behavior;
-    // this is a plain Razorpay Order now).
+    // Legacy structured address, present only on bookings created before
+    // the single-field Enquiry Address migration — returned purely for
+    // display, informational only. It is never treated as the delivery
+    // address: Razorpay Magic Checkout collects the final shipping address
+    // itself, during payment (see verifyBulkPayment).
     const defaultAddress = effectiveBooking.address_line1
       ? {
           line1: effectiveBooking.address_line1,

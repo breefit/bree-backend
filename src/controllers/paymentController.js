@@ -1298,7 +1298,47 @@ export const getShippingInfo = async (req, res) => {
     lookupParams,
   );
 
-  if (!orderRows.length) {
+  let order = orderRows[0] || null;
+
+  // Magic Checkout's "Shipping Info" callback URL is configured once,
+  // account-wide, in the Razorpay Dashboard — Razorpay calls this SAME
+  // endpoint for Bulk Order payments now too (migrated from Standard
+  // Checkout), but a Bulk Booking has no `orders` row yet at payment time
+  // (that row is only created after payment succeeds — see
+  // bulkOrderService.createOrderFromBulkBooking). Fall back to
+  // bulk_bookings, keyed the same way (razorpay_order_id primarily; the
+  // bulk receipt is "bulk_<bulk_booking_number>", not the bare booking
+  // number, so the order_number-style match is best-effort only).
+  let isBulkBooking = false;
+  if (!order) {
+    const { rows: bulkRows } = await query(
+      `SELECT id, bulk_booking_number, razorpay_order_id, delivery_date
+       FROM bulk_bookings
+       WHERE razorpay_order_id = ? OR bulk_booking_number = ?
+       LIMIT 1`,
+      [razorpayOrderId || null, receiptOrderId || null],
+    );
+
+    if (bulkRows.length) {
+      const bulkBooking = bulkRows[0];
+      isBulkBooking = true;
+      // Bulk quotes are all-inclusive (no separate shipping line) — treat
+      // as free shipping for the popup's shipping-method summary.
+      order = {
+        id: bulkBooking.id,
+        shipping: 0,
+        shipping_charge: 0,
+        is_free_shipping: 1,
+        estimated_delivery: bulkBooking.delivery_date
+          ? new Date(bulkBooking.delivery_date).toLocaleDateString("en-IN")
+          : "",
+        razorpay_order_id: bulkBooking.razorpay_order_id,
+        order_number: bulkBooking.bulk_booking_number,
+      };
+    }
+  }
+
+  if (!order) {
     console.warn("[SHIPPING_INFO] Order not found", {
       receiptOrderId,
       razorpayOrderId,
@@ -1307,12 +1347,11 @@ export const getShippingInfo = async (req, res) => {
     return res.status(404).json({ message: "Order not found", addresses: [] });
   }
 
-  const order = orderRows[0];
-
   console.info("[SHIPPING_INFO] Order loaded", {
     orderId: order.id,
     razorpayOrderId: order.razorpay_order_id,
     orderNumber: order.order_number,
+    isBulkBooking,
   });
 
   const isFreeShipping =
