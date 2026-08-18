@@ -499,34 +499,52 @@ export const createOrderFromBulkBooking = async (
   // Reuses the exact same functions the order module already uses for a
   // normal checkout's order confirmation (paymentController.verifyPayment /
   // webhookController) — not new logic, just the same hand-off trigger,
-  // fired once, after commit, and never allowed to fail the request.
+  // fired once, after commit, and never allowed to fail — or *block* — the
+  // request.
+  //
+  // FIX (stuck-on-"Processing payment" bug): this used to `await` the email
+  // send and the communication-log insert (on top of the WhatsApp send,
+  // which normal orders also await). verifyBulkPayment awaits this whole
+  // function before sending its HTTP response, so all three ran serially
+  // in the request/response cycle — unlike paymentController.verifyPayment,
+  // where sendOrderConfirmationEmail (and createPackagePurchaseFromOrder)
+  // are fire-and-forget and only the single WhatsApp call is awaited. Under
+  // any real-world SMTP/Waplify slowness that combined latency could exceed
+  // the frontend's global 20s axios timeout (lib/api.js) — the browser then
+  // aborts the still-in-flight request (shows as "(cancelled)" in DevTools)
+  // while the server keeps running to completion and genuinely finishes the
+  // payment/order successfully. The customer is just never told, so the
+  // page is stuck on "Processing payment" forever even though Razorpay
+  // shows the payment captured. Making email + the comm-log insert
+  // fire-and-forget — matching the email precedent normal orders already
+  // use — brings bulk's blocking footprint down to the same single awaited
+  // WhatsApp call normal orders already rely on, so the response goes back
+  // to the browser promptly regardless of notification latency.
   // `bookingRef` is passed through as an optional field on both payloads so
   // future templates can show "BB-100001"; neither service is required to
   // read it, so this stays fully backward compatible.
   if (notificationPayload) {
-    try {
-      await sendOrderConfirmationEmail({
-        to: notificationPayload.email,
-        name: notificationPayload.name,
-        orderId: notificationPayload.orderId,
-        bookingRef: notificationPayload.bookingRef,
-        amount: notificationPayload.amount,
-        items: [
-          {
-            name: `Bulk Order (${notificationPayload.bookingRef})`,
-            quantity: 1,
-            price: notificationPayload.amount,
-          },
-        ],
-        shippingAddress: null,
-      });
-    } catch (emailErr) {
+    sendOrderConfirmationEmail({
+      to: notificationPayload.email,
+      name: notificationPayload.name,
+      orderId: notificationPayload.orderId,
+      bookingRef: notificationPayload.bookingRef,
+      amount: notificationPayload.amount,
+      items: [
+        {
+          name: `Bulk Order (${notificationPayload.bookingRef})`,
+          quantity: 1,
+          price: notificationPayload.amount,
+        },
+      ],
+      shippingAddress: null,
+    }).catch((emailErr) => {
       console.error("[BULK_ORDER] Confirmation email failed", {
         orderId: notificationPayload.orderId,
         bookingRef: notificationPayload.bookingRef,
         error: emailErr?.message,
       });
-    }
+    });
 
     await safelySendWhatsApp("bulk-order-confirmed", () =>
       sendOrderConfirmationWhatsApp({
@@ -542,13 +560,19 @@ export const createOrderFromBulkBooking = async (
 
     // FIX (audit): communication_history had no backing table before this
     // audit — see logBulkCommunication for the shared insert both this file
-    // and bulkController.js write through.
-    await logBulkCommunication(
+    // and bulkController.js write through. Fire-and-forget (see note above)
+    // — a logging failure must never delay the response.
+    logBulkCommunication(
       bookingId,
       "order_confirmation",
       "Order Confirmation Sent",
       changedBy,
-    );
+    ).catch((logErr) => {
+      console.error("[BULK_ORDER] Communication log insert failed", {
+        bookingId,
+        error: logErr?.message,
+      });
+    });
   }
 
   return { orderId, orderNumber, alreadyExists: false };
