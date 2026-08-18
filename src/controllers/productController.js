@@ -225,16 +225,20 @@ export const getHomeProducts = async (req, res) => {
       results.push(featuredRes.rows[0]);
     }
 
-    if (results.length < 2) {
-      const productSelect = await getProductSelectQuery();
-      const { rows } = await query(`
+    if (results.length < 3) {
+      const excludedIds = results.map((r) => r.id);
+      const placeholders = excludedIds.map(() => "?").join(", ");
+      const { rows } = await query(
+        `
         ${productSelect}
         WHERE p.is_active = 1
+        ${excludedIds.length ? `AND p.id NOT IN (${placeholders})` : ""}
         ORDER BY p.display_order ASC, p.created_at ASC
-        LIMIT 2
-      `);
-      cache.set(cacheKey, rows, PRODUCT_LIST_TTL);
-      return res.json(rows);
+        LIMIT ?
+      `,
+        [...excludedIds, 3 - results.length]
+      );
+      results.push(...rows);
     }
 
     cache.set(cacheKey, results, PRODUCT_LIST_TTL);
