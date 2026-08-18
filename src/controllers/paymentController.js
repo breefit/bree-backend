@@ -1306,18 +1306,44 @@ export const getShippingInfo = async (req, res) => {
   // Checkout), but a Bulk Booking has no `orders` row yet at payment time
   // (that row is only created after payment succeeds — see
   // bulkOrderService.createOrderFromBulkBooking). Fall back to
-  // bulk_bookings, keyed the same way (razorpay_order_id primarily; the
-  // bulk receipt is "bulk_<bulk_booking_number>", not the bare booking
-  // number, so the order_number-style match is best-effort only).
+  // bulk_bookings, keyed the same way — razorpay_order_id primarily.
+  //
+  // FIX (Shipping Info debugging report): the bulk_booking_number match was
+  // never reliable because the Razorpay receipt for a bulk booking is
+  // "bulk_<bulk_booking_number>" (buildBulkReceipt in bulkController.js),
+  // not the bare number — e.g. receipt "bulk_BB-100001" vs. the stored
+  // bulk_booking_number "BB-100001". If a given callback ever doesn't carry
+  // a usable razorpay_order_id, that mismatched prefix made the fallback
+  // key fail too, producing "Order not found" even though the booking
+  // existed. Strip the "bulk_" prefix off receiptOrderId before comparing
+  // it against bulk_booking_number so this key matches the way it was
+  // always intended to.
+  const normalizedBulkBookingNumber = receiptOrderId?.startsWith("bulk_")
+    ? receiptOrderId.slice(5)
+    : receiptOrderId;
+
   let isBulkBooking = false;
   if (!order) {
+    console.info("[SHIPPING_INFO] Bulk lookup", {
+      razorpayOrderId,
+      receiptOrderId,
+      normalizedBulkBookingNumber,
+    });
+
     const { rows: bulkRows } = await query(
       `SELECT id, bulk_booking_number, razorpay_order_id, delivery_date
        FROM bulk_bookings
        WHERE razorpay_order_id = ? OR bulk_booking_number = ?
        LIMIT 1`,
-      [razorpayOrderId || null, receiptOrderId || null],
+      [razorpayOrderId || null, normalizedBulkBookingNumber || null],
     );
+
+    console.info("[SHIPPING_INFO] Bulk lookup result", {
+      found: bulkRows.length > 0,
+      bookingId: bulkRows[0]?.id,
+      bulkBookingNumber: bulkRows[0]?.bulk_booking_number,
+      dbRazorpayOrderId: bulkRows[0]?.razorpay_order_id,
+    });
 
     if (bulkRows.length) {
       const bulkBooking = bulkRows[0];
