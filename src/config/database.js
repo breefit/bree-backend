@@ -450,6 +450,17 @@ const ensureBulkBookingWorkflowColumns = async () => {
       additions.push("ADD COLUMN enquiry_address TEXT NULL DEFAULT NULL");
     }
 
+    // FIX (Profile "Bulk Orders" tab): bulk_bookings was never linked to the
+    // authenticated user who submitted it — only email/mobile/company were
+    // stored. Creating a bulk booking already requires login (bulkRoutes.js:
+    // `router.post("/", auth, createBulkBooking)`), so req.user.id is always
+    // available at creation time; this column is where it gets persisted,
+    // letting the Profile page query "my bulk bookings" by user_id instead
+    // of trusting a frontend-supplied email/phone.
+    if (!existing.has("user_id")) {
+      additions.push("ADD COLUMN user_id CHAR(36) NULL DEFAULT NULL");
+    }
+
     if (additions.length) {
       await pool.query(`ALTER TABLE bulk_bookings ${additions.join(", ")}`);
       console.log("✅ Added missing bulk_bookings workflow columns");
@@ -457,6 +468,55 @@ const ensureBulkBookingWorkflowColumns = async () => {
   } catch (err) {
     console.error(
       "❌ Could not ensure bulk_bookings workflow columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
+// Index + backfill for bulk_bookings.user_id, split out from the column
+// addition above since both need the column to already exist and the index
+// needs its own idempotency check (information_schema.statistics, not
+// .columns). Backfill matches existing NULL rows to a user by email (unique
+// on users.email) so bookings made before this column existed still show up
+// under "My Bulk Orders" for the account that was logged in when they were
+// submitted.
+const ensureBulkBookingUserIdIndexAndBackfill = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [idxRows] = await pool.query(
+      `SELECT 1 FROM information_schema.statistics
+       WHERE table_schema = ? AND table_name = 'bulk_bookings'
+         AND index_name = 'idx_bulk_bookings_user_id'
+       LIMIT 1`,
+      [currentDb],
+    );
+
+    if (!idxRows.length) {
+      await pool.query(
+        "CREATE INDEX idx_bulk_bookings_user_id ON bulk_bookings(user_id)",
+      );
+      console.log("✅ Created idx_bulk_bookings_user_id index");
+    }
+
+    const [result] = await pool.query(`
+      UPDATE bulk_bookings b
+      INNER JOIN users u ON u.email = b.email
+      SET b.user_id = u.id
+      WHERE b.user_id IS NULL
+    `);
+
+    const affected = result?.affectedRows || 0;
+    if (affected > 0) {
+      console.log(
+        `✅ Backfilled user_id for ${affected} legacy bulk booking(s) by email match`,
+      );
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure bulk_bookings.user_id index/backfill:",
       err?.message || err,
     );
   }
@@ -1160,6 +1220,7 @@ await ensureOrderNumberSchema().catch(console.error);
 await ensureRenewalOrderColumns().catch(console.error);
 await ensureOrderShippingColumns().catch(console.error);
 await ensureBulkBookingWorkflowColumns().catch(console.error);
+await ensureBulkBookingUserIdIndexAndBackfill().catch(console.error);
 await ensureBulkBookingNumberSchema().catch(console.error);
 await ensureBulkBookingNumberBackfill().catch(console.error);
 await ensureBulkBookingCommunicationsTable().catch(console.error);

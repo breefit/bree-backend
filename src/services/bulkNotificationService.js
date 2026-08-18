@@ -110,6 +110,10 @@ const isTemplateConfigured = (templateName, label) => {
 //   {{3}} message       — status-specific message
 //   {{4}} details       — additional info / action / URL (optional)
 // ─────────────────────────────────────────────────────────────────────────────
+// Returns safelySendWhatsApp's { success, result|error } so callers that
+// need to know the outcome (e.g. notifyQuoteReady's per-leg logging) can
+// observe it — previously discarded, forcing callers to rely solely on the
+// generic [WhatsApp] SUCCESS/FAILED log line to know what happened.
 const notifyBulkStatusUpdate = async ({
   mobileNumber,
   contactPerson,
@@ -120,10 +124,13 @@ const notifyBulkStatusUpdate = async ({
   const templateName = process.env.WAPLIFY_TEMPLATE_BULK_UPDATE;
 
   if (!isTemplateConfigured(templateName, "bulk-status-update")) {
-    return;
+    return {
+      success: false,
+      error: new Error("WAPLIFY_TEMPLATE_BULK_UPDATE not configured"),
+    };
   }
 
-  await safelySendWhatsApp("bulk-status-update", () =>
+  return safelySendWhatsApp("bulk-status-update", () =>
     sendCustomWhatsAppNotification({
       mobile: mobileNumber,
       templateName,
@@ -200,6 +207,8 @@ export const notifyQuoteReady = async ({
   deliveryDate,
   bookingId,
 }) => {
+  console.log(`[BULK] Quote notification START | bookingId=${bookingId}`);
+
   const quoteLink = `${getFrontendUrl()}/bulk-order/${bookingId}`;
 
   try {
@@ -213,17 +222,28 @@ export const notifyQuoteReady = async ({
          <p>Review and approve your quote here: <a href="${quoteLink}">${quoteLink}</a></p>`,
       ),
     });
+    console.log(`[BULK] Quote email SUCCESS | bookingId=${bookingId}`);
   } catch (err) {
-    console.error("[BULK_NOTIFY] quote-ready email failed", err?.message);
+    console.error(
+      `[BULK] Quote email FAILED | bookingId=${bookingId} | ${err?.message}`,
+    );
   }
 
-  await notifyBulkStatusUpdate({
+  const whatsappResult = await notifyBulkStatusUpdate({
     mobileNumber,
     contactPerson,
     status: "Quote Ready",
     message: `Quote amount: ${formatINR(quotePrice)}. Estimated delivery: ${deliveryDate}.`,
     details: quoteLink,
   });
+
+  if (whatsappResult?.success) {
+    console.log(`[BULK] Quote WhatsApp SUCCESS | bookingId=${bookingId}`);
+  } else {
+    console.error(
+      `[BULK] Quote WhatsApp FAILED | bookingId=${bookingId} | ${whatsappResult?.error?.message || "unknown error"}`,
+    );
+  }
 };
 
 /**

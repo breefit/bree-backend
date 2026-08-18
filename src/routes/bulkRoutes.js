@@ -2,6 +2,7 @@ import express from "express";
 import auth from "../middleware/auth.js";
 import {
   createBulkBooking,
+  getMyBulkBookings,
   approveBulkQuote,
   getBulkQuoteForApproval,
   verifyBulkPayment,
@@ -20,6 +21,11 @@ const router = express.Router();
 // payment, verification — reached via the booking's own id, e.g. from an
 // emailed link) stays public/unauthenticated, unchanged.
 router.post("/", auth, createBulkBooking);
+
+// "My Bulk Orders" — Profile page. A static path (not :id), so it can't
+// collide with the :id-based routes below; scoped entirely by req.user.id
+// from the `auth` middleware, never by anything in the request itself.
+router.get("/mine", auth, getMyBulkBookings);
 
 // FIX (audit): the quote-approval email links here (bulkNotificationService
 // .notifyQuoteReady), but nothing served it — the only pre-approval GET was

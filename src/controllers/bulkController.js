@@ -313,6 +313,7 @@ export const createBulkBooking = async (req, res) => {
         (
           id,
           bulk_booking_number,
+          user_id,
           company_name,
           contact_person,
           email,
@@ -323,10 +324,15 @@ export const createBulkBooking = async (req, res) => {
           status,
           enquiry_address
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           bookingId,
           bookingNumber,
+          // This route is behind `auth` (bulkRoutes.js), so req.user is
+          // always populated — links the booking to the account that
+          // submitted it, so "My Bulk Orders" can query by user_id instead
+          // of trusting a frontend-supplied email/phone.
+          req.user?.id || null,
           companyName,
           contactPerson,
           normalizedEmail,
@@ -392,6 +398,50 @@ export const createBulkBooking = async (req, res) => {
 
     res.status(500).json({
       message: "Internal server error",
+    });
+  }
+};
+
+// ==========================================================================
+// GET MY BULK BOOKINGS (customer, authenticated)
+// ==========================================================================
+
+/**
+ * Bulk bookings belonging to the logged-in customer, for the Profile page's
+ * "Bulk Orders" tab. Mirrors orderController.getMyOrders's pattern exactly:
+ * ownership is scoped by req.user.id (never a frontend-supplied email/phone),
+ * enforced by the `auth` middleware on this route (bulkRoutes.js) — a user
+ * can never see another account's bookings by editing the URL, since there
+ * is no :id in this route at all, only the caller's own user_id.
+ *
+ * @route GET /api/bulk-bookings/mine
+ */
+export const getMyBulkBookings = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+
+    const { rows } = await query(
+      `SELECT
+         id,
+         bulk_booking_number,
+         company_name,
+         quantity,
+         quote_price,
+         delivery_date,
+         status,
+         created_at
+       FROM bulk_bookings
+       WHERE user_id = ?
+       ORDER BY created_at DESC`,
+      [userId],
+    );
+
+    res.status(200).json({ success: true, data: rows });
+  } catch (error) {
+    console.error("❌ Error fetching my bulk bookings:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch your bulk orders",
     });
   }
 };
@@ -650,6 +700,31 @@ export const updateBulkBooking = async (req, res) => {
       });
     }
 
+    // FIX (Quote notification audit): quote_price/delivery_date were only
+    // ever *format*-validated when present in the request body — neither
+    // was actually REQUIRED to move status to "quoted". A PUT with just
+    // { status: "quoted" } (or a stale/blank quote form) used to silently
+    // succeed: the status column flipped, the admin saw "success", but
+    // isSharingQuote below evaluated false (no valid price), so
+    // notifyQuoteReady() was never called and the customer got nothing.
+    // Reject up front instead — before any DB write — using the same
+    // "value from this request, else whatever's already on the row"
+    // pattern the rest of this handler already uses for effective values.
+    if (status === "quoted") {
+      const effectiveQuotePrice =
+        quote_price !== undefined ? quote_price : existing.quote_price;
+      const effectiveDeliveryDate =
+        delivery_date !== undefined ? delivery_date : existing.delivery_date;
+
+      if (!isValidPositiveNumber(effectiveQuotePrice) || !effectiveDeliveryDate) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Quote price and delivery date are required before marking a booking as Quoted.",
+        });
+      }
+    }
+
     // ── Special path: confirming the booking creates a normal Order ────────
     // Validation + row lock + pre-confirm field updates happen inside a
     // transaction to prevent two admins from confirming the same booking at
@@ -859,13 +934,32 @@ export const updateBulkBooking = async (req, res) => {
     }
 
     // Sharing a quote: status moves to 'quoted' with an explicit, valid,
-    // positive numeric quote price present (replaces the previous truthy
-    // check, which would have treated e.g. "0" or non-numeric strings
-    // inconsistently).
+    // positive numeric quote price present. The upfront rejection above
+    // already guarantees this is true whenever status === "quoted" reaches
+    // this point; kept as an explicit guard rather than assumed.
     const quotePriceCandidate =
       quote_price !== undefined ? quote_price : existing.quote_price;
     const isSharingQuote =
       status === "quoted" && isValidPositiveNumber(quotePriceCandidate);
+
+    // Duplicate-notification guard (requirement: don't re-notify a booking
+    // that's already quoted with the exact same price/delivery date — e.g.
+    // a double-click, a network retry, or an unrelated admin_notes edit
+    // resubmitted alongside status: "quoted"). Only a genuine first-time
+    // quote, or a real change to price/delivery date, counts as "sharing".
+    const toDateOnlyString = (value) => {
+      if (!value) return null;
+      const d = value instanceof Date ? value : new Date(value);
+      return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+    };
+    const deliveryDateCandidate =
+      delivery_date !== undefined ? delivery_date : existing.delivery_date;
+    const quoteValuesChanged =
+      existing.status !== "quoted" ||
+      Number(existing.quote_price) !== Number(quotePriceCandidate) ||
+      toDateOnlyString(existing.delivery_date) !==
+        toDateOnlyString(deliveryDateCandidate);
+    const shouldNotifyQuote = isSharingQuote && quoteValuesChanged;
 
     if (isSharingQuote) {
       updates.push("quote_shared_at = NOW()");
@@ -910,17 +1004,30 @@ export const updateBulkBooking = async (req, res) => {
     const updated = await findBulkBookingWithHistory(id);
 
     if (isSharingQuote) {
-      notifyQuoteReady({
-        email: updated.email,
-        mobileNumber: updated.mobile_number,
-        contactPerson: updated.contact_person,
-        quotePrice: updated.quote_price,
-        deliveryDate: updated.delivery_date,
-        bookingId: id,
-      }).catch((err) =>
-        console.error("[BULK] quote-ready notification failed", err?.message),
-      );
-      logBulkCommunication(id, "quote", "Quote Sent", req.admin?.id);
+      if (shouldNotifyQuote) {
+        // Only after the DB update above has already succeeded (`updated`
+        // is the freshly-persisted row). Fire-and-forget: notifyQuoteReady
+        // catches its own email/WhatsApp failures internally and never
+        // rejects, but this .catch stays as a defensive backstop.
+        notifyQuoteReady({
+          email: updated.email,
+          mobileNumber: updated.mobile_number,
+          contactPerson: updated.contact_person,
+          quotePrice: updated.quote_price,
+          deliveryDate: updated.delivery_date,
+          bookingId: id,
+        }).catch((err) =>
+          console.error("[BULK] Quote notification FAILED (unexpected)", {
+            bulkBookingId: id,
+            error: err?.message,
+          }),
+        );
+        logBulkCommunication(id, "quote", "Quote Sent", req.admin?.id);
+      } else {
+        console.log(
+          `[BULK] Quote notification SKIPPED (duplicate — price/delivery date unchanged) | bulkBookingId=${id}`,
+        );
+      }
 
       return res.status(200).json({
         success: true,
