@@ -1273,6 +1273,68 @@ const ensureBulkRazorpayOrder = async (id) => {
     phase1.release();
   }
 
+  // Frozen snapshot of what was on the row when we read it — needed below
+  // to tell a genuine concurrent write (a DIFFERENT value shows up at the
+  // phase-2 re-lock) apart from the same stale value just sitting there
+  // untouched, which must NOT be mistaken for "someone else already fixed
+  // this."
+  const originalRazorpayOrderId = razorpayOrderId;
+
+  const amountPaise = Math.round(Number(lockedQuotePrice) * 100);
+  const razorpay = getRazorpay();
+  const bookingRef =
+    lockedBookingSnapshot.bulk_booking_number || lockedBookingSnapshot.id;
+
+  // FIX (stale Razorpay order bug): a stored razorpay_order_id used to be
+  // trusted forever just because it existed — e.g. after the admin re-quotes
+  // a booking (updateBulkBooking's status:"quoted" path updates quote_price
+  // freely; nothing there touches razorpay_order_id), the stored order still
+  // has the OLD amount baked in, so Razorpay rejects a new payment attempt
+  // against it as "invalid" (input_validation_failed). Mirrors
+  // paymentController.createOrder's own existing-order reuse check
+  // (rzp.orders.fetch(...).status === "created") plus amount/currency, since
+  // Razorpay order amounts are immutable once created.
+  if (razorpayOrderId && !needsRazorpayOrder) {
+    try {
+      const rzpExisting = await razorpay.orders.fetch(razorpayOrderId);
+
+      const statusOk = rzpExisting.status === "created";
+      const amountOk = Number(rzpExisting.amount) === amountPaise;
+      const currencyOk = rzpExisting.currency === "INR";
+      const reusable = statusOk && amountOk && currencyOk;
+
+      console.info("[BULK] Existing Razorpay order validation", {
+        bulkBookingNumber: bookingRef,
+        bulkBookingId: id,
+        existingRazorpayOrderId: razorpayOrderId,
+        razorpayStatus: rzpExisting.status,
+        razorpayAmount: rzpExisting.amount,
+        razorpayCurrency: rzpExisting.currency,
+        databaseQuoteAmount: lockedQuotePrice,
+        databaseQuoteAmountPaise: amountPaise,
+        statusOk,
+        amountOk,
+        currencyOk,
+        reusable,
+      });
+
+      if (!reusable) {
+        needsRazorpayOrder = true;
+      }
+    } catch (err) {
+      console.warn(
+        "[BULK] Could not verify existing Razorpay order — creating a fresh one",
+        {
+          bulkBookingNumber: bookingRef,
+          bulkBookingId: id,
+          existingRazorpayOrderId: razorpayOrderId,
+          error: err?.message,
+        },
+      );
+      needsRazorpayOrder = true;
+    }
+  }
+
   let created = false;
 
   // The Razorpay order-create HTTP call runs with NO DB transaction open —
@@ -1280,10 +1342,6 @@ const ensureBulkRazorpayOrder = async (id) => {
   // trip blocks any other request touching this booking row for no reason.
   // The result is persisted in a short phase-2 transaction below.
   if (needsRazorpayOrder) {
-    const amountPaise = Math.round(Number(lockedQuotePrice) * 100);
-    const razorpay = getRazorpay();
-    const bookingRef =
-      lockedBookingSnapshot.bulk_booking_number || lockedBookingSnapshot.id;
 
     // Magic Checkout: line_items + line_items_total on the Razorpay Order
     // itself are what mark it as a Magic Checkout order (mirrors
@@ -1328,10 +1386,22 @@ const ensureBulkRazorpayOrder = async (id) => {
       );
       const relocked = relockedRows[0];
 
-      if (relocked?.razorpay_order_id) {
-        // Another concurrent request already wrote one first. Use theirs;
-        // ours simply goes unused on Razorpay's side (it expires untouched
-        // — no charge, no cleanup needed).
+      // FIX (stale Razorpay order bug): originally this treated ANY
+      // non-null value found here as proof a concurrent request already
+      // wrote a fresh order — true when the row started with NULL, but not
+      // anymore: we can now reach this branch specifically BECAUSE the row
+      // already had a value that we determined was stale/invalid. Without
+      // comparing against what we actually started from, this would put
+      // that same stale value straight back and silently discard the valid
+      // order we just created. Only trust `relocked` as "someone else's
+      // fresh write" if it's a DIFFERENT value from what we originally read.
+      if (
+        relocked?.razorpay_order_id &&
+        relocked.razorpay_order_id !== originalRazorpayOrderId
+      ) {
+        // Another concurrent request already wrote a fresh one first. Use
+        // theirs; ours simply goes unused on Razorpay's side (it expires
+        // untouched — no charge, no cleanup needed).
         razorpayOrderId = relocked.razorpay_order_id;
         await phase2.query("COMMIT");
       } else {
@@ -1357,6 +1427,14 @@ const ensureBulkRazorpayOrder = async (id) => {
   }
 
   const booking = await findBulkBooking(id);
+
+  console.info("[BULK] Razorpay order resolution complete", {
+    bulkBookingNumber: bookingRef,
+    bulkBookingId: id,
+    reused: !created,
+    finalRazorpayOrderId: razorpayOrderId,
+  });
+
   return { ok: true, booking, razorpayOrderId, created };
 };
 
@@ -1874,8 +1952,20 @@ export const getBulkPaymentDetails = async (req, res) => {
     // already set, so it's reused, never duplicated. There is no admin-side
     // step involved: the customer reaches this page directly after
     // approving their own quote.
+    //
+    // FIX (stale Razorpay order bug): this used to only call
+    // ensureBulkRazorpayOrder when razorpay_order_id was still NULL — once
+    // set, the stored value was returned as-is on every later page load,
+    // forever, with no re-validation. That's what let a re-quote (which
+    // changes quote_price but never touches razorpay_order_id) leave a
+    // stale, amount-mismatched Razorpay order in place, which Razorpay then
+    // rejects as invalid at payment time. Always calling
+    // ensureBulkRazorpayOrder — which now validates any existing order's
+    // status/amount/currency before reusing it — means an existing valid
+    // order is still returned unchanged (one extra cheap Razorpay read), but
+    // a stale one is transparently replaced.
     let effectiveBooking = booking;
-    if (!booking.razorpay_order_id) {
+    {
       let result;
       try {
         result = await ensureBulkRazorpayOrder(id);
