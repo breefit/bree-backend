@@ -414,16 +414,26 @@ export const getBulkBookings = async (req, res) => {
     let whereClause = "1=1";
     const params = [];
 
-    // Search in company_name, contact_person, email, mobile_number
+    // Search in bulk_booking_number (human-friendly reference), id (UUID),
+    // company_name, contact_person, email, mobile_number
     if (search) {
       whereClause += ` AND (
-        company_name LIKE ? OR 
-        contact_person LIKE ? OR 
-        email LIKE ? OR 
+        bulk_booking_number LIKE ? OR
+        id LIKE ? OR
+        company_name LIKE ? OR
+        contact_person LIKE ? OR
+        email LIKE ? OR
         mobile_number LIKE ?
       )`;
       const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      params.push(
+        searchTerm,
+        searchTerm,
+        searchTerm,
+        searchTerm,
+        searchTerm,
+        searchTerm,
+      );
     }
 
     // Get total count

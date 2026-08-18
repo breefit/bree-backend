@@ -494,6 +494,50 @@ const ensureBulkBookingNumberSchema = async () => {
   }
 };
 
+// Backfills bulk_booking_number for any bulk_bookings rows created before
+// that column existed (it's nullable, so legacy rows have NULL). Assigns
+// each one a number via the same atomic counter new bookings use, oldest
+// first, so admin/customer surfaces never show "no reference" for an old
+// booking. Idempotent — only touches rows still NULL, safe on every restart;
+// uses a single dedicated connection (like getNextBulkBookingNumber) so
+// LAST_INSERT_ID() reads back the value this same session just wrote.
+const ensureBulkBookingNumberBackfill = async () => {
+  const connection = await pool.getConnection();
+  try {
+    const [rows] = await connection.query(
+      "SELECT id FROM bulk_bookings WHERE bulk_booking_number IS NULL ORDER BY created_at ASC",
+    );
+
+    if (!rows.length) return;
+
+    for (const row of rows) {
+      await connection.query(
+        `UPDATE bulk_booking_number_counter
+         SET current_value = LAST_INSERT_ID(current_value + 1)
+         WHERE id = 1`,
+      );
+      const [[{ next_value }]] = await connection.query(
+        "SELECT LAST_INSERT_ID() AS next_value",
+      );
+      await connection.query(
+        "UPDATE bulk_bookings SET bulk_booking_number = ? WHERE id = ?",
+        [`BB-${next_value}`, row.id],
+      );
+    }
+
+    console.log(
+      `✅ Backfilled bulk_booking_number for ${rows.length} legacy bulk booking(s)`,
+    );
+  } catch (err) {
+    console.error(
+      "❌ Could not backfill bulk_bookings.bulk_booking_number:",
+      err?.message || err,
+    );
+  } finally {
+    connection.release();
+  }
+};
+
 // FIX (audit): communication_history was read by the admin UI
 // (selectedBooking.communication_history) but no table ever backed it, so
 // every notification sent (quote, payment link, confirmation, dispatch) went
@@ -1117,6 +1161,7 @@ await ensureRenewalOrderColumns().catch(console.error);
 await ensureOrderShippingColumns().catch(console.error);
 await ensureBulkBookingWorkflowColumns().catch(console.error);
 await ensureBulkBookingNumberSchema().catch(console.error);
+await ensureBulkBookingNumberBackfill().catch(console.error);
 await ensureBulkBookingCommunicationsTable().catch(console.error);
 await ensureOrderBulkColumns().catch(console.error);
 await ensureOrderShippingAddressColumns().catch(console.error);
