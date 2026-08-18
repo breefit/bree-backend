@@ -1056,15 +1056,31 @@ export const getOrderSuccess = async (req, res) => {
 export const getMyOrders = async (req, res) => {
   try {
     const userId = req.user?.id;
+    console.info("[ORDERS] Customer identity", { userId });
+
     const schemaInfo = await getOrderSchemaInfo();
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
+    // FIX (Profile → Orders missing bulk/renewal orders): the source-type
+    // columns (is_bulk_order/bulk_booking_number/company_name/
+    // is_subscription/is_renewal_order) already exist on `orders` — reused
+    // here, not introduced — so the frontend can tell a bulk order or a
+    // subscription renewal apart from a normal one instead of rendering
+    // every row identically. The WHERE clause itself (`o.user_id = ?`) is
+    // unchanged: it was never too restrictive — the real bug was that
+    // bulk-created orders had user_id written as NULL (see
+    // bulkOrderService.js's INSERT), so this exact filter correctly
+    // excluded them. Subscription/renewal orders already carry the correct
+    // user_id (copied from the original order in renewalService.js) and
+    // were never excluded by this query.
     const orderQuery = isNewOrderSchema
       ? `SELECT o.id, o.order_number, o.contact_name, o.contact_email, o.contact_phone, o.total,
            o.payment_status, o.order_status, o.is_free_shipping, o.shipping_charge, o.estimated_delivery,
            o.razorpay_order_id, o.razorpay_subscription_id,
            o.subscription_status, o.next_billing_date, o.created_at,
            o.parent_package_id, o.fulfillment_cycle,
+           o.is_bulk_order, o.bulk_booking_id, o.bulk_booking_number, o.company_name,
+           o.is_subscription, o.is_renewal_order, o.parent_order_id,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            pkg.next_fulfillment_date AS package_next_fulfillment_date,
            pkg.status AS package_status
@@ -1078,6 +1094,8 @@ export const getMyOrders = async (req, res) => {
            o.razorpay_order_id, o.razorpay_subscription_id,
            o.subscription_status, o.next_billing_date, o.created_at,
            o.parent_package_id, o.fulfillment_cycle,
+           o.is_bulk_order, o.bulk_booking_id, o.bulk_booking_number, o.company_name,
+           o.is_subscription, o.is_renewal_order, o.parent_order_id,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            pkg.next_fulfillment_date AS package_next_fulfillment_date,
            pkg.status AS package_status
@@ -1086,7 +1104,40 @@ export const getMyOrders = async (req, res) => {
          WHERE o.user_id = ?
          ORDER BY o.created_at DESC`;
 
+    console.info("[ORDERS] Query filters", {
+      userId,
+      isNewOrderSchema,
+      filter: "o.user_id = ?",
+    });
+
     const { rows: orderRows } = await query(orderQuery, [userId]);
+
+    console.info("[ORDERS] Orders found", {
+      userId,
+      count: orderRows.length,
+      bulkOrderCount: orderRows.filter((o) => o.is_bulk_order).length,
+      renewalOrderCount: orderRows.filter((o) => o.is_renewal_order).length,
+      subscriptionOrderCount: orderRows.filter((o) => o.is_subscription).length,
+    });
+
+    orderRows.forEach((o) => {
+      if (o.is_bulk_order) {
+        console.info("[ORDERS] Bulk order included", {
+          userId,
+          orderId: o.id,
+          orderNumber: o.order_number,
+          bulkBookingNumber: o.bulk_booking_number,
+        });
+      }
+      if (o.is_renewal_order) {
+        console.info("[ORDERS] Subscription renewal included", {
+          userId,
+          orderId: o.id,
+          orderNumber: o.order_number,
+          parentOrderId: o.parent_order_id,
+        });
+      }
+    });
 
     sendJson(res, 200, orderRows);
   } catch (error) {

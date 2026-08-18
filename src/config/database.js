@@ -703,6 +703,71 @@ const ensureOrderBulkColumns = async () => {
   }
 };
 
+// FIX (Profile → Orders visibility bug): backfills orders.user_id for any
+// historical bulk or subscription-renewal orders that ended up with it NULL
+// — bulk orders because bulkOrderService.js's INSERT hardcoded user_id to
+// NULL until this fix (bulk_bookings.user_id itself was only added once
+// booking creation required login), and, defensively, any renewal order
+// whose origin order was somehow missing user_id too. Both backfills use an
+// existing, proper foreign key — bulk_booking_id -> bulk_bookings.user_id,
+// and parent_order_id -> the origin order's own user_id — never an email
+// match, since a real FK relationship already exists in both cases. Only
+// touches rows still NULL; idempotent and safe to run on every restart.
+const ensureOrderUserIdBackfill = async () => {
+  try {
+    const [bulkResult] = await pool.query(`
+      UPDATE orders o
+      INNER JOIN bulk_bookings b ON b.id = o.bulk_booking_id
+      SET o.user_id = b.user_id
+      WHERE o.is_bulk_order = 1
+        AND o.user_id IS NULL
+        AND b.user_id IS NOT NULL
+    `);
+    const bulkAffected = bulkResult?.affectedRows || 0;
+    if (bulkAffected > 0) {
+      console.log(
+        `✅ Backfilled user_id for ${bulkAffected} bulk order(s) via bulk_booking_id`,
+      );
+    }
+
+    const [renewalResult] = await pool.query(`
+      UPDATE orders o
+      INNER JOIN orders origin ON origin.id = o.parent_order_id
+      SET o.user_id = origin.user_id
+      WHERE o.is_renewal_order = 1
+        AND o.user_id IS NULL
+        AND origin.user_id IS NOT NULL
+    `);
+    const renewalAffected = renewalResult?.affectedRows || 0;
+    if (renewalAffected > 0) {
+      console.log(
+        `✅ Backfilled user_id for ${renewalAffected} subscription renewal order(s) via parent_order_id`,
+      );
+    }
+
+    // Any orders still NULL after both backfills have no resolvable FK
+    // (bulk_booking_id/parent_order_id itself missing, or pointing at a row
+    // that also has no user_id) — logged for visibility, not auto-fixed.
+    // Guessing a customer via email here would risk attaching an order to
+    // the wrong account, so these are left for manual admin review.
+    const [[{ remaining }]] = await pool.query(`
+      SELECT COUNT(*) AS remaining
+      FROM orders
+      WHERE user_id IS NULL AND (is_bulk_order = 1 OR is_renewal_order = 1)
+    `);
+    if (remaining > 0) {
+      console.warn(
+        `⚠️ ${remaining} bulk/renewal order(s) still have no resolvable user_id — no proper FK to backfill from; needs manual review, not auto-migrated`,
+      );
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not backfill orders.user_id for bulk/renewal orders:",
+      err?.message || err,
+    );
+  }
+};
+
 // FIX (Magic Checkout for Bulk Orders): a structured delivery address for
 // orders that have no `address_id` and never will — bulk_bookings has no
 // user_id, and addresses.user_id is NOT NULL, so a Bulk Order can never get
@@ -1225,6 +1290,7 @@ await ensureBulkBookingNumberSchema().catch(console.error);
 await ensureBulkBookingNumberBackfill().catch(console.error);
 await ensureBulkBookingCommunicationsTable().catch(console.error);
 await ensureOrderBulkColumns().catch(console.error);
+await ensureOrderUserIdBackfill().catch(console.error);
 await ensureOrderShippingAddressColumns().catch(console.error);
 await ensureOrderShipmentColumns().catch(console.error);
 await ensureOrderReturnColumns().catch(console.error);

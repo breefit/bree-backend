@@ -358,7 +358,7 @@ export const createOrderFromBulkBooking = async (
          shipping_address_line1, shipping_address_line2,
          shipping_city, shipping_state, shipping_pincode, shipping_country
        ) VALUES (
-         ?, ?, NULL, NULL,
+         ?, ?, ?, NULL,
          ?, ?, ?,
          ?, ?, ?,
          ?, ?, ?,
@@ -372,6 +372,16 @@ export const createOrderFromBulkBooking = async (
       [
         orderId,
         orderNumber,
+        // FIX (Profile → Orders visibility bug): this was hardcoded to the
+        // literal NULL — bulk_bookings.user_id (added when bulk bookings
+        // were first linked to the account that submitted them; booking
+        // creation is already behind `auth`) was never propagated onto the
+        // order this creates. getMyOrders filters strictly by
+        // `WHERE o.user_id = ?`, so every bulk-generated order was
+        // structurally invisible to its own customer's Profile → Orders,
+        // even though it's fully visible admin-side (admin's order list has
+        // no user_id filter at all).
+        booking.user_id || null,
         booking.contact_person,
         booking.email,
         booking.mobile_number,
