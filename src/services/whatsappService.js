@@ -138,30 +138,30 @@ const logAttemptHeader = ({
   apiUrl,
   attemptNumber,
 }) => {
-  console.log("========== WAPLIFY OTP ==========");
-  console.log("Template:", templateName);
-  console.log("Phone:", maskMobile(formattedMobile));
-  console.log("API URL:", apiUrl);
-  console.log("Attempt:", attemptNumber);
+  // console.log("========== WAPLIFY OTP ==========");
+  // console.log("Template:", templateName);
+  // console.log("Phone:", maskMobile(formattedMobile));
+  // console.log("API URL:", apiUrl);
+  // console.log("Attempt:", attemptNumber);
 };
 
 const logSuccess = (response, templateName) => {
   const requestId = response.headers?.["x-request-id"] || null;
   const timestamp = response.data?.timestamp || new Date().toISOString();
 
-  console.log("Template Name:", templateName);
-  console.log("Request ID:", requestId);
-  console.log("Message ID:", response.data?.message_id);
-  console.log("Status:", response.data?.status);
-  console.log("Response Status:", response.status);
-  console.log("Timestamp:", timestamp);
+  // console.log("Template Name:", templateName);
+  // console.log("Request ID:", requestId);
+  // console.log("Message ID:", response.data?.message_id);
+  // console.log("Status:", response.data?.status);
+  // console.log("Response Status:", response.status);
+  // console.log("Timestamp:", timestamp);
 
   // Full response body is verbose - keep production logs concise.
   if (process.env.NODE_ENV !== "production") {
     console.log("Response Data:", response.data);
   }
 
-  console.log("================================");
+  // console.log("================================");
 };
 
 const logFailure = (error) => {

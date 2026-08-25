@@ -648,17 +648,17 @@ export const createShipment = async (req, res) => {
       });
     }
 
-    console.log("Warehouse Config:", {
-      name: warehouse.name,
-      address: warehouse.address,
-      city: warehouse.city,
-      state: warehouse.state,
-      pincode: warehouse.pincode,
-      phone: warehouse.phone,
-      gst: warehouse.gst,
-    });
-    console.log("Pickup Location Sent:", payload.pickup_location);
-    console.log("Seller Name Sent:", payload.shipments?.[0]?.seller_name);
+    // console.log("Warehouse Config:", {
+    //   name: warehouse.name,
+    //   address: warehouse.address,
+    //   city: warehouse.city,
+    //   state: warehouse.state,
+    //   pincode: warehouse.pincode,
+    //   phone: warehouse.phone,
+    //   gst: warehouse.gst,
+    // });
+    // console.log("Pickup Location Sent:", payload.pickup_location);
+    // console.log("Seller Name Sent:", payload.shipments?.[0]?.seller_name);
 
     // ── 5b. Log key shipment-creation context (no full PII) before calling
     //        Delhivery, to make failures like invalid-pincode traceable.
@@ -687,9 +687,9 @@ export const createShipment = async (req, res) => {
 
     // ── 6. Call Delhivery API to create shipment ─────────────────────────────
     let delhiveryResponse;
-    console.log("\n========== DELHIVERY PAYLOAD ==========\n");
-    console.log(JSON.stringify(payload, null, 2));
-    console.log("\n=======================================\n");
+    // console.log("\n========== DELHIVERY PAYLOAD ==========\n");
+    // console.log(JSON.stringify(payload, null, 2));
+    // console.log("\n=======================================\n");
     try {
       delhiveryResponse = await delhiveryService.createShipment(payload);
     } catch (error) {

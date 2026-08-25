@@ -526,17 +526,17 @@ export const sendTemplateMessage = async ({
   console.log(`[WhatsApp] START | ${templateName} | ${maskedMobile}`);
 
   if (!IS_PRODUCTION) {
-    console.log("========== WAPLIFY REQUEST ==========");
-    console.log("Template:", templateName);
-    console.log("Mobile:", maskedMobile);
-    console.log(
-      "Request URL:",
-      `${WAPLIFY_BASE_URL}${WAPLIFY_MESSAGES_ENDPOINT}`,
-    );
-    console.log(
-      "Payload:",
-      JSON.stringify({ ...payload, contact_phone: maskedMobile }, null, 2),
-    );
+    // console.log("========== WAPLIFY REQUEST ==========");
+    // console.log("Template:", templateName);
+    // console.log("Mobile:", maskedMobile);
+    // console.log(
+    //   "Request URL:",
+    //   `${WAPLIFY_BASE_URL}${WAPLIFY_MESSAGES_ENDPOINT}`,
+    // );
+    // console.log(
+    //   "Payload:",
+    //   JSON.stringify({ ...payload, contact_phone: maskedMobile }, null, 2),
+    // );
     console.log("======================================");
   }
 
@@ -555,10 +555,10 @@ export const sendTemplateMessage = async ({
       const requestId = extractRequestId(response);
 
       if (!IS_PRODUCTION) {
-        console.log("========== WAPLIFY RESPONSE ==========");
-        console.log("HTTP Status:", response.status);
-        console.log("Response Body:", JSON.stringify(response.data, null, 2));
-        console.log("=======================================");
+        // console.log("========== WAPLIFY RESPONSE ==========");
+        // console.log("HTTP Status:", response.status);
+        // console.log("Response Body:", JSON.stringify(response.data, null, 2));
+        // console.log("=======================================");
       }
 
       logNotificationSuccess(templateName, maskedMobile, templateName, {
@@ -659,8 +659,8 @@ export const sendOrderConfirmationWhatsApp = async ({
   ];
 
   if (!IS_PRODUCTION) {
-    console.log("Order UUID:", orderUuid);
-    console.log("Button Parameters:", buttonParameters);
+    // console.log("Order UUID:", orderUuid);
+    // console.log("Button Parameters:", buttonParameters);
   }
 
   return sendTemplateMessage({
@@ -1363,13 +1363,13 @@ export const validateWhatsAppConfiguration = () => {
     throw new Error(`Missing ${missingTemplateEnvVars.join(", ")}`);
   }
 
-  console.log("================================");
-  console.log("WhatsApp Configuration (Waplify)");
-  console.log("================================");
-  console.log("Base URL:", WAPLIFY_BASE_URL);
-  console.log("API Key:", WAPLIFY_API_KEY ? "**** (configured)" : "MISSING");
-  console.log("All WhatsApp templates configured.");
-  console.log("================================");
+  // console.log("================================");
+  // console.log("WhatsApp Configuration (Waplify)");
+  // console.log("================================");
+  // console.log("Base URL:", WAPLIFY_BASE_URL);
+  // console.log("API Key:", WAPLIFY_API_KEY ? "**** (configured)" : "MISSING");
+  // console.log("All WhatsApp templates configured.");
+  // console.log("================================");
 
   return true;
 };

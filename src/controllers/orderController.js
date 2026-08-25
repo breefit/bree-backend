@@ -466,16 +466,16 @@ export const createOrder = async (req, res) => {
       tax = 0,
     } = req.body;
 
-    console.log("========== CREATE ORDER REQUEST ==========");
-    console.log({
-      addressId,
-      contactName,
-      contactEmail,
-      contactPhone,
-      userId,
-    });
-    console.log(req.body);
-    console.log("==========================================");
+    // console.log("========== CREATE ORDER REQUEST ==========");
+    // console.log({
+    //   addressId,
+    //   contactName,
+    //   contactEmail,
+    //   contactPhone,
+    //   userId,
+    // });
+    // console.log(req.body);
+    // console.log("==========================================");
 
     const cart =
       Array.isArray(items) && items.length

@@ -209,10 +209,10 @@ export const buildDelhiveryShipmentPayload = ({
     },
   };
 
-  console.log(
-    "\n========== DELHIVERY PAYLOAD ==========\n",
-    JSON.stringify(payload, null, 2),
-  );
+  // console.log(
+  //   "\n========== DELHIVERY PAYLOAD ==========\n",
+  //   JSON.stringify(payload, null, 2),
+  // );
 
   return payload;
 };

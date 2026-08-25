@@ -28,9 +28,7 @@ const client = axios.create({
 // createShipment(). Only method + URL are logged for traceability.
 client.interceptors.request.use(
   (config) => {
-    console.log(
-      `[Delhivery] --> ${config.method?.toUpperCase()} ${config.baseURL}${config.url}`,
-    );
+    c
     return config;
   },
   (error) => {
@@ -235,12 +233,12 @@ class DelhiveryService {
   async requestPickup(data) {
     // Safe logging: only non-sensitive scheduling metadata is logged.
     // Never log customer names, addresses, phone numbers, or other PII.
-    console.log("[Delhivery] requestPickup() called with safe metadata:", {
-      pickup_location: data?.pickup_location,
-      expected_package_count: data?.expected_package_count,
-      pickup_date: data?.pickup_date,
-      pickup_time: data?.pickup_time,
-    });
+    // console.log("[Delhivery] requestPickup() called with safe metadata:", {
+    //   pickup_location: data?.pickup_location,
+    //   expected_package_count: data?.expected_package_count,
+    //   pickup_date: data?.pickup_date,
+    //   pickup_time: data?.pickup_time,
+    // });
 
     const validationError = this.validatePickupPayload(data);
     if (validationError) {
@@ -257,7 +255,7 @@ class DelhiveryService {
         throw new Error("Empty response received from Delhivery.");
       }
 
-      console.log("[Delhivery] requestPickup() succeeded:", response.data);
+      // console.log("[Delhivery] requestPickup() succeeded:", response.data);
 
       return response.data;
     } catch (error) {

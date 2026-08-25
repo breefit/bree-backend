@@ -670,17 +670,17 @@ export const createReverseShipment = async (req, res) => {
       });
     }
 
-    console.log("Warehouse Config:", {
-      name: originAsWarehouse.name,
-      address: originAsWarehouse.address,
-      city: originAsWarehouse.city,
-      state: originAsWarehouse.state,
-      pincode: originAsWarehouse.pincode,
-      phone: originAsWarehouse.phone,
-      gst: originAsWarehouse.gst,
-    });
-    console.log("Pickup Location Sent:", payload.pickup_location);
-    console.log("Seller Name Sent:", payload.shipments?.[0]?.seller_name);
+    // console.log("Warehouse Config:", {
+    //   name: originAsWarehouse.name,
+    //   address: originAsWarehouse.address,
+    //   city: originAsWarehouse.city,
+    //   state: originAsWarehouse.state,
+    //   pincode: originAsWarehouse.pincode,
+    //   phone: originAsWarehouse.phone,
+    //   gst: originAsWarehouse.gst,
+    // });
+    // console.log("Pickup Location Sent:", payload.pickup_location);
+    // console.log("Seller Name Sent:", payload.shipments?.[0]?.seller_name);
 
     let delhiveryResponse;
     try {

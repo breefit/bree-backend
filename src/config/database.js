@@ -167,7 +167,7 @@ const ensureStockDeductedColumn = async () => {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN stock_deducted TINYINT(1) NOT NULL DEFAULT 0",
       );
-      console.log("✅ Added orders.stock_deducted column");
+      // console.log("✅ Added orders.stock_deducted column");
     }
   } catch (err) {
     console.error(
@@ -197,7 +197,7 @@ const ensureOrderNumberSchema = async () => {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN order_number VARCHAR(30) NULL UNIQUE",
       );
-      console.log("✅ Added orders.order_number column");
+      // console.log("✅ Added orders.order_number column");
     }
 
     const [tables] = await pool.query(
@@ -215,7 +215,7 @@ const ensureOrderNumberSchema = async () => {
                                       ON UPDATE CURRENT_TIMESTAMP
         )
       `);
-      console.log("✅ Created order_number_counter table");
+      // console.log("✅ Created order_number_counter table");
     }
 
     await pool.query(
@@ -260,14 +260,14 @@ const ensureRenewalOrderColumns = async () => {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN is_renewal_order TINYINT(1) NOT NULL DEFAULT 0",
       );
-      console.log("✅ Added orders.is_renewal_order column");
+      // console.log("✅ Added orders.is_renewal_order column");
     }
 
     if (!existing.has("parent_order_id")) {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN parent_order_id VARCHAR(36) NULL DEFAULT NULL",
       );
-      console.log("✅ Added orders.parent_order_id column");
+      // console.log("✅ Added orders.parent_order_id column");
     }
   } catch (err) {
     console.error(
@@ -326,7 +326,7 @@ const ensureOrderShippingColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
-      console.log("✅ Added missing orders shipping/totals columns");
+      // console.log("✅ Added missing orders shipping/totals columns");
     }
   } catch (err) {
     console.error(
@@ -463,7 +463,7 @@ const ensureBulkBookingWorkflowColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE bulk_bookings ${additions.join(", ")}`);
-      console.log("✅ Added missing bulk_bookings workflow columns");
+      // console.log("✅ Added missing bulk_bookings workflow columns");
     }
   } catch (err) {
     console.error(
@@ -498,7 +498,7 @@ const ensureBulkBookingUserIdIndexAndBackfill = async () => {
       await pool.query(
         "CREATE INDEX idx_bulk_bookings_user_id ON bulk_bookings(user_id)",
       );
-      console.log("✅ Created idx_bulk_bookings_user_id index");
+      // console.log("✅ Created idx_bulk_bookings_user_id index");
     }
 
     const [result] = await pool.query(`
@@ -540,7 +540,7 @@ const ensureBulkBookingNumberSchema = async () => {
                                       ON UPDATE CURRENT_TIMESTAMP
         )
       `);
-      console.log("✅ Created bulk_booking_number_counter table");
+      // console.log("✅ Created bulk_booking_number_counter table");
     }
 
     await pool.query(
@@ -621,7 +621,7 @@ const ensureBulkBookingCommunicationsTable = async () => {
           INDEX idx_bulk_booking_communications_booking (bulk_booking_id)
         )
       `);
-      console.log("✅ Created bulk_booking_communications table");
+      // console.log("✅ Created bulk_booking_communications table");
     }
   } catch (err) {
     console.error(
@@ -665,35 +665,35 @@ const ensureOrderBulkColumns = async () => {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN is_bulk_order TINYINT(1) NOT NULL DEFAULT 0",
       );
-      console.log("✅ Added orders.is_bulk_order column");
+      // console.log("✅ Added orders.is_bulk_order column");
     }
 
     if (!existing.has("bulk_booking_id")) {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN bulk_booking_id CHAR(36) NULL DEFAULT NULL",
       );
-      console.log("✅ Added orders.bulk_booking_id column");
+      // console.log("✅ Added orders.bulk_booking_id column");
     }
 
     if (!existing.has("bulk_booking_number")) {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN bulk_booking_number VARCHAR(30) NULL DEFAULT NULL",
       );
-      console.log("✅ Added orders.bulk_booking_number column");
+      // console.log("✅ Added orders.bulk_booking_number column");
     }
 
     if (!existing.has("company_name")) {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN company_name VARCHAR(255) NULL DEFAULT NULL",
       );
-      console.log("✅ Added orders.company_name column");
+      // console.log("✅ Added orders.company_name column");
     }
 
     if (!existing.has("contact_person")) {
       await pool.query(
         "ALTER TABLE orders ADD COLUMN contact_person VARCHAR(255) NULL DEFAULT NULL",
       );
-      console.log("✅ Added orders.contact_person column");
+      // console.log("✅ Added orders.contact_person column");
     }
   } catch (err) {
     console.error(
@@ -835,7 +835,7 @@ const ensureOrderShippingAddressColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
-      console.log("✅ Added missing orders shipping-address columns");
+      // console.log("✅ Added missing orders shipping-address columns");
     }
   } catch (err) {
     console.error(
@@ -872,7 +872,7 @@ const ensureOrderReturnColumns = async () => {
     // for how existing rows get this populated from order_status_history.
     if (!existing.has("delivered_at")) {
       additions.push("ADD COLUMN delivered_at DATETIME NULL DEFAULT NULL");
-      console.log("Will add missing orders.delivered_at column");
+      // console.log("Will add missing orders.delivered_at column");
     }
 
     // Return side: return_status values are approved / rejected /
@@ -882,7 +882,7 @@ const ensureOrderReturnColumns = async () => {
     // existed on the backend).
     if (!existing.has("return_status")) {
       additions.push("ADD COLUMN return_status VARCHAR(30) NULL DEFAULT NULL");
-      console.log("Will add missing orders.return_status column");
+      // console.log("Will add missing orders.return_status column");
     }
     if (!existing.has("return_reason")) {
       additions.push("ADD COLUMN return_reason TEXT NULL DEFAULT NULL");
@@ -930,7 +930,7 @@ const ensureOrderReturnColumns = async () => {
       additions.push(
         "ADD COLUMN inspection_status VARCHAR(30) NULL DEFAULT NULL",
       );
-      console.log("Will add missing orders.inspection_status column");
+      // console.log("Will add missing orders.inspection_status column");
     }
 
     // Refund side: refund_status values are approved / initiated /
@@ -938,7 +938,7 @@ const ensureOrderReturnColumns = async () => {
     // refund id once a real refund is created (see completeRefund).
     if (!existing.has("refund_status")) {
       additions.push("ADD COLUMN refund_status VARCHAR(30) NULL DEFAULT NULL");
-      console.log("Will add missing orders.refund_status column");
+      // console.log("Will add missing orders.refund_status column");
     }
     if (!existing.has("refund_amount")) {
       additions.push(
@@ -958,7 +958,7 @@ const ensureOrderReturnColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
-      console.log("✅ Added missing orders return/refund columns");
+      // console.log("✅ Added missing orders return/refund columns");
     }
   } catch (err) {
     console.error(
@@ -994,7 +994,7 @@ const ensureOrderShipmentColumns = async () => {
 
     if (!existing.has("awb_number")) {
       additions.push("ADD COLUMN awb_number VARCHAR(255) NULL DEFAULT NULL");
-      console.log("Will add missing orders.awb_number column");
+      // console.log("Will add missing orders.awb_number column");
     }
     if (!existing.has("shipment_id")) {
       additions.push("ADD COLUMN shipment_id VARCHAR(255) NULL DEFAULT NULL");
@@ -1031,7 +1031,7 @@ const ensureOrderShipmentColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
-      console.log("✅ Added missing orders Delhivery shipment columns");
+      // console.log("✅ Added missing orders Delhivery shipment columns");
     }
   } catch (err) {
     console.error(
@@ -1123,7 +1123,7 @@ const ensurePackageProductColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE products ${additions.join(", ")}`);
-      console.log("✅ Added missing products recurring-package columns");
+      // console.log("✅ Added missing products recurring-package columns");
     }
   } catch (err) {
     console.error(
@@ -1168,7 +1168,7 @@ const ensurePackageOrderColumns = async () => {
 
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
-      console.log("✅ Added missing orders package-fulfillment columns");
+      // console.log("✅ Added missing orders package-fulfillment columns");
     }
 
     const [idx] = await pool.query(
@@ -1183,7 +1183,7 @@ const ensurePackageOrderColumns = async () => {
         `ALTER TABLE orders
          ADD UNIQUE INDEX uq_orders_package_cycle (parent_package_id, fulfillment_cycle)`,
       );
-      console.log("✅ Added orders.uq_orders_package_cycle unique index");
+      // console.log("✅ Added orders.uq_orders_package_cycle unique index");
     }
   } catch (err) {
     console.error(
@@ -1237,7 +1237,7 @@ const ensurePackagePurchasesTable = async () => {
           INDEX idx_package_purchases_status_next (status, next_fulfillment_date)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
       `);
-      console.log("✅ Created package_purchases table");
+      // console.log("✅ Created package_purchases table");
     }
   } catch (err) {
     console.error(
@@ -1264,7 +1264,7 @@ const ensurePackageNumberSchema = async () => {
                                       ON UPDATE CURRENT_TIMESTAMP
         )
       `);
-      console.log("✅ Created package_number_counter table");
+      // console.log("✅ Created package_number_counter table");
     }
 
     await pool.query(
