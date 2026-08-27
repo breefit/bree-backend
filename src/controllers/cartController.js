@@ -18,7 +18,7 @@ export const validateCart = async (req, res) => {
       const clientPrice = Number(it.price ?? it.unit_price ?? 0);
 
       const { rows } = await query(
-        `SELECT id, name, image, price AS price, stock_qty, is_active, status,
+        `SELECT id, name, image, price AS price, is_active,
                 is_free_shipping, shipping_charge, estimated_delivery
          FROM products
          WHERE id = ?
@@ -37,8 +37,7 @@ export const validateCart = async (req, res) => {
       }
 
       const p = rows[0];
-      const available = !!p.is_active && p.status === "In Stock";
-      const stock = Number(p.stock_qty ?? 0);
+      const available = !!p.is_active;
       const currentPrice = Number(p.price ?? 0);
       const isFreeShipping =
         p.is_free_shipping === true ||
@@ -53,23 +52,18 @@ export const validateCart = async (req, res) => {
         String(p.estimated_delivery || "").trim() || null;
 
       const priceChanged = Math.abs(currentPrice - clientPrice) > 0.009;
-      const outOfStock = !available;
-      const insufficientStock = stock < requestedQty;
 
-      if (priceChanged || outOfStock || insufficientStock) anyChange = true;
+      if (priceChanged) anyChange = true;
 
       results.push({
         id: productId,
         name: p.name,
         image: p.image || null,
         available,
-        stock,
         requestedQty,
         currentPrice,
         clientPrice,
         priceChanged,
-        outOfStock,
-        insufficientStock,
         is_free_shipping: isFreeShipping,
         shipping_charge: shippingCharge,
         estimated_delivery: estimatedDelivery,

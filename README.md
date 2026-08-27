@@ -72,27 +72,27 @@ This is the backend API/server for **BREE Wellness**, a Direct-to-Consumer welln
 
 Versions below are taken directly from `package.json`. Node.js is an **ES Module** project (`"type": "module"`).
 
-| Package | Version | Purpose |
-|---|---|---|
-| `express` | ^5.1.0 | HTTP server / routing |
-| `mysql2` | ^3.4.4 | MySQL driver (`mysql2/promise`, connection pool) |
-| `jsonwebtoken` | ^9.0.2 | Customer + admin JWT signing/verification |
-| `bcryptjs` | ^3.0.3 | Password/OTP hashing |
-| `razorpay` | ^2.9.6 | Razorpay Orders/Payments/Subscriptions/Refunds SDK |
-| `firebase-admin` | ^11.11.1 | Verifying Google Sign-In ID tokens server-side |
-| `cloudinary` + `multer-storage-cloudinary` + `multer` | ^1.41.3 / ^4.0.0 / ^2.0.0 | Product image upload and storage |
-| `nodemailer` | ^6.9.9 | SMTP email sending |
-| `axios` | ^1.6.2 | Outbound HTTP calls (Delhivery, Waplify WhatsApp API) |
-| `node-cron` | ^4.6.0 | Scheduled jobs (package fulfillment, shipment tracking sync, OTP cleanup) |
-| `socket.io` | ^4.8.3 | Real-time `order:updated` / `product:*` events to the frontend |
-| `helmet` | ^7.1.0 | HTTP security headers |
-| `cors` | ^2.8.5 | Cross-origin request handling |
-| `cookie-parser` | ^1.4.7 | Reading/writing auth cookies |
-| `express-rate-limit` | ^7.1.5 | Rate limiting (general API, auth, admin login, payment) |
-| `express-validator` | ^7.0.1 | Request body validation (auth routes) |
-| `morgan` | ^1.10.0 | HTTP request logging |
-| `dotenv` | ^17.4.2 | `.env` loading |
-| `nodemon` (dev) | ^3.1.10 | Auto-restart in development |
+| Package                                               | Version                   | Purpose                                                                   |
+| ----------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------- |
+| `express`                                             | ^5.1.0                    | HTTP server / routing                                                     |
+| `mysql2`                                              | ^3.4.4                    | MySQL driver (`mysql2/promise`, connection pool)                          |
+| `jsonwebtoken`                                        | ^9.0.2                    | Customer + admin JWT signing/verification                                 |
+| `bcryptjs`                                            | ^3.0.3                    | Password/OTP hashing                                                      |
+| `razorpay`                                            | ^2.9.6                    | Razorpay Orders/Payments/Subscriptions/Refunds SDK                        |
+| `firebase-admin`                                      | ^11.11.1                  | Verifying Google Sign-In ID tokens server-side                            |
+| `cloudinary` + `multer-storage-cloudinary` + `multer` | ^1.41.3 / ^4.0.0 / ^2.0.0 | Product image upload and storage                                          |
+| `nodemailer`                                          | ^6.9.9                    | SMTP email sending                                                        |
+| `axios`                                               | ^1.6.2                    | Outbound HTTP calls (Delhivery, Waplify WhatsApp API)                     |
+| `node-cron`                                           | ^4.6.0                    | Scheduled jobs (package fulfillment, shipment tracking sync, OTP cleanup) |
+| `socket.io`                                           | ^4.8.3                    | Real-time `order:updated` / `product:*` events to the frontend            |
+| `helmet`                                              | ^7.1.0                    | HTTP security headers                                                     |
+| `cors`                                                | ^2.8.5                    | Cross-origin request handling                                             |
+| `cookie-parser`                                       | ^1.4.7                    | Reading/writing auth cookies                                              |
+| `express-rate-limit`                                  | ^7.1.5                    | Rate limiting (general API, auth, admin login, payment)                   |
+| `express-validator`                                   | ^7.0.1                    | Request body validation (auth routes)                                     |
+| `morgan`                                              | ^1.10.0                   | HTTP request logging                                                      |
+| `dotenv`                                              | ^17.4.2                   | `.env` loading                                                            |
+| `nodemon` (dev)                                       | ^3.1.10                   | Auto-restart in development                                               |
 
 **WhatsApp**: there is no dedicated WhatsApp SDK — outbound messages are sent via `axios` HTTP calls to the **Waplify** API. A Meta WhatsApp Cloud API webhook receiver also exists (`/api/webhooks/meta`) for inbound Meta events, and a narrow Meta-based OTP sender (`whatsappService.js`) exists alongside it — see [§25](#25-notifications) for how these fit together.
 
@@ -289,7 +289,7 @@ ADMIN_PASSWORD=YOUR_VALUE_HERE
   - `otp_verifications` — mobile OTP records (`mobile`, `otp_hash`, `expires_at`, `attempts`, `verified`).
   - `refresh_tokens` — customer session refresh tokens (via `authService.js`).
   - `admins` — admin accounts (`id`, `email`, `name`, hashed password).
-  - `products` — includes `is_subscription`, `razorpay_plan_id`, `is_recurring_package`, `package_duration_months`, `package_fulfillment_interval_days`, plus shipping/pricing/stock fields.
+  - `products` — includes subscription/package configuration plus shipping and pricing fields.
   - `orders` — the central order table; includes payment/Razorpay fields, `is_bulk_order`/`bulk_booking_id`, `is_subscription`/`is_renewal_order`/`parent_order_id`/`subscription_status`/`next_billing_date`, package-fulfillment fields (`parent_package_id`, `fulfillment_cycle`), shipping/Delhivery fields (`awb_number`, `tracking_status`, etc.), and the full return/refund column set (see [§21](#21-return-system)).
   - `order_items`, `order_status_history`, `payments` — order line items, status audit trail, and payment records.
   - `order_number_counter` — atomic counter backing human-readable order numbers (e.g. `#BREE-100001`).
@@ -355,109 +355,109 @@ Grouped by area. **Auth** column reflects the actual middleware on each route. O
 
 ### Auth (`/api/auth`, `routes/auth.js`)
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/auth/send-otp` | Public | Send a mobile OTP via WhatsApp |
-| POST | `/api/auth/verify-otp` | Public | Verify OTP; logs in existing users, flags new users for profile completion |
-| POST | `/api/auth/resend-otp` | Public | Resend OTP (rate-limited via cooldown) |
-| POST | `/api/auth/complete-profile` | Public (requires a prior verified OTP record) | Create a new user after OTP verification |
-| POST | `/api/auth/google` | Public | Google Sign-In via Firebase ID token |
-| PATCH | `/api/auth/change-password` | Required | Change password (email/password accounts) |
-| GET | `/api/auth/verify` | Public (cookie/token optional — returns 401 if session invalid) | Verify/refresh the current session |
-| GET | `/api/auth/me` | Required | Get the current authenticated user |
-| POST | `/api/auth/logout` | Public | Revoke refresh token(s) and clear auth cookies |
+| Method | Path                         | Auth                                                            | Purpose                                                                    |
+| ------ | ---------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| POST   | `/api/auth/send-otp`         | Public                                                          | Send a mobile OTP via WhatsApp                                             |
+| POST   | `/api/auth/verify-otp`       | Public                                                          | Verify OTP; logs in existing users, flags new users for profile completion |
+| POST   | `/api/auth/resend-otp`       | Public                                                          | Resend OTP (rate-limited via cooldown)                                     |
+| POST   | `/api/auth/complete-profile` | Public (requires a prior verified OTP record)                   | Create a new user after OTP verification                                   |
+| POST   | `/api/auth/google`           | Public                                                          | Google Sign-In via Firebase ID token                                       |
+| PATCH  | `/api/auth/change-password`  | Required                                                        | Change password (email/password accounts)                                  |
+| GET    | `/api/auth/verify`           | Public (cookie/token optional — returns 401 if session invalid) | Verify/refresh the current session                                         |
+| GET    | `/api/auth/me`               | Required                                                        | Get the current authenticated user                                         |
+| POST   | `/api/auth/logout`           | Public                                                          | Revoke refresh token(s) and clear auth cookies                             |
 
 ### Users / Profile / Addresses
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/api/profile` | Required | Get current user's profile |
-| PUT | `/api/profile` | Required | Update profile |
-| PUT | `/api/profile/password` | Required | Change password |
-| GET | `/api/addresses` | Required | List saved addresses |
-| POST | `/api/addresses` | Required | Add an address |
-| PUT | `/api/addresses/:id` | Required | Update an address |
-| DELETE | `/api/addresses/:id` | Required | Delete an address |
-| PUT | `/api/addresses/:id/default` | Required | Set default address |
+| Method | Path                         | Auth     | Purpose                    |
+| ------ | ---------------------------- | -------- | -------------------------- |
+| GET    | `/api/profile`               | Required | Get current user's profile |
+| PUT    | `/api/profile`               | Required | Update profile             |
+| PUT    | `/api/profile/password`      | Required | Change password            |
+| GET    | `/api/addresses`             | Required | List saved addresses       |
+| POST   | `/api/addresses`             | Required | Add an address             |
+| PUT    | `/api/addresses/:id`         | Required | Update an address          |
+| DELETE | `/api/addresses/:id`         | Required | Delete an address          |
+| PUT    | `/api/addresses/:id/default` | Required | Set default address        |
 
 ### Products
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/api/products` | Public | List products |
-| GET | `/api/products/home` | Public | Home-page product selection |
-| GET | `/api/products/:id` | Public | Product detail |
-| GET | `/api/products/:id/recommendations` | Public | Related-product recommendations |
+| Method | Path                                | Auth   | Purpose                         |
+| ------ | ----------------------------------- | ------ | ------------------------------- |
+| GET    | `/api/products`                     | Public | List products                   |
+| GET    | `/api/products/home`                | Public | Home-page product selection     |
+| GET    | `/api/products/:id`                 | Public | Product detail                  |
+| GET    | `/api/products/:id/recommendations` | Public | Related-product recommendations |
 
 ### Orders / Checkout
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/api/orders` | Required | List the current user's orders |
-| GET | `/api/orders/:id` | Optional | Get an order (guest orders supported via `user_id IS NULL`) |
-| GET | `/api/orders/:id/success` | Required | Post-payment order summary |
-| GET | `/api/orders/:id/tracking` | Required | Order + shipment tracking detail |
-| GET | `/api/orders/:id/history` | Required | Order status history |
-| POST | `/api/orders/validate-cart` | Optional | Re-validate cart prices/stock/availability before checkout |
-| POST | `/api/orders/create` | Required | (Order-creation entry used by `orderController`) |
-| PUT | `/api/orders/:id/payment-status` | Required | Update payment status |
+| Method | Path                             | Auth     | Purpose                                                                 |
+| ------ | -------------------------------- | -------- | ----------------------------------------------------------------------- |
+| GET    | `/api/orders`                    | Required | List the current user's orders                                          |
+| GET    | `/api/orders/:id`                | Optional | Get an order (guest orders supported via `user_id IS NULL`)             |
+| GET    | `/api/orders/:id/success`        | Required | Post-payment order summary                                              |
+| GET    | `/api/orders/:id/tracking`       | Required | Order + shipment tracking detail                                        |
+| GET    | `/api/orders/:id/history`        | Required | Order status history                                                    |
+| POST   | `/api/orders/validate-cart`      | Optional | Re-validate cart prices and active-product availability before checkout |
+| POST   | `/api/orders/create`             | Required | (Order-creation entry used by `orderController`)                        |
+| PUT    | `/api/orders/:id/payment-status` | Required | Update payment status                                                   |
 
 ### Payments
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/payment/create-order` | Optional | Create a Razorpay Order (Standard or Magic Checkout, based on `line_items`) |
-| POST | `/api/payment/verify` | Optional | Verify a completed Razorpay payment and finalize the order |
-| POST | `/api/payment/webhook` | Public (Razorpay signature-verified) | Razorpay async event webhook (`payment.captured`, `subscription.charged`, etc.) |
-| POST | `/api/payment/shipping-info` | Optional | Razorpay Magic Checkout's shipping-methods/serviceability callback |
-| GET | `/api/payment/status/:paymentId` | Optional | Payment status lookup |
-| POST | `/api/payment/promotions` | Optional | Available promotions for an order |
-| POST | `/api/payment/apply-promotions` | Optional | Apply a promotion code |
+| Method | Path                             | Auth                                 | Purpose                                                                         |
+| ------ | -------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------- |
+| POST   | `/api/payment/create-order`      | Optional                             | Create a Razorpay Order (Standard or Magic Checkout, based on `line_items`)     |
+| POST   | `/api/payment/verify`            | Optional                             | Verify a completed Razorpay payment and finalize the order                      |
+| POST   | `/api/payment/webhook`           | Public (Razorpay signature-verified) | Razorpay async event webhook (`payment.captured`, `subscription.charged`, etc.) |
+| POST   | `/api/payment/shipping-info`     | Optional                             | Razorpay Magic Checkout's shipping-methods/serviceability callback              |
+| GET    | `/api/payment/status/:paymentId` | Optional                             | Payment status lookup                                                           |
+| POST   | `/api/payment/promotions`        | Optional                             | Available promotions for an order                                               |
+| POST   | `/api/payment/apply-promotions`  | Optional                             | Apply a promotion code                                                          |
 
 ### Subscriptions
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/subscriptions/create` | **Required** | Create a subscription (Razorpay `subscription_id`) |
-| GET | `/api/subscriptions/my` | Required | List the current user's subscriptions |
-| POST | `/api/subscriptions/:id/pause` | Required | Pause a subscription |
-| POST | `/api/subscriptions/:id/resume` | Required | Resume a subscription |
-| POST | `/api/subscriptions/:id/cancel` | Required | Request cancellation (effective at cycle end) |
+| Method | Path                            | Auth         | Purpose                                            |
+| ------ | ------------------------------- | ------------ | -------------------------------------------------- |
+| POST   | `/api/subscriptions/create`     | **Required** | Create a subscription (Razorpay `subscription_id`) |
+| GET    | `/api/subscriptions/my`         | Required     | List the current user's subscriptions              |
+| POST   | `/api/subscriptions/:id/pause`  | Required     | Pause a subscription                               |
+| POST   | `/api/subscriptions/:id/resume` | Required     | Resume a subscription                              |
+| POST   | `/api/subscriptions/:id/cancel` | Required     | Request cancellation (effective at cycle end)      |
 
 ### Bulk Orders (`/api/bulk-bookings`, `routes/bulkRoutes.js`)
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/bulk-bookings` | **Required** | Submit a Bulk Order enquiry (Enquiry Address only) |
-| GET | `/api/bulk-bookings/:id/quote` | Public | Fetch a shared quote for approval |
-| POST | `/api/bulk-bookings/:id/approve-quote` | Public | Approve the quote |
-| GET | `/api/bulk-bookings/:id/payment` | Public | Get/prepare Razorpay Magic Checkout payment details |
-| POST | `/api/bulk-bookings/:id/verify-payment` | Public | Verify Bulk Order payment and trigger Order creation |
+| Method | Path                                    | Auth         | Purpose                                              |
+| ------ | --------------------------------------- | ------------ | ---------------------------------------------------- |
+| POST   | `/api/bulk-bookings`                    | **Required** | Submit a Bulk Order enquiry (Enquiry Address only)   |
+| GET    | `/api/bulk-bookings/:id/quote`          | Public       | Fetch a shared quote for approval                    |
+| POST   | `/api/bulk-bookings/:id/approve-quote`  | Public       | Approve the quote                                    |
+| GET    | `/api/bulk-bookings/:id/payment`        | Public       | Get/prepare Razorpay Magic Checkout payment details  |
+| POST   | `/api/bulk-bookings/:id/verify-payment` | Public       | Verify Bulk Order payment and trigger Order creation |
 
 ### Shipping / Tracking (`/api/shipping`, `routes/shippingRoutes.js`)
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/shipping/create-shipment/:orderId` | Admin | Create a Delhivery shipment (`ready_to_ship` → `shipped`) |
-| POST | `/api/shipping/pickup/:orderId` | Admin | Schedule a Delhivery pickup |
-| GET | `/api/shipping/track/:awb` | Admin | Fetch live tracking status by AWB |
-| POST | `/api/shipping/cancel/:orderId` | Admin | Cancel a shipment |
-| GET | `/api/shipping/label/:awb` | Admin | Download the shipping label (PDF) |
+| Method | Path                                     | Auth  | Purpose                                                   |
+| ------ | ---------------------------------------- | ----- | --------------------------------------------------------- |
+| POST   | `/api/shipping/create-shipment/:orderId` | Admin | Create a Delhivery shipment (`ready_to_ship` → `shipped`) |
+| POST   | `/api/shipping/pickup/:orderId`          | Admin | Schedule a Delhivery pickup                               |
+| GET    | `/api/shipping/track/:awb`               | Admin | Fetch live tracking status by AWB                         |
+| POST   | `/api/shipping/cancel/:orderId`          | Admin | Cancel a shipment                                         |
+| GET    | `/api/shipping/label/:awb`               | Admin | Download the shipping label (PDF)                         |
 
 ### Webhooks (`/api/webhooks`, `routes/webhookRoutes.js` — distinct from the Razorpay webhook above)
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| GET | `/api/webhooks/meta` | Public (verify-token challenge) | Meta WhatsApp Cloud API webhook verification handshake |
-| POST | `/api/webhooks/meta` | Public (Meta-originated) | Receive Meta WhatsApp Cloud API events |
+| Method | Path                 | Auth                            | Purpose                                                |
+| ------ | -------------------- | ------------------------------- | ------------------------------------------------------ |
+| GET    | `/api/webhooks/meta` | Public (verify-token challenge) | Meta WhatsApp Cloud API webhook verification handshake |
+| POST   | `/api/webhooks/meta` | Public (Meta-originated)        | Receive Meta WhatsApp Cloud API events                 |
 
 ### Contact / Testimonials
 
-| Method | Path | Auth | Purpose |
-|---|---|---|---|
-| POST | `/api/contact` | Public | Submit a contact inquiry |
-| GET | `/api/testimonials` | Public | List approved testimonials |
-| POST | `/api/testimonials` | Optional | Submit a testimonial |
+| Method | Path                | Auth     | Purpose                    |
+| ------ | ------------------- | -------- | -------------------------- |
+| POST   | `/api/contact`      | Public   | Submit a contact inquiry   |
+| GET    | `/api/testimonials` | Public   | List approved testimonials |
+| POST   | `/api/testimonials` | Optional | Submit a testimonial       |
 
 ### Admin (`/api/admin`, all behind `adminAuth` except `/login`) — see full detail in [§26](#26-admin-api)
 
@@ -474,8 +474,6 @@ Admin (`productController.js` under `/api/admin/products`, all `adminAuth`):
 - `PUT /api/admin/products/:id` — update; recreates the Razorpay plan if subscription is newly enabled or its price changes.
 - `DELETE /api/admin/products/:id` — **soft delete** (`is_active = 0`), with a best-effort Cloudinary image cleanup.
 - `GET/POST /api/admin/products/:id/relations`, `DELETE /api/admin/products/:id/relations/:relId` — related-product management (recommend/upsell/alternative).
-
-**Stock**: `stock_qty`, checked and decremented at payment verification/webhook time (row-locked, see [§28](#28-transactions--data-safety)).
 
 **Pricing**: `price` (selling), `mrp`; discount is computed by the frontend, not stored server-side.
 
@@ -497,13 +495,13 @@ Product → Cart (client-side) → validate-cart → Checkout
   → Razorpay Checkout (popup)
   → POST /api/payment/verify          (signature verified, payment fetched & amount-checked, order finalized)
        OR Razorpay webhook: POST /api/payment/webhook, event "payment.captured"
-  → Order marked payment_status='paid', order_status='paid'; stock deducted (idempotent, guarded by a stock_deducted flag)
+  → Order marked payment_status='paid', order_status='paid'
   → Admin transitions order_status forward (processing → ready_to_ship → shipped → ...)
   → Delhivery shipment created → tracked → delivered
 ```
 
-- **Razorpay order creation** (`paymentController.createOrder`): validates cart items/stock/price server-side (never trusts the frontend total beyond a small tolerance check), reuses a still-valid pending Razorpay order for the same user/amount within the last 30 minutes instead of creating a duplicate, and includes `line_items`/`line_items_total` in the Razorpay Orders API call when the request supplies Magic-Checkout-style `line_items` — this is what makes Razorpay treat the order as Magic Checkout.
-- **Payment verification** (`paymentController.verifyPayment`): HMAC signature check (`verifyPaymentSignature`) → fetches the payment from Razorpay directly (amount cross-check for non-subscription orders) → resolves the final address (Magic Checkout's `customer_details.shipping_address` when present, else the submitted `shippingAddress`) → finalizes the order and payment rows inside a row-locked transaction → deducts stock exactly once (guarded by a `stock_deducted` flag on the order) → fires order-confirmation email/WhatsApp and (fire-and-forget) recurring-package creation.
+- **Razorpay order creation** (`paymentController.createOrder`): validates cart items and price server-side (never trusts the frontend total beyond a small tolerance check), reuses a still-valid pending Razorpay order for the same user/amount within the last 30 minutes instead of creating a duplicate, and includes `line_items`/`line_items_total` in the Razorpay Orders API call when the request supplies Magic-Checkout-style `line_items` — this is what makes Razorpay treat the order as Magic Checkout.
+- **Payment verification** (`paymentController.verifyPayment`): HMAC signature check (`verifyPaymentSignature`) → fetches the payment from Razorpay directly (amount cross-check for non-subscription orders) → resolves the final address (Magic Checkout's `customer_details.shipping_address` when present, else the submitted `shippingAddress`) → finalizes the order and payment rows inside a row-locked transaction → fires order-confirmation email/WhatsApp and (fire-and-forget) recurring-package creation.
 - **Webhook handling** (`paymentController.handleWebhook`, mounted at `POST /api/payment/webhook` with the **raw** request body preserved specifically for signature verification): verifies `verifyWebhookSignature` against `RAZORPAY_WEBHOOK_SECRET`, then handles `payment.captured` (row-locked, idempotent — returns `already_processed` if the order is already paid), `payment.failed`, and the subscription lifecycle events (`subscription.activated`, `subscription.charged`, `subscription.paused`, `subscription.resumed`, `subscription.halted`, `subscription.cancelled`).
 - **Idempotency**: both the client-verify path and the webhook path check `payment_status`/`razorpay_payment_id` under a row lock before writing, so a payment can never be double-processed regardless of which path (or both, racing) reaches the server first.
 - Payment success is **never** determined by the frontend alone — both `verifyPayment` and the webhook independently re-verify against Razorpay's own records before marking anything paid.
@@ -514,14 +512,14 @@ Product → Cart (client-side) → validate-cart → Checkout
 
 A **single shared Razorpay client** (`config/razorpay.js`, `getRazorpay()` — lazily instantiated singleton from `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`) is used everywhere Razorpay is called — there is no second client instantiated anywhere in the codebase.
 
-| Concern | Where implemented |
-|---|---|
-| Order creation | `paymentController.createOrder` (normal/subscription-checkout cart) and `bulkController`'s `ensureBulkRazorpayOrder` (Bulk Orders) |
-| Payment verification | `paymentController.verifyPayment` (normal/subscription) and `bulkController.verifyBulkPayment` (Bulk Orders) — both reuse `utils/razorpay.js`'s `verifyPaymentSignature` |
-| Signature verification | `utils/razorpay.js` — `verifyPaymentSignature` (payment/order HMAC) and `verifyWebhookSignature` (webhook HMAC, raw body) |
-| Webhook handling | `paymentController.handleWebhook`, `POST /api/payment/webhook` |
-| Subscriptions | `subscriptionController.createSubscription` (creates the Razorpay subscription) and `admin/subscriptionAdminController.js` (pause/resume/cancel via `razorpay.subscriptions.*`) |
-| Refunds | `admin/returnController.completeRefund` (`razorpay.payments.refund` / `razorpay.refunds.fetch`) — see [§24](#24-razorpay-refunds) |
+| Concern                | Where implemented                                                                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Order creation         | `paymentController.createOrder` (normal/subscription-checkout cart) and `bulkController`'s `ensureBulkRazorpayOrder` (Bulk Orders)                                              |
+| Payment verification   | `paymentController.verifyPayment` (normal/subscription) and `bulkController.verifyBulkPayment` (Bulk Orders) — both reuse `utils/razorpay.js`'s `verifyPaymentSignature`        |
+| Signature verification | `utils/razorpay.js` — `verifyPaymentSignature` (payment/order HMAC) and `verifyWebhookSignature` (webhook HMAC, raw body)                                                       |
+| Webhook handling       | `paymentController.handleWebhook`, `POST /api/payment/webhook`                                                                                                                  |
+| Subscriptions          | `subscriptionController.createSubscription` (creates the Razorpay subscription) and `admin/subscriptionAdminController.js` (pause/resume/cancel via `razorpay.subscriptions.*`) |
+| Refunds                | `admin/returnController.completeRefund` (`razorpay.payments.refund` / `razorpay.refunds.fetch`) — see [§24](#24-razorpay-refunds)                                               |
 
 Distinguishing the four payment surfaces in this codebase:
 
@@ -588,9 +586,9 @@ No Razorpay secrets are logged or exposed by any of the above — only the publi
 
 (`subscriptionController.js`, `routes/index.js` → `subscriptionRouter`)
 
-- **Creation** (`POST /api/subscriptions/create`, **`auth` required**): validates the request shape (items, customer name/email/mobile, shipping address), row-locks and validates the referenced product(s) (`stock_qty`, `is_active`, `status = 'In Stock'`), computes the server-side total (never trusts a client-supplied price), and creates a Razorpay Subscription against the product's `razorpay_plan_id`.
+- **Creation** (`POST /api/subscriptions/create`, **`auth` required**): validates the request shape (items, customer name/email/mobile, shipping address), validates the referenced active product(s), computes the server-side total (never trusts a client-supplied price), and creates a Razorpay Subscription against the product's `razorpay_plan_id`.
 - **Authentication requirement**: enforced by the `auth` middleware on the route; the controller reads the purchaser's identity from `req.user.id` — a client cannot create a subscription for another user by supplying a different id in the body.
-- **Product validation**: subscription creation is rejected (400) for missing/invalid items, a product that's inactive/out of stock/not found, or insufficient stock.
+- **Product validation**: subscription creation is rejected (400) for missing/invalid items, or a product that's inactive/not found.
 - **Price / frequency**: price is the product's own price (server-fetched, not client-supplied); frequency is passed through to Razorpay's subscription/plan configuration.
 - **Status values observed**: `pending`, `active`, `authenticated`, `paused`, `cancelled`, `cancellation_requested`, `created` (`SUBSCRIPTION_STATUS` constants in `subscriptionController.js`).
 - **Cancellation**: modeled as `cancel_at_cycle_end` on Razorpay (`subscriptions.cancel({ cancel_at_cycle_end: 1 })`, admin-triggered from `admin/subscriptionAdminController.js`) — the local `subscription_status` is set to `cancellation_requested` immediately and only becomes `cancelled` once Razorpay's webhook confirms the cycle actually ended; `order_status` is never touched by this transition.
@@ -617,16 +615,16 @@ The number of cycles (`package_duration_months`) and the interval between shipme
 
 Key fields:
 
-| Field | Location | Meaning |
-|---|---|---|
-| `origin_order_id` | `package_purchases` | The Cycle‑1 order (unique) |
-| `total_cycles` | `package_purchases` | Total shipments owed |
-| `fulfillment_interval_days` | `package_purchases` | Days between shipments |
-| `cycles_created` | `package_purchases` | How many cycles exist so far (including Cycle 1) |
-| `next_fulfillment_date` | `package_purchases` | When the next cycle is due; `NULL` once completed |
-| `status` | `package_purchases` | `active` or `completed` |
-| `parent_package_id` | `orders` | Links a fulfillment order back to its package |
-| `fulfillment_cycle` | `orders` | Which cycle number this order represents |
+| Field                       | Location            | Meaning                                           |
+| --------------------------- | ------------------- | ------------------------------------------------- |
+| `origin_order_id`           | `package_purchases` | The Cycle‑1 order (unique)                        |
+| `total_cycles`              | `package_purchases` | Total shipments owed                              |
+| `fulfillment_interval_days` | `package_purchases` | Days between shipments                            |
+| `cycles_created`            | `package_purchases` | How many cycles exist so far (including Cycle 1)  |
+| `next_fulfillment_date`     | `package_purchases` | When the next cycle is due; `NULL` once completed |
+| `status`                    | `package_purchases` | `active` or `completed`                           |
+| `parent_package_id`         | `orders`            | Links a fulfillment order back to its package     |
+| `fulfillment_cycle`         | `orders`            | Which cycle number this order represents          |
 
 ---
 
@@ -640,9 +638,9 @@ Key fields:
   SELECT id FROM package_purchases
   WHERE status = 'active' AND next_fulfillment_date IS NOT NULL AND next_fulfillment_date <= NOW()
   ```
-- **Cycle creation** (`fulfillNextCycle`, per package): row-locks the `package_purchases` row (`FOR UPDATE`), re-validates it's still due, copies the origin order's items into a brand-new `orders` row (`fulfillment_cycle = cycles_created + 1`), deducts stock (rolls back with `insufficient_stock` if unavailable), and advances `package_purchases` (`cycles_created`, `next_fulfillment_date`, and `status = 'completed'` once the final cycle is reached) — only after the new order commits successfully.
+- **Cycle creation** (`fulfillNextCycle`, per package): row-locks the `package_purchases` row (`FOR UPDATE`), re-validates it's still due, copies the origin order's items into a brand-new `orders` row (`fulfillment_cycle = cycles_created + 1`), and advances `package_purchases` (`cycles_created`, `next_fulfillment_date`, and `status = 'completed'` once the final cycle is reached) — only after the new order commits successfully.
 - **Notifications**: on success, fires an order-confirmation email and (best-effort) WhatsApp for the new cycle's order.
-- **Retry behavior**: if creating a cycle fails for any reason (including insufficient stock), the transaction rolls back, `package_purchases` is left untouched, and the same package is simply picked up again on the **next day's** cron run — no cycle is silently skipped or double-counted.
+- **Retry behavior**: if creating a cycle fails for any reason, the transaction rolls back, `package_purchases` is left untouched, and the same package is simply picked up again on the **next day's** cron run — no cycle is silently skipped or double-counted.
 - **Completion logic**: a package is complete once `cycles_created >= total_cycles`; `status` becomes `'completed'` and `next_fulfillment_date` is cleared, so it's permanently excluded from the due-package query.
 - A separate cron, `cron/shippingTrackingCron.js`, runs **every 30 minutes** (`*/30 * * * *`) to sync live Delhivery tracking status for all orders with an AWB that aren't yet in a terminal tracking state — see [§19](#19-shipping--delhivery).
 - An inline hourly cron (`0 * * * *`, defined directly in `server.js`) runs `cleanupExpiredOtps()` to delete expired `otp_verifications` rows.
@@ -655,8 +653,8 @@ Key fields:
 - **Unique constraints**:
   - `package_purchases.origin_order_id` is **unique** — a given order can only ever originate one package.
   - `orders` has a **unique index** on `(parent_package_id, fulfillment_cycle)` (`uq_orders_package_cycle`) — a duplicate-cycle insert fails at the database level even if the application-level lock were somehow bypassed; the code catches this specific duplicate-key error and treats it as "already created by a concurrent run," not a failure.
-- **Transaction handling**: the new order + its items + stock deduction + `package_purchases` advancement all happen inside one transaction; any failure rolls back the entire cycle attempt, leaving no partial state.
-- **Cycle advancement only after success**: `cycles_created`/`next_fulfillment_date`/`status` on `package_purchases` are only updated **after** the new order's insert (and stock deduction) has committed — a failed attempt never advances the package state, so the exact same cycle is retried next run rather than being skipped.
+- **Transaction handling**: the new order + its items + `package_purchases` advancement all happen inside one transaction; any failure rolls back the entire cycle attempt, leaving no partial state.
+- **Cycle advancement only after success**: `cycles_created`/`next_fulfillment_date`/`status` on `package_purchases` are only updated **after** the new order's insert has committed — a failed attempt never advances the package state, so the exact same cycle is retried next run rather than being skipped.
 - **On fulfillment failure**: the transaction rolls back completely (no order, no stock change, no package-state change); the error is logged; the package remains `active` with its `next_fulfillment_date` unchanged, so it's picked up again on the next scheduled run. One package's failure does not affect any other package in the same cron run — each is processed and error-handled independently.
 
 ---
@@ -732,7 +730,8 @@ Server-side eligibility (`isReturnWindowOpen`, `admin/returnController.js`) is t
 
 ```js
 const RETURN_WINDOW_HOURS = 48;
-const deadline = new Date(delivered_at).getTime() + RETURN_WINDOW_HOURS * 60 * 60 * 1000;
+const deadline =
+  new Date(delivered_at).getTime() + RETURN_WINDOW_HOURS * 60 * 60 * 1000;
 ```
 
 A return is **not allowed** when:
@@ -799,17 +798,17 @@ All routes below are mounted under `/api/admin` and require `adminAuth` (a valid
 
 **Authentication**: `POST /api/admin/login` (rate-limited, 10/15min) checks email + `bcrypt.compare()` against the `admins` table, issues a JWT (`ADMIN_JWT_SECRET`) as both the `admin_auth_token` cookie and the JSON response body, `GET /api/admin/me` verifies the session, `POST /api/admin/logout` clears the cookie.
 
-| Area | Endpoints |
-|---|---|
-| **Dashboard** | `GET /dashboard` — cached aggregate stats (total orders/revenue/customers, pending orders, bulk booking count, this-month revenue, this-week orders, 5 most recent orders) |
-| **Orders** | `GET /orders` (paginated/filterable/sortable), `GET /orders/:id`, `PATCH /orders/:id/status`, `PATCH /orders/bulk-status` — status-transition validated, Delhivery-locked statuses protected, triggers email/WhatsApp/socket notifications |
-| **Returns / Inspection / Refunds** | `PATCH /orders/:orderId/return/approve|reject`, `POST /orders/:orderId/return/reverse-shipment`, `PATCH /orders/:orderId/return/schedule-pickup`, `PATCH /orders/:orderId/return/mark-returned`, `PATCH /orders/:orderId/return/inspection/approve|reject`, `PATCH /orders/:orderId/refund/approve|reject|complete` (see [§21](#21-return-system)–[§24](#24-razorpay-refunds)) |
-| **Products** | `GET /products`, `POST /products` (image upload), `PUT /products/:id`, `DELETE /products/:id` (soft delete), `GET/POST /products/:id/relations`, `DELETE /products/:id/relations/:relId` |
-| **Bulk Orders** | Registered via `controllers/admin/bulkRoutes.js` — bulk booking listing/detail/quote-setting/status management (booking creation itself is on the public/customer router, see [§12](#12-bulk-order-system)) |
-| **Subscriptions** | `GET /subscriptions`, `GET /subscriptions/:id`, `PATCH /subscriptions/:id/pause|resume|cancel`, `GET /subscriptions/analytics`, `GET /subscriptions/upcoming-renewals`, `GET /subscriptions/failed-renewals` |
-| **Customers** | `GET /customers` — paginated/searchable, with order count and total spend |
-| **Inquiries** | `GET /inquiries`, `PATCH /inquiries/:id/contacted`, `PATCH /inquiries/:id`, `DELETE /inquiries/:id` |
-| **Testimonials** | `GET /testimonials`, `PATCH /testimonials/:id/approve|reject`, `DELETE /testimonials/:id` |
+| Area                               | Endpoints                                                                                                                                                                                                                                  |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------- |
+| **Dashboard**                      | `GET /dashboard` — cached aggregate stats (total orders/revenue/customers, pending orders, bulk booking count, this-month revenue, this-week orders, 5 most recent orders)                                                                 |
+| **Orders**                         | `GET /orders` (paginated/filterable/sortable), `GET /orders/:id`, `PATCH /orders/:id/status`, `PATCH /orders/bulk-status` — status-transition validated, Delhivery-locked statuses protected, triggers email/WhatsApp/socket notifications |
+| **Returns / Inspection / Refunds** | `PATCH /orders/:orderId/return/approve                                                                                                                                                                                                     | reject`, `POST /orders/:orderId/return/reverse-shipment`, `PATCH /orders/:orderId/return/schedule-pickup`, `PATCH /orders/:orderId/return/mark-returned`, `PATCH /orders/:orderId/return/inspection/approve | reject`, `PATCH /orders/:orderId/refund/approve                                                                       | reject | complete` (see [§21](#21-return-system)–[§24](#24-razorpay-refunds)) |
+| **Products**                       | `GET /products`, `POST /products` (image upload), `PUT /products/:id`, `DELETE /products/:id` (soft delete), `GET/POST /products/:id/relations`, `DELETE /products/:id/relations/:relId`                                                   |
+| **Bulk Orders**                    | Registered via `controllers/admin/bulkRoutes.js` — bulk booking listing/detail/quote-setting/status management (booking creation itself is on the public/customer router, see [§12](#12-bulk-order-system))                                |
+| **Subscriptions**                  | `GET /subscriptions`, `GET /subscriptions/:id`, `PATCH /subscriptions/:id/pause                                                                                                                                                            | resume                                                                                                                                                                                                      | cancel`, `GET /subscriptions/analytics`, `GET /subscriptions/upcoming-renewals`, `GET /subscriptions/failed-renewals` |
+| **Customers**                      | `GET /customers` — paginated/searchable, with order count and total spend                                                                                                                                                                  |
+| **Inquiries**                      | `GET /inquiries`, `PATCH /inquiries/:id/contacted`, `PATCH /inquiries/:id`, `DELETE /inquiries/:id`                                                                                                                                        |
+| **Testimonials**                   | `GET /testimonials`, `PATCH /testimonials/:id/approve                                                                                                                                                                                      | reject`, `DELETE /testimonials/:id`                                                                                                                                                                         |
 
 Package/recurring-package information is exposed as part of the standard `GET /orders`/`GET /orders/:id` payload (`parent_package_id`, `fulfillment_cycle`, and the joined `package_purchases` fields) rather than as a separate admin endpoint.
 
@@ -819,16 +818,16 @@ Package/recurring-package information is exposed as part of the standard `GET /o
 
 Centralized in `middleware/errorHandler.js` (mounted last, after the 404 handler):
 
-| Condition | Status | Response |
-|---|---|---|
-| Multer file too large | 400 | `File too large. Maximum 5 MB allowed.` |
-| Multer invalid file type | 400 | The multer error message (JPEG/PNG/WebP only) |
-| Body-parser payload too large | 413 | Guidance to use multipart under 5 MB |
-| Invalid/expired JWT (`JsonWebTokenError`/`TokenExpiredError`) | 401 | `Invalid or expired token` |
-| MySQL duplicate key (`ER_DUP_ENTRY` / errno 1062) | 409 | `Resource already exists (duplicate value)` |
-| MySQL FK violation (`ER_NO_REFERENCED_ROW_2`/`ER_ROW_IS_REFERENCED_2` / errno 1452/1451) | 400 | `Referenced resource does not exist` |
-| Everything else | `err.status`/`err.statusCode` or 500 | The error's own message, except in production where a 500 is always generalized to `Internal server error` (never leaks internals) |
-| Unmatched route | 404 | `Route <METHOD> <path> not found` |
+| Condition                                                                                | Status                               | Response                                                                                                                           |
+| ---------------------------------------------------------------------------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Multer file too large                                                                    | 400                                  | `File too large. Maximum 5 MB allowed.`                                                                                            |
+| Multer invalid file type                                                                 | 400                                  | The multer error message (JPEG/PNG/WebP only)                                                                                      |
+| Body-parser payload too large                                                            | 413                                  | Guidance to use multipart under 5 MB                                                                                               |
+| Invalid/expired JWT (`JsonWebTokenError`/`TokenExpiredError`)                            | 401                                  | `Invalid or expired token`                                                                                                         |
+| MySQL duplicate key (`ER_DUP_ENTRY` / errno 1062)                                        | 409                                  | `Resource already exists (duplicate value)`                                                                                        |
+| MySQL FK violation (`ER_NO_REFERENCED_ROW_2`/`ER_ROW_IS_REFERENCED_2` / errno 1452/1451) | 400                                  | `Referenced resource does not exist`                                                                                               |
+| Everything else                                                                          | `err.status`/`err.statusCode` or 500 | The error's own message, except in production where a 500 is always generalized to `Internal server error` (never leaks internals) |
+| Unmatched route                                                                          | 404                                  | `Route <METHOD> <path> not found`                                                                                                  |
 
 Controllers generally use explicit `try/catch` with their own status codes for expected validation/business-rule failures (400/401/404/409), and either `next(error)` or an uncaught throw for unexpected failures, which the global handler catches. Database transaction blocks (`getClient()`-based) always `ROLLBACK` in their `catch` before re-throwing or returning an error response — no code path commits a partial transaction.
 
@@ -837,7 +836,7 @@ Controllers generally use explicit `try/catch` with their own status codes for e
 ## 28. Transactions & Data Safety
 
 - **Database transactions**: every multi-statement write that must succeed or fail atomically (order finalization, subscription renewal, bulk-order-to-order conversion, package-cycle creation, return/refund state changes) uses `getClient()` + explicit `BEGIN`/`COMMIT`/`ROLLBACK`, never the pooled `query()` helper for multi-step writes.
-- **Row locking**: `SELECT ... FOR UPDATE` is used consistently before a conditional write that must not race — order rows during payment verification/webhook, `package_purchases` rows during cycle creation, product rows during stock deduction, atomic counter rows when issuing the next order/bulk-booking/package number.
+- **Row locking**: `SELECT ... FOR UPDATE` is used consistently before a conditional write that must not race — order rows during payment verification/webhook, `package_purchases` rows during cycle creation, and atomic counter rows when issuing the next order/bulk-booking/package number.
 - **Idempotency**: enforced at multiple layers — application-level pre-checks (`payment_status`/`razorpay_payment_id` already set → short-circuit success), row locks to close the race window, and database-level unique constraints/indexes as a last-resort backstop (`package_purchases.origin_order_id`, `orders(parent_package_id, fulfillment_cycle)`).
 - **Duplicate order prevention**: both the client-side `verify` call and the server-side webhook can race to finalize the same payment — both take the row lock and both check `payment_status === 'paid'` before writing, so whichever arrives second is a no-op success, not a duplicate write.
 - **Duplicate fulfillment prevention**: see [§18](#18-package-idempotency) — the unique `(parent_package_id, fulfillment_cycle)` index is the hard backstop behind the row-lock/re-validate pattern.
@@ -850,11 +849,11 @@ Controllers generally use explicit `try/catch` with their own status codes for e
 
 All started from `src/server.js`, only after the initial `SELECT 1` database connectivity check succeeds.
 
-| File | Schedule | Purpose |
-|---|---|---|
-| `cron/packageFulfillmentCron.js` | `0 3 * * *` (daily, 3:00 AM, `Asia/Kolkata`) | Finds `package_purchases` rows due for their next cycle and creates the next fulfillment order for each (see [§17](#17-package-fulfillment-cron)) |
-| `cron/shippingTrackingCron.js` | `*/30 * * * *` (every 30 minutes) | Syncs live Delhivery tracking status for every order with an AWB not yet in a terminal tracking state; updates `tracking_status`/`order_status`, appends `order_status_history`, sends out-for-delivery/delivered emails |
-| Inline in `server.js` (`otpCleanupJob.js`) | `0 * * * *` (hourly, on the hour) | Deletes expired rows from `otp_verifications` |
+| File                                       | Schedule                                     | Purpose                                                                                                                                                                                                                  |
+| ------------------------------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cron/packageFulfillmentCron.js`           | `0 3 * * *` (daily, 3:00 AM, `Asia/Kolkata`) | Finds `package_purchases` rows due for their next cycle and creates the next fulfillment order for each (see [§17](#17-package-fulfillment-cron))                                                                        |
+| `cron/shippingTrackingCron.js`             | `*/30 * * * *` (every 30 minutes)            | Syncs live Delhivery tracking status for every order with an AWB not yet in a terminal tracking state; updates `tracking_status`/`order_status`, appends `order_status_history`, sends out-for-delivery/delivered emails |
+| Inline in `server.js` (`otpCleanupJob.js`) | `0 * * * *` (hourly, on the hour)            | Deletes expired rows from `otp_verifications`                                                                                                                                                                            |
 
 No other cron/scheduled jobs exist in the codebase.
 
@@ -910,17 +909,17 @@ There are no destructive migration commands documented or present — the only s
 
 ## 32. Third-Party Services
 
-| Service | Purpose | Required Configuration |
-|---|---|---|
-| MySQL | Primary data store | `DATABASE_URL` or `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME` |
-| Razorpay | Payments — Orders, Magic Checkout, Subscriptions, Refunds, webhooks | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET` |
-| Firebase Admin SDK | Verifying Google Sign-In ID tokens | `GOOGLE_APPLICATION_CREDENTIALS` (path to a service-account JSON file — the active code path; see [§7](#7-authentication)) |
-| Cloudinary | Product image storage/CDN | `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `CLOUDINARY_UPLOAD_FOLDER` |
-| SMTP (Nodemailer) | Transactional email | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` |
-| Waplify | WhatsApp notifications (order/bulk/subscription/return/OTP) | `WAPLIFY_BASE_URL`, `WAPLIFY_API_KEY`, `WAPLIFY_TEMPLATE_*`, `WAPLIFY_OTP_TEMPLATE` |
-| Meta WhatsApp Cloud API | Inbound webhook receiver only | `META_VERIFY_TOKEN` |
-| Delhivery | Shipping — shipment creation, tracking, pickup, labels, reverse shipments | `DELHIVERY_BASE_URL`, `DELHIVERY_API_TOKEN`, `DELHIVERY_TIMEOUT` (optional) |
-| Warehouse config | Pickup/origin address for all Delhivery shipments | `WAREHOUSE_NAME`, `WAREHOUSE_ADDRESS`, `WAREHOUSE_CITY`, `WAREHOUSE_STATE`, `WAREHOUSE_PINCODE`, `WAREHOUSE_COUNTRY`, `WAREHOUSE_PHONE`, `WAREHOUSE_GST` |
+| Service                 | Purpose                                                                   | Required Configuration                                                                                                                                   |
+| ----------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| MySQL                   | Primary data store                                                        | `DATABASE_URL` or `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`                                                                                  |
+| Razorpay                | Payments — Orders, Magic Checkout, Subscriptions, Refunds, webhooks       | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`                                                                                      |
+| Firebase Admin SDK      | Verifying Google Sign-In ID tokens                                        | `GOOGLE_APPLICATION_CREDENTIALS` (path to a service-account JSON file — the active code path; see [§7](#7-authentication))                               |
+| Cloudinary              | Product image storage/CDN                                                 | `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `CLOUDINARY_UPLOAD_FOLDER`                                                       |
+| SMTP (Nodemailer)       | Transactional email                                                       | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`                                                                                          |
+| Waplify                 | WhatsApp notifications (order/bulk/subscription/return/OTP)               | `WAPLIFY_BASE_URL`, `WAPLIFY_API_KEY`, `WAPLIFY_TEMPLATE_*`, `WAPLIFY_OTP_TEMPLATE`                                                                      |
+| Meta WhatsApp Cloud API | Inbound webhook receiver only                                             | `META_VERIFY_TOKEN`                                                                                                                                      |
+| Delhivery               | Shipping — shipment creation, tracking, pickup, labels, reverse shipments | `DELHIVERY_BASE_URL`, `DELHIVERY_API_TOKEN`, `DELHIVERY_TIMEOUT` (optional)                                                                              |
+| Warehouse config        | Pickup/origin address for all Delhivery shipments                         | `WAREHOUSE_NAME`, `WAREHOUSE_ADDRESS`, `WAREHOUSE_CITY`, `WAREHOUSE_STATE`, `WAREHOUSE_PINCODE`, `WAREHOUSE_COUNTRY`, `WAREHOUSE_PHONE`, `WAREHOUSE_GST` |
 
 No credentials are shown above — names only.
 

@@ -36,11 +36,18 @@ const pool = mysql.createPool({
 
 const schemaPath = resolve(__dirname, "../mysql-schema.sql");
 const sql = await fs.readFile(schemaPath, "utf8");
+const cleanupMigrationPath = resolve(
+  __dirname,
+  "007_remove_inventory_columns.sql",
+);
+const cleanupMigration = await fs.readFile(cleanupMigrationPath, "utf8");
 
 const connection = await pool.getConnection();
 try {
   console.log(`Executing MySQL schema from ${schemaPath}`);
   await connection.query(sql);
+  console.log(`Executing migration from ${cleanupMigrationPath}`);
+  await connection.query(cleanupMigration);
   console.log("✅ MySQL schema created successfully");
 } catch (err) {
   console.error("❌ MySQL schema creation failed:", err.message);

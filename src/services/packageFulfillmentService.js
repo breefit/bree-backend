@@ -35,9 +35,9 @@
 //
 // 6. Fail-safe cycle advancement: cycles_created / next_fulfillment_date on
 //    package_purchases are only updated AFTER the new order is committed.
-//    If order creation fails (e.g. stock exhausted) the transaction rolls
-//    back and package_purchases is left untouched — the next cron run will
-//    simply retry, no cycle is silently skipped or double-counted.
+//    If order creation fails, the transaction rolls back and
+//    package_purchases is left untouched — the next cron run will simply
+//    retry, no cycle is silently skipped or double-counted.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { randomUUID } from "crypto";
@@ -99,7 +99,11 @@ export const createPackagePurchaseFromOrder = async (orderId) => {
   if (!Number.isInteger(totalCycles) || totalCycles < 1) {
     console.error(
       "[PACKAGE] Order contains a recurring-package product with an invalid duration — skipping package creation",
-      { orderId, productId: item.product_id, totalCycles: item.package_duration_months },
+      {
+        orderId,
+        productId: item.product_id,
+        totalCycles: item.package_duration_months,
+      },
     );
     return null;
   }
@@ -266,10 +270,13 @@ export const fulfillNextCycle = async (packageId) => {
     );
     if (!originItems.length) {
       await client.query("ROLLBACK");
-      console.error("[PACKAGE_CRON] Origin order has no items — cannot fulfil cycle", {
-        packageId,
-        originOrderId: origin.id,
-      });
+      console.error(
+        "[PACKAGE_CRON] Origin order has no items — cannot fulfil cycle",
+        {
+          packageId,
+          originOrderId: origin.id,
+        },
+      );
       return { created: false, reason: "origin_has_no_items" };
     }
 
@@ -341,30 +348,6 @@ export const fulfillNextCycle = async (packageId) => {
       );
     }
 
-    // Stock deduction: this cycle is about to actually ship, so it deducts
-    // real inventory now (same guarded pattern as paymentController's
-    // verifyPayment) — unlike unrelated one-time-charge renewal orders,
-    // there is no later "processing" transition this depends on.
-    for (const item of originItems) {
-      const stockResult = await client.query(
-        `UPDATE products SET stock_qty = GREATEST(stock_qty - ?, 0)
-         WHERE id = ? AND stock_qty >= ?`,
-        [item.quantity, item.product_id, item.quantity],
-      );
-      if (!stockResult.affectedRows && !stockResult.rowCount) {
-        await client.query("ROLLBACK");
-        console.warn(
-          "[PACKAGE_CRON] Insufficient stock for fulfillment cycle — will retry next run",
-          { packageId, productId: item.product_id, cycle: newCycle },
-        );
-        return { created: false, reason: "insufficient_stock" };
-      }
-    }
-    await client.query(
-      `UPDATE orders SET stock_deducted = 1 WHERE id = ?`,
-      [newOrderId],
-    );
-
     await client.query(
       `INSERT INTO order_status_history
          (order_id, previous_status, new_status, changed_by, notes)
@@ -423,7 +406,11 @@ export const fulfillNextCycle = async (packageId) => {
       message: err?.message || String(err),
       stack: err?.stack,
     });
-    return { created: false, reason: "error", error: err?.message || String(err) };
+    return {
+      created: false,
+      reason: "error",
+      error: err?.message || String(err),
+    };
   } finally {
     client.release();
   }
@@ -435,7 +422,15 @@ export const fulfillNextCycle = async (packageId) => {
  * Fire-and-forget — never throws.
  */
 const notifyFulfillmentOrderCreated = async (result) => {
-  const { orderId, orderNumber, resolvedEmail, resolvedName, resolvedPhone, resolvedAddress, amount } = result;
+  const {
+    orderId,
+    orderNumber,
+    resolvedEmail,
+    resolvedName,
+    resolvedPhone,
+    resolvedAddress,
+    amount,
+  } = result;
 
   const { rows: itemRows } = await query(
     `SELECT product_name AS name, quantity, product_price AS price, subtotal
@@ -481,7 +476,9 @@ export const runDuePackageFulfillments = async () => {
   const dueIds = await findDuePackageIds();
   if (!dueIds.length) return { processed: 0, created: 0 };
 
-  console.info(`[PACKAGE_CRON] ${dueIds.length} package(s) due for fulfillment`);
+  console.info(
+    `[PACKAGE_CRON] ${dueIds.length} package(s) due for fulfillment`,
+  );
 
   let created = 0;
   for (const packageId of dueIds) {

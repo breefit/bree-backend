@@ -19,11 +19,9 @@ const PRODUCT_SELECT = `
   p.price,
   p.mrp,
   p.quantity,
-  p.stock_qty,
   p.image,
   p.features,
   p.popular,
-  p.status,
   p.is_subscription,
   p.journey_level,
   p.show_recommendations,
@@ -236,7 +234,7 @@ export const getHomeProducts = async (req, res) => {
         ORDER BY p.display_order ASC, p.created_at ASC
         LIMIT ?
       `,
-        [...excludedIds, 3 - results.length]
+        [...excludedIds, 3 - results.length],
       );
       results.push(...rows);
     }
@@ -363,7 +361,6 @@ export const getHomeData = async (req, res) => {
 // Filters applied automatically:
 //   - inactive products excluded  (is_active = 1)
 //   - subscription products excluded from upgrade suggestions
-//   - out-of-stock products excluded  (stock_qty > 0 AND status != 'Out Of Stock')
 //
 // The caller (CartDrawer) further filters products already in the cart.
 
@@ -446,11 +443,9 @@ export const getRecommendations = async (req, res) => {
         price,
         mrp,
         quantity,
-        stock_qty,
         image,
         features,
         popular,
-        status,
         is_subscription,
         journey_level,
         show_recommendations,
@@ -461,8 +456,6 @@ export const getRecommendations = async (req, res) => {
       WHERE journey_level IN (${placeholders})
         AND is_active = 1
         AND is_subscription = 0
-        AND stock_qty > 0
-        AND status != 'Out Of Stock'
       ORDER BY journey_level ASC
       `,
       targetLevels,

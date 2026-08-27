@@ -145,41 +145,9 @@ try {
   // console.log("⚠️ Continuing startup without DB");
 }
 
-// FIX (audit Section 2 / Fix 2): ensure the `stock_deducted` guard column
-// exists on `orders`. This column lets verifyPayment() and the
-// payment.captured webhook safely race each other without double-deducting
-// stock. Uses the same information_schema lookup pattern as
-// utils/orderSchema.js, so it's safe to run on every boot regardless of
-// which migration tooling (if any) manages the rest of the schema.
-const ensureStockDeductedColumn = async () => {
-  try {
-    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
-    const currentDb = dbRows?.[0]?.db;
-    if (!currentDb) return;
-
-    const [cols] = await pool.query(
-      `SELECT column_name FROM information_schema.columns
-       WHERE table_schema = ? AND table_name = 'orders' AND column_name = 'stock_deducted'`,
-      [currentDb],
-    );
-
-    if (!cols.length) {
-      await pool.query(
-        "ALTER TABLE orders ADD COLUMN stock_deducted TINYINT(1) NOT NULL DEFAULT 0",
-      );
-      // console.log("✅ Added orders.stock_deducted column");
-    }
-  } catch (err) {
-    console.error(
-      "❌ Could not ensure orders.stock_deducted column exists:",
-      err?.message || err,
-    );
-  }
-};
-
 // FIX (Order Number feature): ensure orders.order_number + the
-// order_number_counter table exist. Same idempotent information_schema
-// pattern as ensureStockDeductedColumn above — safe to run on every boot.
+// order_number_counter table exist. Uses an idempotent information_schema
+// pattern and is safe to run on every boot.
 // Does NOT touch orders.id (UUID), any Razorpay columns, or any FKs.
 const ensureOrderNumberSchema = async () => {
   try {
@@ -433,9 +401,7 @@ const ensureBulkBookingWorkflowColumns = async () => {
       additions.push("ADD COLUMN pincode VARCHAR(10) NULL DEFAULT NULL");
     }
     if (!existing.has("country")) {
-      additions.push(
-        "ADD COLUMN country VARCHAR(56) NOT NULL DEFAULT 'India'",
-      );
+      additions.push("ADD COLUMN country VARCHAR(56) NOT NULL DEFAULT 'India'");
     }
 
     // Magic Checkout migration: the Bulk Request form now collects a single
@@ -1021,7 +987,9 @@ const ensureOrderShipmentColumns = async () => {
       );
     }
     if (!existing.has("delhivery_response")) {
-      additions.push("ADD COLUMN delhivery_response LONGTEXT NULL DEFAULT NULL");
+      additions.push(
+        "ADD COLUMN delhivery_response LONGTEXT NULL DEFAULT NULL",
+      );
     }
     if (!existing.has("pickup_request_id")) {
       additions.push(
@@ -1280,7 +1248,6 @@ const ensurePackageNumberSchema = async () => {
 
 // Run startup migrations in a fault-tolerant way: if one fails unexpectedly,
 // the remaining migrations still execute instead of the whole chain aborting.
-await ensureStockDeductedColumn().catch(console.error);
 await ensureOrderNumberSchema().catch(console.error);
 await ensureRenewalOrderColumns().catch(console.error);
 await ensureOrderShippingColumns().catch(console.error);

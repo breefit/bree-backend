@@ -195,15 +195,13 @@ const buildShippingAddressSnapshot = (address, isLegacy) => {
 // ==========================================================================
 
 /**
- * Locks every product row involved in an order (SELECT ... FOR UPDATE)
- * within the current transaction, so two concurrent checkouts against the
- * same stock can't both pass validation and oversell it. Batches what was
- * previously a per-item product lookup into a single query.
+ * Loads every product row involved in an order. Batches what was previously
+ * a per-item product lookup into a single query.
  *
  * @param {object} client - transaction-bound DB client
  * @param {string[]} productIds
  * @param {boolean} shippingColumnsAvailable
- * @returns {Promise<Map<string, object>>} productId -> locked product row
+ * @returns {Promise<Map<string, object>>} productId -> product row
  */
 const lockProductsForOrder = async (
   client,
@@ -217,10 +215,9 @@ const lockProductsForOrder = async (
     : "";
 
   const { rows } = await client.query(
-    `SELECT id, name, image, price, stock_qty${shippingSelect}
+    `SELECT id, name, image, price${shippingSelect}
      FROM products
-     WHERE id IN (?) AND is_active = 1
-     FOR UPDATE`,
+     WHERE id IN (?) AND is_active = 1`,
     [productIds],
   );
 
@@ -329,7 +326,7 @@ const insertOrderItemsBatch = async (
 // ==========================================================================
 
 /**
- * Validates a cart payload against live product data (stock, price, status).
+ * Validates a cart payload against live product data and current prices.
  * Batches product lookups into a single query instead of one per line item.
  *
  * @route POST /api/cart/validate (or equivalent)
@@ -355,7 +352,7 @@ export const validateCart = async (req, res) => {
     let productMap = new Map();
     if (productIds.length) {
       const { rows: productRows } = await query(
-        `SELECT id, name, price, stock_qty, is_active, status
+        `SELECT id, name, price, is_active
          FROM products
          WHERE id IN (?)`,
         [productIds],
@@ -368,13 +365,14 @@ export const validateCart = async (req, res) => {
 
     for (const item of cartItems) {
       const product = productMap.get(item.id);
+      const requestedQty = Number(item.quantity || 0);
 
-      if (!product || !product.is_active || product.status !== "In Stock") {
+      if (!product || !product.is_active) {
         validationResults.push({
-          productId: item.id,
-          valid: false,
-          productName: item.name || "Product",
-          reason: "Product not available or out of stock",
+          id: item.id,
+          name: product?.name || item.name,
+          available: false,
+          requestedQty,
         });
         hasErrors = true;
         continue;
@@ -383,19 +381,12 @@ export const validateCart = async (req, res) => {
       const priceMatch =
         Math.abs(parseFloat(product.price) - parseFloat(item.price)) < 0.01;
 
-      if (product.stock_qty < item.quantity) {
+      if (!priceMatch) {
         validationResults.push({
-          productId: item.id,
-          productName: product.name,
-          valid: false,
-          reason: "Insufficient stock",
-          availableQuantity: product.stock_qty,
-        });
-        hasErrors = true;
-      } else if (!priceMatch) {
-        validationResults.push({
-          productId: item.id,
-          productName: product.name,
+          id: item.id,
+          name: product.name,
+          available: true,
+          requestedQty,
           valid: false,
           reason: "Price updated",
           currentPrice: product.price,
@@ -405,8 +396,10 @@ export const validateCart = async (req, res) => {
         hasErrors = true;
       } else {
         validationResults.push({
-          productId: item.id,
-          productName: product.name,
+          id: item.id,
+          name: product.name,
+          available: true,
+          requestedQty,
           valid: true,
         });
       }
@@ -438,7 +431,7 @@ export const validateCart = async (req, res) => {
  *      (new `user_addresses` table, falling back to the legacy `addresses`
  *      table).
  *   3. Detect the active orders/order_items schema (new vs legacy).
- *   4. Lock every product row (FOR UPDATE) and validate stock.
+ *   4. Resolve active product rows and validate current prices.
  *   5. Compute totals, generate the order number, write the order,
  *      order_items (batched), and status-history rows.
  *   6. Commit, then best-effort emit a Socket.IO update.
@@ -590,10 +583,6 @@ export const createOrder = async (req, res) => {
       if (!product) {
         await client.query("ROLLBACK");
         return sendError(res, 400, `Product ${productId} not found`);
-      }
-      if (product.stock_qty < quantity) {
-        await client.query("ROLLBACK");
-        return sendError(res, 400, `Insufficient stock for "${product.name}"`);
       }
 
       const orderItem = buildOrderItem(product, quantity);

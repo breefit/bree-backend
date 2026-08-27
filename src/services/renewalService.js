@@ -30,10 +30,8 @@
 //    admin billing-history queries (WHERE razorpay_subscription_id = ?) return
 //    the full payment chain.
 //
-// 6. Stock is NOT deducted for renewal orders. Subscription renewals represent
-//    a commitment to deliver — stock deduction happens when the admin marks
-//    the order as 'processing' (or via a future pick-list flow). This avoids
-//    over-deducting stock for orders that have not yet been pulled from shelves.
+// 6. Renewal orders are fulfillment records linked to the original payment
+//    subscription and do not perform inventory work.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 

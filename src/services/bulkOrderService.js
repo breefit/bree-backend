@@ -43,11 +43,9 @@
 //    safe; it exists purely so the order displays sensibly in the existing
 //    admin order list/detail and tracking pages.
 //
-// 6. Stock: bulk orders reference a synthetic product_id (see #5), not a
-//    real catalog product, so there is nothing for the normal checkout
-//    stock-deduction path to decrement here. If/when bulk bookings start
-//    carrying real product_id + quantity line items, stock deduction should
-//    call the SAME helper the normal checkout uses (do not re-implement).
+// 6. Bulk orders reference a synthetic product_id (see #5), not a real
+//    catalog product. Their booking and fulfillment flows remain independent
+//    from catalog product availability.
 //
 // 7. Bulk order metadata: `is_bulk_order`, `bulk_booking_id`,
 //    `bulk_booking_number`, `company_name`, and `contact_person` are stored
@@ -55,7 +53,7 @@
 //    reference/traceability in the existing admin Orders UI. This is metadata
 //    only — it does not change order_number generation (still the normal
 //    #BREE-100001 sequence via getNextOrderNumber), the order workflow,
-//    Razorpay/payment logic, stock, order_items, rewards, Delhivery,
+//    Razorpay/payment logic, order_items, rewards, Delhivery,
 //    notifications, or transaction handling.
 //
 // ─────────────────────────────────────────────────────────────────────────────
@@ -252,7 +250,15 @@ const resolveOrderAddress = (booking, magicCheckoutAddress) => {
 const flattenAddress = (addr) => {
   if (!addr) return null;
   return (
-    [addr.name, addr.line1, addr.line2, addr.city, addr.state, addr.pincode, addr.country]
+    [
+      addr.name,
+      addr.line1,
+      addr.line2,
+      addr.city,
+      addr.state,
+      addr.pincode,
+      addr.country,
+    ]
       .filter(Boolean)
       .join(", ") || null
   );

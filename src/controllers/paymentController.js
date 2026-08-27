@@ -112,9 +112,9 @@ export const createOrder = async (req, res) => {
     }
 
     const { rows } = await query(
-      `SELECT id, name, image, price, stock_qty${shippingSelect}
+      `SELECT id, name, image, price${shippingSelect}
        FROM products
-       WHERE id = ? AND is_active = 1 AND status = 'In Stock'`,
+       WHERE id = ? AND is_active = 1`,
       [productId],
     );
 
@@ -126,13 +126,6 @@ export const createOrder = async (req, res) => {
     }
 
     const product = rows[0];
-
-    if (product.stock_qty < quantity) {
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient stock for "${product.name}"`,
-      });
-    }
 
     const itemPrice = Number(product.price);
     const isFreeShipping =
@@ -1007,47 +1000,6 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    const stockGuard = await client.query(
-      `UPDATE orders SET stock_deducted = 1 WHERE id = ? AND stock_deducted = 0`,
-      [order.id],
-    );
-    const stockGuardAffected =
-      stockGuard.affectedRows || stockGuard.rowCount || 0;
-
-    if (stockGuardAffected > 0) {
-      const { rows: items } = await client.query(
-        "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
-        [order.id],
-      );
-
-      for (const item of items) {
-        const stockResult = await client.query(
-          `UPDATE products
-           SET stock_qty = stock_qty - ?
-           WHERE id = ? AND stock_qty >= ?`,
-          [item.quantity, item.product_id, item.quantity],
-        );
-
-        if (!stockResult.affectedRows && !stockResult.rowCount) {
-          await client.query("ROLLBACK");
-          console.warn("[VERIFY_PAYMENT] Stock insufficient — rolling back", {
-            orderId: order.id,
-            productId: item.product_id,
-          });
-          return res.status(400).json({
-            success: false,
-            message:
-              "Unable to finalise the order: one or more products ran out of stock. Please contact support.",
-          });
-        }
-      }
-    } else {
-      console.info(
-        "[VERIFY_PAYMENT] Stock already deducted (webhook or prior request) — skipping",
-        { orderId: order.id },
-      );
-    }
-
     await client.query(
       `INSERT INTO order_status_history
          (order_id, previous_status, new_status, changed_by, notes)
@@ -1915,40 +1867,6 @@ export const handleWebhook = async (req, res) => {
               [rzpPaymentId, rzpOrderId],
             );
 
-            const whStockGuard = await whClient.query(
-              `UPDATE orders SET stock_deducted = 1 WHERE id = ? AND stock_deducted = 0`,
-              [order.id],
-            );
-            const whStockGuardAffected =
-              whStockGuard.affectedRows || whStockGuard.rowCount || 0;
-
-            if (whStockGuardAffected > 0) {
-              const { rows: whItems } = await whClient.query(
-                "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
-                [order.id],
-              );
-
-              for (const item of whItems) {
-                const whStockResult = await whClient.query(
-                  `UPDATE products
-                   SET stock_qty = GREATEST(stock_qty - ?, 0)
-                   WHERE id = ?`,
-                  [item.quantity, item.product_id],
-                );
-                if (!whStockResult.affectedRows && !whStockResult.rowCount) {
-                  console.error(
-                    "[WEBHOOK] Stock deduction found no matching product row",
-                    { orderId: order.id, productId: item.product_id },
-                  );
-                }
-              }
-            } else {
-              console.info(
-                "[WEBHOOK] Stock already deducted (verifyPayment or prior webhook) — skipping",
-                { orderId: order.id },
-              );
-            }
-
             await whClient.query(
               `INSERT INTO order_status_history
                  (order_id, previous_status, new_status, changed_by, notes)
@@ -1972,10 +1890,13 @@ export const handleWebhook = async (req, res) => {
           emitUpdate(order.id, "paid");
 
           createPackagePurchaseFromOrder(order.id).catch((err) => {
-            console.error("[PACKAGE] createPackagePurchaseFromOrder (webhook) failed", {
-              orderId: order.id,
-              message: err?.message || String(err),
-            });
+            console.error(
+              "[PACKAGE] createPackagePurchaseFromOrder (webhook) failed",
+              {
+                orderId: order.id,
+                message: err?.message || String(err),
+              },
+            );
           });
         }
       }

@@ -59,12 +59,10 @@ const products = [
     price: 299,
     mrp: 499,
     quantity: 7,
-    stock_qty: 100,
     image: "",
     features: ["7 × 50ml bottles", "Try before committing", "Free shipping"],
     recommended_product_ids: [],
     popular: false,
-    status: "In Stock",
   },
 
   {
@@ -75,7 +73,6 @@ const products = [
     price: 999,
     mrp: 1499,
     quantity: 30,
-    stock_qty: 80,
     image: "",
     features: [
       "30 × 50ml bottles",
@@ -85,7 +82,6 @@ const products = [
     ],
     recommended_product_ids: [],
     popular: true,
-    status: "In Stock",
   },
 
   {
@@ -96,7 +92,6 @@ const products = [
     price: 4999,
     mrp: 8994,
     quantity: 180,
-    stock_qty: 30,
     image: "",
     features: [
       "180 × 50ml bottles",
@@ -106,7 +101,6 @@ const products = [
     ],
     recommended_product_ids: [],
     popular: false,
-    status: "In Stock",
   },
 
   {
@@ -117,7 +111,6 @@ const products = [
     price: 8999,
     mrp: 17988,
     quantity: 365,
-    stock_qty: 15,
     image: "",
     features: [
       "365 × 50ml bottles",
@@ -127,7 +120,6 @@ const products = [
     ],
     recommended_product_ids: [],
     popular: false,
-    status: "In Stock",
   },
 ];
 
@@ -144,17 +136,13 @@ for (const p of products) {
       price,
       mrp,
       quantity,
-      stock_qty,
       image,
       features,
       recommended_product_ids,
-      popular,
-      status
+      popular
     )
     VALUES
     (
-      ?,
-      ?,
       ?,
       ?,
       ?,
@@ -175,13 +163,11 @@ for (const p of products) {
     price = VALUES(price),
     mrp = VALUES(mrp),
     quantity = VALUES(quantity),
-    stock_qty = VALUES(stock_qty),
     image = VALUES(image),
     features = VALUES(features),
     recommended_product_ids =
       VALUES(recommended_product_ids),
-    popular = VALUES(popular),
-    status = VALUES(status)
+    popular = VALUES(popular)
     `,
     [
       randomUUID(),
@@ -192,12 +178,10 @@ for (const p of products) {
       p.price,
       p.mrp,
       p.quantity,
-      p.stock_qty,
       p.image,
       JSON.stringify(p.features),
       JSON.stringify(p.recommended_product_ids),
       p.popular ? 1 : 0,
-      p.status,
     ],
   );
 }

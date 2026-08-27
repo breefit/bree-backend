@@ -161,7 +161,7 @@ const extractRequestedItems = (items) => {
   return { valid: true, requested };
 };
 
-// Pass 2: existence + stock validation against an already-fetched product
+// Pass 2: existence and price validation against an already-fetched product
 // map (O(1) lookup per item instead of one query per item). Same messages,
 // status codes, and short-circuit order as the original loop.
 const validateSubscriptionItems = (requestedItems, productMap) => {
@@ -179,20 +179,6 @@ const validateSubscriptionItems = (requestedItems, productMap) => {
         valid: false,
         status: 400,
         message: `Product ${productId} not found`,
-      };
-    }
-
-    if (product.stock_qty < quantity) {
-      logger.warn("[SUBSCRIPTION] Rejected: insufficient stock", {
-        productId,
-        productName: product.name,
-        requested: quantity,
-        available: product.stock_qty,
-      });
-      return {
-        valid: false,
-        status: 400,
-        message: `Insufficient stock for ${product.name}`,
       };
     }
 
@@ -215,13 +201,9 @@ const validateSubscriptionItems = (requestedItems, productMap) => {
   return { valid: true, validatedItems, serverTotal };
 };
 
-// Batched, row-locked product fetch. Replaces N per-item queries with a
-// single `IN (...)` query, and reuses the same fetched row for both stock
-// validation and Razorpay-plan resolution (no second product query later).
-// The lock is scoped to this short read-only transaction only — it is
-// released (COMMIT) before any external Razorpay call, so it protects
-// against concurrent overselling reads without holding a DB connection open
-// across a network round-trip.
+// Batched product fetch. Replaces N per-item queries with a single `IN (...)`
+// query and reuses the same fetched row for validation and Razorpay-plan
+// resolution (no second product query later).
 const fetchAndLockProducts = async (productIds) => {
   const uniqueIds = [...new Set(productIds)];
   const client = await getClient();
@@ -231,10 +213,9 @@ const fetchAndLockProducts = async (productIds) => {
 
     const placeholders = uniqueIds.map(() => "?").join(", ");
     const { rows } = await client.query(
-      `SELECT id, name, image, price, stock_qty, razorpay_plan_id, is_subscription
+      `SELECT id, name, image, price, razorpay_plan_id, is_subscription
        FROM products
-       WHERE id IN (${placeholders}) AND is_active = 1 AND status = 'In Stock'
-       FOR UPDATE`,
+       WHERE id IN (${placeholders}) AND is_active = 1`,
       uniqueIds,
     );
 

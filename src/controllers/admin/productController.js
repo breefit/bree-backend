@@ -11,8 +11,6 @@ const slugify = (name) =>
     .replace(/\s+/g, "-")
     .replace(/[^a-z0-9-]/g, "");
 
-const VALID_PRODUCT_STATUSES = ["In Stock", "Out Of Stock"];
-
 const normalizeFeaturesInput = (features) => {
   if (Array.isArray(features)) {
     return features.map((item) => String(item || "").trim()).filter(Boolean);
@@ -77,17 +75,6 @@ const normalizeProductFeaturesForResponse = (features) => {
       .filter(Boolean);
   }
   return [];
-};
-
-const normalizeProductStatus = (status) =>
-  VALID_PRODUCT_STATUSES.includes(status) ? status : "In Stock";
-
-const resolveProductStatus = (stockQty, status) => {
-  const parsedQty = Number(stockQty);
-  if (!Number.isFinite(parsedQty) || parsedQty <= 0) {
-    return "Out Of Stock";
-  }
-  return status !== undefined ? normalizeProductStatus(status) : "In Stock";
 };
 
 // Accepts boolean true/false, string "true"/"false", or integer 1/0.
@@ -158,8 +145,8 @@ export const getProducts = async (req, res) => {
   const [productsRes, countRes] = await Promise.all([
     query(
       `SELECT id, name, slug, category, description, price, mrp,
-              quantity, stock_qty, image, features, popular, display_order,
-              status, is_active, is_subscription,
+              quantity, image, features, popular, display_order,
+              is_active, is_subscription,
               journey_level, show_recommendations,
               is_free_shipping, shipping_charge, estimated_delivery,
               is_recurring_package, package_duration_months,
@@ -200,8 +187,6 @@ export const createProduct = async (req, res) => {
     quantity,
     features,
     popular,
-    status,
-    stockQty,
     displayOrder,
     is_subscription,
     journey_level,
@@ -215,7 +200,8 @@ export const createProduct = async (req, res) => {
   } = req.body;
 
   const isSubscriptionValue = normalizeIsSubscription(is_subscription);
-  const isRecurringPackageValue = normalizeIsRecurringPackage(is_recurring_package);
+  const isRecurringPackageValue =
+    normalizeIsRecurringPackage(is_recurring_package);
 
   if (isRecurringPackageValue === 1 && isSubscriptionValue === 1) {
     return res.status(400).json({
@@ -244,7 +230,8 @@ export const createProduct = async (req, res) => {
       if (!Number.isFinite(parsedInterval) || parsedInterval < 1) {
         return res.status(400).json({
           success: false,
-          message: "Fulfillment interval (days) must be a positive whole number.",
+          message:
+            "Fulfillment interval (days) must be a positive whole number.",
         });
       }
       packageIntervalDaysValue = parsedInterval;
@@ -262,8 +249,6 @@ export const createProduct = async (req, res) => {
   const normalizedFeatures = normalizeFeaturesInput(features);
   const featuresValue = JSON.stringify(normalizedFeatures);
 
-  const stockQuantity = parseInt(stockQty || 0, 10);
-  const productStatus = resolveProductStatus(stockQuantity, status);
   const isFreeShippingValue =
     is_free_shipping === true ||
     is_free_shipping === 1 ||
@@ -292,7 +277,7 @@ export const createProduct = async (req, res) => {
   await query(
     `INSERT INTO products
      (id, name, slug, category, description, price, mrp, quantity,
-      stock_qty, image, features, popular, status, display_order,
+      image, features, popular, display_order,
       recommended_product_ids, is_subscription, journey_level, show_recommendations,
       is_free_shipping, shipping_charge, estimated_delivery,
       is_recurring_package, package_duration_months, package_fulfillment_interval_days)
@@ -306,11 +291,9 @@ export const createProduct = async (req, res) => {
       parseFloat(price),
       parseFloat(mrp || price),
       parseInt(quantity),
-      stockQuantity,
       image,
       featuresValue,
       popular === "true" || popular === true ? 1 : 0,
-      productStatus,
       displayOrder !== undefined ? parseInt(displayOrder, 10) : 0,
       JSON.stringify([]), // recommended_product_ids kept for backwards-compat
       isSubscriptionValue,
@@ -386,8 +369,6 @@ export const updateProduct = async (req, res) => {
       quantity,
       features,
       popular,
-      status,
-      stockQty,
       isActive,
       displayOrder,
       is_subscription,
@@ -528,15 +509,14 @@ export const updateProduct = async (req, res) => {
         if (!Number.isFinite(parsedInterval) || parsedInterval < 1) {
           return res.status(400).json({
             success: false,
-            message: "Fulfillment interval (days) must be a positive whole number.",
+            message:
+              "Fulfillment interval (days) must be a positive whole number.",
           });
         }
         add("package_fulfillment_interval_days", parsedInterval);
       }
     }
 
-    const parsedStockQty =
-      stockQty !== undefined ? parseInt(stockQty, 10) : undefined;
     const isFreeShippingValue =
       is_free_shipping !== undefined
         ? is_free_shipping === true ||
@@ -556,24 +536,6 @@ export const updateProduct = async (req, res) => {
           ? estimated_delivery.trim()
           : estimated_delivery || null
         : undefined;
-    const explicitStatus =
-      status !== undefined ? normalizeProductStatus(status) : undefined;
-
-    if (stockQty !== undefined) {
-      add("stock_qty", Number.isFinite(parsedStockQty) ? parsedStockQty : 0);
-    }
-
-    const resolvedStatus =
-      stockQty !== undefined
-        ? parsedStockQty <= 0
-          ? "Out Of Stock"
-          : (explicitStatus ?? "In Stock")
-        : explicitStatus;
-
-    if (resolvedStatus !== undefined) {
-      add("status", resolvedStatus);
-    }
-
     if (isFreeShippingValue !== undefined) {
       add("is_free_shipping", isFreeShippingValue ? 1 : 0);
     }

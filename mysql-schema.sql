@@ -99,7 +99,6 @@ CREATE TABLE IF NOT EXISTS products (
   price                   DECIMAL(10,2) NOT NULL,
   mrp                     DECIMAL(10,2) NOT NULL,
   quantity                INT           NOT NULL DEFAULT 1,
-  stock_qty               INT           NOT NULL DEFAULT 0,
   image                   TEXT          NOT NULL,
   features                JSON          NOT NULL,
   recommended_product_ids JSON          NOT NULL DEFAULT (JSON_ARRAY()),
@@ -107,7 +106,6 @@ CREATE TABLE IF NOT EXISTS products (
   display_order           INT           NOT NULL DEFAULT 0,
   featured                TINYINT(1)    NOT NULL DEFAULT 0,
   popular                 TINYINT(1)    NOT NULL DEFAULT 0,
-  status                  VARCHAR(100)  NOT NULL DEFAULT 'In Stock',
   is_active               TINYINT(1)    NOT NULL DEFAULT 1,
   discount                DECIMAL(6,2)  DEFAULT NULL,
   created_at              DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -188,7 +186,6 @@ CREATE TABLE IF NOT EXISTS orders (
   created_at               DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at               DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
-  stock_deducted           TINYINT(1)    NOT NULL DEFAULT 0,
   order_number             VARCHAR(30)   DEFAULT NULL UNIQUE,
   is_renewal_order         TINYINT(1)    NOT NULL DEFAULT 0,
   parent_order_id          VARCHAR(36)   DEFAULT NULL,
