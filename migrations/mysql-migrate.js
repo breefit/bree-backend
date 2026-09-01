@@ -41,6 +41,11 @@ const cleanupMigrationPath = resolve(
   "007_remove_inventory_columns.sql",
 );
 const cleanupMigration = await fs.readFile(cleanupMigrationPath, "utf8");
+const reminderMigrationPath = resolve(
+  __dirname,
+  "008_add_daily_reminder_feature.sql",
+);
+const reminderMigration = await fs.readFile(reminderMigrationPath, "utf8");
 
 const connection = await pool.getConnection();
 try {
@@ -48,6 +53,8 @@ try {
   await connection.query(sql);
   console.log(`Executing migration from ${cleanupMigrationPath}`);
   await connection.query(cleanupMigration);
+  console.log(`Executing migration from ${reminderMigrationPath}`);
+  await connection.query(reminderMigration);
   console.log("✅ MySQL schema created successfully");
 } catch (err) {
   console.error("❌ MySQL schema creation failed:", err.message);

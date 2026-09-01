@@ -783,9 +783,19 @@ export const getOrder = async (req, res) => {
 
     const { rows: itemRows } = await query(itemQuery, [id]);
 
+    // Fetch daily reminders if they exist for this order
+    const { rows: reminderRows } = await query(
+      `SELECT id, product_id, reminder_time, reminder_enabled, status, reminder_start_date, reminder_end_date
+       FROM daily_reminders
+       WHERE order_id = ? AND reminder_enabled = 1
+       ORDER BY created_at ASC`,
+      [id],
+    );
+
     sendJson(res, 200, {
       ...orderRows[0],
       items: itemRows,
+      reminders: reminderRows,
     });
   } catch (error) {
     log("error", "order.get_failed", {

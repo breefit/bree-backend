@@ -73,6 +73,8 @@ const TEMPLATES = {
   SUBSCRIPTION_STATUS: process.env.WAPLIFY_TEMPLATE_SUBSCRIPTION_STATUS,
 
   PAYMENT_STATUS: process.env.WAPLIFY_TEMPLATE_PAYMENT_STATUS,
+
+  DAILY_REMINDER: process.env.WAPLIFY_TEMPLATE_DAILY_REMINDER,
 };
 
 // Maps each TEMPLATES key to the env var name that configures it, so
@@ -82,6 +84,7 @@ const TEMPLATE_ENV_VAR_NAMES = {
   ORDER_STATUS: "WAPLIFY_TEMPLATE_ORDER_STATUS",
   SUBSCRIPTION_STATUS: "WAPLIFY_TEMPLATE_SUBSCRIPTION_STATUS",
   PAYMENT_STATUS: "WAPLIFY_TEMPLATE_PAYMENT_STATUS",
+  DAILY_REMINDER: "WAPLIFY_TEMPLATE_DAILY_REMINDER",
 };
 
 /*
@@ -1129,6 +1132,28 @@ export const sendCustomWhatsAppNotification = async ({
     mobile,
     templateName,
     parameters,
+  });
+};
+
+/**
+ * Sends a daily wellness reminder WhatsApp message.
+ *
+ * @param {Object} options
+ * @param {string} options.mobile - Customer's mobile number.
+ * @param {string} options.customerName - Customer's name (for personalization).
+ * @returns {Promise<Object>} Waplify API response.
+ *
+ * @example
+ * await sendDailyWellnessReminder({
+ *   mobile: "9876543210",
+ *   customerName: "John Doe",
+ * });
+ */
+export const sendDailyWellnessReminder = async ({ mobile, customerName }) => {
+  return sendTemplateMessage({
+    mobile,
+    templateName: TEMPLATES.DAILY_REMINDER,
+    parameters: [customerName || DEFAULT_CONTACT_NAME],
   });
 };
 

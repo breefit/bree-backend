@@ -6,6 +6,7 @@ import { Server } from "socket.io";
 import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
+import { runDailyReminderScheduler } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -43,6 +44,14 @@ const startServer = async () => {
 
       // Recurring package fulfillment cron (creates cycle 2+ orders)
       startPackageFulfillmentCron();
+
+      // Daily wellness reminder cron (runs every minute to check for reminders)
+      cron.schedule("* * * * *", () => {
+        runDailyReminderScheduler().catch((err) => {
+          console.error("[dailyReminderCron] Scheduler error:", err);
+        });
+      });
+      console.log("💬 Daily reminder cron started (runs every minute)");
 
       // OTP cleanup cron (runs every hour)
       cron.schedule("0 * * * *", () => {

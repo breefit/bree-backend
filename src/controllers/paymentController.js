@@ -9,7 +9,9 @@ import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
 import { createPackagePurchaseFromOrder } from "../services/packageFulfillmentService.js";
+import { createDailyReminder } from "../services/dailyReminderService.js";
 import delhiveryService from "../services/delhiveryService.js";
+import { calculateOrderTotals } from "../utils/orderTotals.js";
 import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
@@ -74,6 +76,7 @@ export const createOrder = async (req, res) => {
   console.info("[CREATE_ORDER] Received request", {
     userId: req.user?.id,
     itemCount: req.body?.items?.length,
+    remindersCount: req.body?.reminders?.length,
   });
 
   const {
@@ -85,7 +88,15 @@ export const createOrder = async (req, res) => {
     shippingAddress,
     addressId,
     line_items,
+    reminders,
+    discountAmount,
+    discount_amount,
   } = req.body;
+
+  const parsedDiscountAmount = Math.max(
+    0,
+    Number(discountAmount ?? discount_amount ?? 0),
+  );
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: "Cart is empty" });
@@ -99,6 +110,7 @@ export const createOrder = async (req, res) => {
   const validatedItems = [];
   let serverSubtotal = 0;
   let shippingCharge = 0;
+  let reminderCharges = 0;
   let serverTotal = 0;
 
   for (const item of items) {
@@ -157,6 +169,109 @@ export const createOrder = async (req, res) => {
     });
   }
 
+  // ── Validate and process reminders ────────────────────────────────────────
+  const validatedReminders = [];
+  const ALLOWED_REMINDER_TIMES = ["04:00", "04:30", "05:00", "05:30", "06:00"];
+
+  if (Array.isArray(reminders) && reminders.length > 0) {
+    for (const reminder of reminders) {
+      if (!reminder.enabled) continue; // Skip disabled reminders
+
+      const reminderProductId = reminder.product_id;
+      const reminderTime = reminder.time;
+      const reminderQuantity = Number(reminder.quantity ?? 1); // Quantity for this product from cart
+      const reminderTotalPrice = Number(reminder.price ?? 0); // Frontend-calculated total (price × quantity)
+
+      // Validate reminder time
+      if (!ALLOWED_REMINDER_TIMES.includes(reminderTime)) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid reminder time: ${reminderTime}`,
+        });
+      }
+
+      // Validate that product exists and has reminder enabled
+      const { rows: productRows } = await query(
+        `SELECT id, daily_reminder_enabled, daily_reminder_price
+         FROM products
+         WHERE id = ? AND is_active = 1`,
+        [reminderProductId],
+      );
+
+      if (!productRows.length) {
+        return res.status(400).json({
+          success: false,
+          message: `Reminder product ${reminderProductId} not found`,
+        });
+      }
+
+      const reminderProduct = productRows[0];
+      if (!reminderProduct.daily_reminder_enabled) {
+        return res.status(400).json({
+          success: false,
+          message: `Reminder not available for product ${reminderProductId}`,
+        });
+      }
+
+      // Calculate expected reminder charge from database and verify
+      const dbReminderPricePerUnit = Number(
+        reminderProduct.daily_reminder_price,
+      );
+      const expectedReminderCharge = dbReminderPricePerUnit * reminderQuantity;
+
+      // Verify total price matches database (prevent price tampering)
+      // Allow 0.5 tolerance due to rounding with multiple items
+      if (Math.abs(reminderTotalPrice - expectedReminderCharge) > 0.5) {
+        console.warn("[CREATE_ORDER] Reminder price mismatch", {
+          productId: reminderProductId,
+          frontend: reminderTotalPrice,
+          calculated: expectedReminderCharge,
+          dbPrice: dbReminderPricePerUnit,
+          quantity: reminderQuantity,
+        });
+        return res.status(400).json({
+          success: false,
+          message: `Reminder price mismatch for product ${reminderProductId}`,
+        });
+      }
+
+      validatedReminders.push({
+        product_id: reminderProductId,
+        time: reminderTime,
+        price: expectedReminderCharge, // Use backend-calculated price (always correct)
+      });
+
+      reminderCharges += expectedReminderCharge;
+    }
+  }
+
+  const orderTotals = calculateOrderTotals({
+    productSubtotal: serverSubtotal,
+    deliveryCharge: shippingCharge,
+    dailyReminderPrice: reminderCharges,
+    actualDiscount: parsedDiscountAmount,
+  });
+  const finalServerTotal = orderTotals.finalTotal;
+  serverTotal = finalServerTotal;
+
+  console.info("========== PAYMENT CALCULATION ==========");
+  console.info("Product Subtotal:", serverSubtotal);
+  console.info("Reminder Amount:", reminderCharges);
+  console.info("Shipping Charge:", shippingCharge);
+  console.info("Discount:", parsedDiscountAmount);
+  console.info("Final Payable Amount:", serverTotal);
+  console.info("Razorpay Amount (paise):", Math.round(serverTotal * 100));
+  console.info("Magic Checkout Shipping Fee (paise):", 0);
+  console.info("==========================================");
+
+  console.info("[CREATE_ORDER] Price breakdown", {
+    subtotal: serverSubtotal,
+    shipping: shippingCharge,
+    reminders: reminderCharges,
+    discount: parsedDiscountAmount,
+    total: serverTotal,
+  });
+
   const isMagicCheckout = Array.isArray(line_items) && line_items.length > 0;
   console.info("[CREATE_ORDER] isMagicCheckout:", isMagicCheckout);
 
@@ -203,11 +318,12 @@ export const createOrder = async (req, res) => {
         console.info("[CREATE_ORDER] Returning verified pending order", {
           orderId: existing.id,
           razorpayOrderId: existing.razorpay_order_id,
+          amountRupees: serverTotal,
         });
         return res.json({
           success: true,
           order_id: existing.razorpay_order_id,
-          amount: Math.round(serverTotal * 100),
+          amount: Math.round(serverTotal * 100), // in paise
           currency: "INR",
           key_id: process.env.RAZORPAY_KEY_ID,
           order_db_id: existing.id,
@@ -239,7 +355,7 @@ export const createOrder = async (req, res) => {
       const rzp = getRazorpay();
 
       const orderPayload = {
-        amount: Math.round(serverTotal * 100), // paise
+        amount: Math.round(serverTotal * 100), // paise — authoritative final payable amount
         currency: "INR",
         receipt: orderNumber,
       };
@@ -247,7 +363,15 @@ export const createOrder = async (req, res) => {
       if (isMagicCheckout) {
         orderPayload.line_items =
           buildLineItemsFromValidatedItems(validatedItems);
-        orderPayload.line_items_total = Math.round(serverSubtotal * 100);
+        const lineItemsTotalExclusiveOfShipping = Math.max(
+          0,
+          orderTotals.productSubtotal +
+            orderTotals.dailyReminderPrice -
+            orderTotals.actualDiscount,
+        );
+        orderPayload.line_items_total = Math.round(
+          lineItemsTotalExclusiveOfShipping * 100,
+        );
       }
 
       rzpOrder = await rzp.orders.create(orderPayload);
@@ -333,7 +457,7 @@ export const createOrder = async (req, res) => {
     await client.query(
       `INSERT INTO payments (id, order_id, razorpay_order_id, amount, status)
        VALUES (?, ?, ?, ?, 'created')`,
-      [randomUUID(), orderId, rzpOrder.id, serverTotal],
+      [randomUUID(), orderId, rzpOrder.id, Math.round(serverTotal * 100) / 100], // Store in rupees, not paise
     );
 
     await client.query(
@@ -348,7 +472,8 @@ export const createOrder = async (req, res) => {
     console.info("[CREATE_ORDER] Complete", {
       orderId,
       razorpayOrderId: rzpOrder.id,
-      amount: rzpOrder.amount,
+      amountPaise: rzpOrder.amount,
+      amountRupees: serverTotal,
       isMagicCheckout,
     });
 
@@ -362,7 +487,7 @@ export const createOrder = async (req, res) => {
     return res.json({
       success: true,
       order_id: rzpOrder.id,
-      amount: rzpOrder.amount,
+      amount: rzpOrder.amount, // in paise
       currency: rzpOrder.currency,
       key_id: process.env.RAZORPAY_KEY_ID,
       order_db_id: orderId,
@@ -666,6 +791,7 @@ export const verifyPayment = async (req, res) => {
     email,
     mobileNumber,
     shippingAddress,
+    reminders,
   } = req.body;
 
   console.info("[VERIFY_PAYMENT] Request received", {
@@ -1007,6 +1133,105 @@ export const verifyPayment = async (req, res) => {
       [order.id, lockedOrder.order_status, newOrderStatus],
     );
 
+    // ── Create daily reminders if provided ─────────────────────────────────
+    if (Array.isArray(reminders) && reminders.length > 0 && order.user_id) {
+      try {
+        const ALLOWED_REMINDER_TIMES = [
+          "04:00",
+          "04:30",
+          "05:00",
+          "05:30",
+          "06:00",
+        ];
+
+        for (const reminder of reminders) {
+          const productId = reminder.product_id;
+          const reminderTime = reminder.time;
+          const reminderPrice = Number(reminder.price ?? 0);
+
+          // Validate reminder time (prevent fraud)
+          if (!ALLOWED_REMINDER_TIMES.includes(reminderTime)) {
+            console.warn(
+              "[VERIFY_PAYMENT] Skipping reminder with invalid time",
+              { orderId: order.id, productId, reminderTime },
+            );
+            continue;
+          }
+
+          // Fetch product details (reminder enabled, original price, duration)
+          const { rows: prodRows } = await client.query(
+            `SELECT daily_reminder_enabled, daily_reminder_original_price,
+                    package_duration_days
+             FROM products
+             WHERE id = ? AND is_active = 1`,
+            [productId],
+          );
+
+          if (!prodRows.length || !prodRows[0].daily_reminder_enabled) {
+            console.warn(
+              "[VERIFY_PAYMENT] Skipping reminder for unavailable product",
+              { orderId: order.id, productId },
+            );
+            continue;
+          }
+
+          const product = prodRows[0];
+
+          // Fetch order_item to link reminder to order_item
+          const { rows: oiRows } = await client.query(
+            `SELECT id FROM order_items
+             WHERE order_id = ? AND product_id = ?
+             LIMIT 1`,
+            [order.id, productId],
+          );
+
+          if (!oiRows.length) {
+            console.warn("[VERIFY_PAYMENT] Order item not found for reminder", {
+              orderId: order.id,
+              productId,
+            });
+            continue;
+          }
+
+          const orderItemId = oiRows[0].id;
+
+          // Create daily reminder
+          try {
+            await createDailyReminder({
+              userId: order.user_id,
+              orderId: order.id,
+              orderItemId,
+              productId,
+              reminderTime,
+              reminderPricePaid: reminderPrice,
+              reminderOriginalPrice:
+                Number(product.daily_reminder_original_price) || reminderPrice,
+              packageDurationDays: Number(product.package_duration_days) || 30,
+            });
+
+            console.info("[VERIFY_PAYMENT] Daily reminder created", {
+              orderId: order.id,
+              productId,
+              reminderTime,
+            });
+          } catch (reminderErr) {
+            console.error("[VERIFY_PAYMENT] Failed to create daily reminder", {
+              orderId: order.id,
+              productId,
+              error: reminderErr.message,
+            });
+            // Continue with other reminders even if one fails
+          }
+        }
+      } catch (remindersErr) {
+        console.error("[VERIFY_PAYMENT] Error processing reminders", {
+          orderId: order.id,
+          error: remindersErr.message,
+        });
+        // Don't roll back transaction — order payment is valid even if reminders fail
+      }
+    }
+
     await client.query("COMMIT");
 
     console.info("[VERIFY_PAYMENT] Order finalised", {
@@ -1346,7 +1571,10 @@ export const getShippingInfo = async (req, res) => {
     : Number.isFinite(storedShippingCharge)
       ? Math.max(0, storedShippingCharge)
       : 0;
-  const shippingFeePaise = Math.round(shippingFee * 100);
+  // Delivery is already included in the application-calculated Razorpay
+  // order amount. Magic Checkout must only validate serviceability here;
+  // returning the product delivery amount as shipping_fee charges it again.
+  const razorpayShippingFeePaise = 0;
 
   const estimatedDelivery =
     String(order.estimated_delivery || "").trim() || "3-5 business days";
@@ -1355,7 +1583,7 @@ export const getShippingInfo = async (req, res) => {
     orderId: order.id,
     isFreeShipping,
     shippingFee,
-    shippingFeePaise,
+    razorpayShippingFeePaise,
     estimatedDelivery,
   });
 
@@ -1431,7 +1659,7 @@ export const getShippingInfo = async (req, res) => {
             name: "Standard Delivery",
             description: `Delivery in ${estimatedDelivery}`,
             serviceable,
-            shipping_fee: shippingFeePaise,
+            shipping_fee: razorpayShippingFeePaise,
             cod: false,
             cod_fee: 0,
           },

@@ -12,6 +12,7 @@ import {
   sendOutForDeliveryEmail,
   sendShipmentDeliveredEmail,
 } from "../src/services/orderEmailService.js";
+import { activateReminderFromDelivery } from "../src/services/dailyReminderService.js";
 
 const TERMINAL_STATUSES = ["delivered", "cancelled", "returned"];
 
@@ -171,6 +172,32 @@ export const syncShippingTracking = async () => {
               `[SHIPPING_CRON] Failed to send delivered email for order ${order.id}`,
               emailError,
             );
+          }
+
+          // Activate daily reminders when order is delivered
+          try {
+            const { rows: reminders } = await query(
+              `SELECT id FROM daily_reminders
+               WHERE order_id = ? AND reminder_enabled = 1`,
+              [order.id],
+            );
+
+            for (const reminder of reminders) {
+              await activateReminderFromDelivery({
+                reminderId: reminder.id,
+                deliveryDate: new Date().toISOString().split("T")[0], // Today's date in YYYY-MM-DD
+              });
+
+              console.info(
+                `[SHIPPING_CRON] Reminder activated for order ${order.id} reminder ${reminder.id}`,
+              );
+            }
+          } catch (reminderError) {
+            console.error(
+              `[SHIPPING_CRON] Failed to activate reminders for order ${order.id}`,
+              reminderError.message || reminderError,
+            );
+            // Don't throw — order delivery email sent successfully
           }
         }
       }

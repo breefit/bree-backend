@@ -27,7 +27,10 @@ const PRODUCT_SELECT = `
   p.show_recommendations,
   p.is_recurring_package,
   p.package_duration_months,
-  p.package_fulfillment_interval_days
+  p.package_fulfillment_interval_days,
+  p.daily_reminder_enabled,
+  p.daily_reminder_price,
+  p.daily_reminder_original_price
 `;
 
 const getProductShippingColumnsAvailable = async () => {

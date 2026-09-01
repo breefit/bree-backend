@@ -151,6 +151,7 @@ export const getProducts = async (req, res) => {
               is_free_shipping, shipping_charge, estimated_delivery,
               is_recurring_package, package_duration_months,
               package_fulfillment_interval_days,
+              daily_reminder_enabled, daily_reminder_price, daily_reminder_original_price,
               created_at
        FROM products ${where} ORDER BY display_order ASC, created_at DESC
        LIMIT ? OFFSET ?`,
@@ -197,6 +198,9 @@ export const createProduct = async (req, res) => {
     is_recurring_package,
     package_duration_months,
     package_fulfillment_interval_days,
+    daily_reminder_enabled,
+    daily_reminder_price,
+    daily_reminder_original_price,
   } = req.body;
 
   const isSubscriptionValue = normalizeIsSubscription(is_subscription);
@@ -236,6 +240,45 @@ export const createProduct = async (req, res) => {
       }
       packageIntervalDaysValue = parsedInterval;
     }
+  }
+
+  // Normalize daily reminder fields
+  const dailyReminderEnabled =
+    daily_reminder_enabled === true ||
+    daily_reminder_enabled === 1 ||
+    daily_reminder_enabled === "true" ||
+    daily_reminder_enabled === "1";
+
+  let dailyReminderPriceValue = null;
+  let dailyReminderOriginalPriceValue = null;
+
+  if (dailyReminderEnabled) {
+    const parsedPrice = Number(daily_reminder_price || 0);
+    const parsedOriginal = Number(daily_reminder_original_price || 0);
+
+    if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Reminder price must be a number ≥ 0",
+      });
+    }
+
+    if (!Number.isFinite(parsedOriginal) || parsedOriginal < 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Original reminder price must be a number ≥ 0",
+      });
+    }
+
+    if (parsedPrice > parsedOriginal) {
+      return res.status(400).json({
+        success: false,
+        message: "Reminder price cannot exceed original price",
+      });
+    }
+
+    dailyReminderPriceValue = parsedPrice;
+    dailyReminderOriginalPriceValue = parsedOriginal;
   }
 
   const image =
@@ -280,8 +323,9 @@ export const createProduct = async (req, res) => {
       image, features, popular, display_order,
       recommended_product_ids, is_subscription, journey_level, show_recommendations,
       is_free_shipping, shipping_charge, estimated_delivery,
-      is_recurring_package, package_duration_months, package_fulfillment_interval_days)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      is_recurring_package, package_duration_months, package_fulfillment_interval_days,
+      daily_reminder_enabled, daily_reminder_price, daily_reminder_original_price)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       productId,
       name,
@@ -305,6 +349,9 @@ export const createProduct = async (req, res) => {
       isRecurringPackageValue,
       packageDurationMonthsValue,
       packageIntervalDaysValue,
+      dailyReminderEnabled ? 1 : 0,
+      dailyReminderPriceValue,
+      dailyReminderOriginalPriceValue,
     ],
   );
 
@@ -380,6 +427,9 @@ export const updateProduct = async (req, res) => {
       is_recurring_package,
       package_duration_months,
       package_fulfillment_interval_days,
+      daily_reminder_enabled,
+      daily_reminder_price,
+      daily_reminder_original_price,
     } = req.body;
 
     const { rows: existingRows } = await query(
@@ -546,6 +596,72 @@ export const updateProduct = async (req, res) => {
 
     if (normalizedEstimatedDelivery !== undefined) {
       add("estimated_delivery", normalizedEstimatedDelivery);
+    }
+
+    // Handle daily reminder fields
+    if (daily_reminder_enabled !== undefined) {
+      const dailyReminderEnabled =
+        daily_reminder_enabled === true ||
+        daily_reminder_enabled === 1 ||
+        daily_reminder_enabled === "true" ||
+        daily_reminder_enabled === "1";
+
+      add("daily_reminder_enabled", dailyReminderEnabled ? 1 : 0);
+
+      if (dailyReminderEnabled) {
+        const parsedPrice = Number(daily_reminder_price || 0);
+        const parsedOriginal = Number(daily_reminder_original_price || 0);
+
+        if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Reminder price must be a number ≥ 0",
+          });
+        }
+
+        if (!Number.isFinite(parsedOriginal) || parsedOriginal < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Original reminder price must be a number ≥ 0",
+          });
+        }
+
+        if (parsedPrice > parsedOriginal) {
+          return res.status(400).json({
+            success: false,
+            message: "Reminder price cannot exceed original price",
+          });
+        }
+
+        add("daily_reminder_price", parsedPrice);
+        add("daily_reminder_original_price", parsedOriginal);
+      }
+    } else if (
+      daily_reminder_price !== undefined ||
+      daily_reminder_original_price !== undefined
+    ) {
+      // Update prices if provided but enabled flag wasn't changed
+      if (daily_reminder_price !== undefined) {
+        const parsedPrice = Number(daily_reminder_price || 0);
+        if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Reminder price must be a number ≥ 0",
+          });
+        }
+        add("daily_reminder_price", parsedPrice);
+      }
+
+      if (daily_reminder_original_price !== undefined) {
+        const parsedOriginal = Number(daily_reminder_original_price || 0);
+        if (!Number.isFinite(parsedOriginal) || parsedOriginal < 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Original reminder price must be a number ≥ 0",
+          });
+        }
+        add("daily_reminder_original_price", parsedOriginal);
+      }
     }
 
     if (!req.params.id) {
