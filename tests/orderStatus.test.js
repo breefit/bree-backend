@@ -163,7 +163,7 @@ test("30-Pack with reminder and free delivery stays at 1048 and never discounts 
       variant_id: "reminder-42",
       name: "Daily WhatsApp Reminder",
       description: "Daily WhatsApp Reminder",
-      image_url: "",
+      image_url: "https://breefit.in/images/daily-whatsapp-reminder.png",
       price: 4900,
       offer_price: 4900,
       quantity: 1,

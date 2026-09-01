@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS daily_reminders (
   reminder_enabled TINYINT(1) NOT NULL DEFAULT 1,
   reminder_time VARCHAR(5) NOT NULL DEFAULT '05:30',  -- HH:MM format (04:00, 04:30, 05:00, 05:30, 06:00)
   reminder_channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',
+  reminder_whatsapp_number VARCHAR(20) NULL, -- Final number used for reminder sends, normalized to 91XXXXXXXXXX format
+  reminder_phone_source VARCHAR(20) NOT NULL DEFAULT 'profile', -- profile or custom
   
   -- Pricing (immutable — locked in at purchase time)
   reminder_price_paid DECIMAL(10,2) NOT NULL,

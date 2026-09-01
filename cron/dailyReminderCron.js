@@ -83,6 +83,7 @@ const getEligibleReminders = async (today) => {
       dr.reminder_time,
       dr.reminder_start_date,
       dr.reminder_end_date,
+      dr.reminder_whatsapp_number,
       u.name AS customer_name,
       u.phone AS customer_phone,
       drs.id AS send_record_id
@@ -200,10 +201,13 @@ export const runDailyReminderScheduler = async () => {
         id: reminderId,
         customer_name,
         customer_phone,
+        reminder_whatsapp_number,
         reminder_time,
         reminder_start_date,
         reminder_end_date,
       } = reminder;
+
+      const sendMobile = reminder_whatsapp_number || customer_phone;
 
       // Check if current time is within tolerance of scheduled time
       if (!isWithinReminderTimeWindow(reminder_time, currentTime)) {
@@ -217,7 +221,7 @@ export const runDailyReminderScheduler = async () => {
           `daily-reminder-${reminderId}`,
           () =>
             sendDailyWellnessReminder({
-              mobile: customer_phone,
+              mobile: sendMobile,
               customerName: customer_name,
             }),
         );
@@ -233,7 +237,7 @@ export const runDailyReminderScheduler = async () => {
           sent++;
 
           console.log(
-            `[Reminder] Sent reminder ${reminderId} to ${customer_phone} (${customer_name}) | Message ID: ${result.data.message_id}`,
+            `[Reminder] Sent reminder ${reminderId} to ${sendMobile} (${customer_name}) | Message ID: ${result.data.message_id}`,
           );
         } else if (success) {
           // Sent but no message ID in response
@@ -253,7 +257,7 @@ export const runDailyReminderScheduler = async () => {
           );
 
           console.error(
-            `[Reminder] Failed to send reminder ${reminderId} to ${customer_phone}: ${result?.error}`,
+            `[Reminder] Failed to send reminder ${reminderId} to ${sendMobile}: ${result?.error}`,
           );
         }
       } catch (error) {

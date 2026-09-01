@@ -6,6 +6,7 @@
 
 import { query } from "../config/database.js";
 import { randomUUID } from "crypto";
+import { validateMobile } from "./whatsappNotificationService.js";
 
 /**
  * Creates a daily reminder record after successful payment
@@ -22,6 +23,8 @@ import { randomUUID } from "crypto";
  * @param {number} options.reminderPricePaid - Actual price paid by customer
  * @param {number} options.reminderOriginalPrice - Original/display price at purchase
  * @param {number} options.packageDurationDays - Duration of package (e.g., 30, 180, 365)
+ * @param {string|null} options.reminderWhatsappNumber - Selected WhatsApp number for sending reminders
+ * @param {string} options.reminderPhoneSource - Source of the selected number: profile|custom
  * @returns {Promise<{success: boolean, reminderId?: string, error?: string}>}
  */
 export const createDailyReminder = async ({
@@ -33,6 +36,8 @@ export const createDailyReminder = async ({
   reminderPricePaid,
   reminderOriginalPrice,
   packageDurationDays = null,
+  reminderWhatsappNumber = null,
+  reminderPhoneSource = "profile",
 }) => {
   try {
     // Validate reminder time (must be one of: 04:00, 04:30, 05:00, 05:30, 06:00)
@@ -45,15 +50,22 @@ export const createDailyReminder = async ({
     }
 
     const reminderId = randomUUID();
+    const normalizedWhatsappNumber =
+      reminderWhatsappNumber && String(reminderWhatsappNumber).trim()
+        ? validateMobile(reminderWhatsappNumber)
+        : null;
+    const safePhoneSource =
+      reminderPhoneSource === "custom" ? "custom" : "profile";
 
     await query(
       `
       INSERT INTO daily_reminders
       (id, user_id, order_id, order_item_id, product_id,
        reminder_enabled, reminder_time, reminder_channel,
+       reminder_whatsapp_number, reminder_phone_source,
        reminder_price_paid, reminder_original_price,
        package_duration_days, status)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         reminderId,
@@ -64,6 +76,8 @@ export const createDailyReminder = async ({
         1, // reminder_enabled = true (always enabled on creation)
         reminderTime,
         "whatsapp",
+        normalizedWhatsappNumber,
+        safePhoneSource,
         reminderPricePaid,
         reminderOriginalPrice,
         packageDurationDays,
@@ -72,7 +86,7 @@ export const createDailyReminder = async ({
     );
 
     console.log(
-      `[Reminder] Created reminder ${reminderId} for order ${orderId} | Time: ${reminderTime}`,
+      `[Reminder] Created reminder ${reminderId} for order ${orderId} | Time: ${reminderTime} | Phone: ${normalizedWhatsappNumber || "fallback-user-phone"} | Source: ${safePhoneSource}`,
     );
 
     return { success: true, reminderId };

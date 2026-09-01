@@ -18,6 +18,7 @@ import {
 import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
+  validateMobile,
 } from "../services/whatsappNotificationService.js";
 
 let productShippingColumnsAvailable = null;
@@ -87,7 +88,7 @@ export const buildRazorpayLineItems = (
       variant_id: `reminder-${reminder.product_id}`,
       name: "Daily WhatsApp Reminder",
       description: "Daily WhatsApp Reminder",
-      image_url: "",
+      image_url: "https://breefit.in/images/daily-whatsapp-reminder.png",
       price: reminderAmountPaise,
       offer_price: reminderAmountPaise,
       quantity: 1,
@@ -214,6 +215,28 @@ export const createOrder = async (req, res) => {
       const reminderTime = reminder.time;
       const reminderQuantity = Number(reminder.quantity ?? 1); // Quantity for this product from cart
       const reminderTotalPrice = Number(reminder.price ?? 0); // Frontend-calculated total (price × quantity)
+      const reminderPhoneSource =
+        reminder.reminder_phone_source === "custom" ? "custom" : "profile";
+      const reminderWhatsappNumber =
+        reminder.reminder_whatsapp_number || reminder.custom_phone || null;
+
+      if (reminderPhoneSource === "custom" && !reminderWhatsappNumber) {
+        return res.status(400).json({
+          success: false,
+          message: "Please provide a valid WhatsApp number for the reminder.",
+        });
+      }
+
+      if (reminderWhatsappNumber) {
+        try {
+          validateMobile(reminderWhatsappNumber);
+        } catch (err) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid WhatsApp reminder number.",
+          });
+        }
+      }
 
       // Validate reminder time
       if (!ALLOWED_REMINDER_TIMES.includes(reminderTime)) {
@@ -272,6 +295,10 @@ export const createOrder = async (req, res) => {
         product_id: reminderProductId,
         time: reminderTime,
         price: expectedReminderCharge, // Use backend-calculated price (always correct)
+        reminder_phone_source: reminderPhoneSource,
+        reminder_whatsapp_number: reminderWhatsappNumber
+          ? validateMobile(reminderWhatsappNumber)
+          : null,
       });
 
       reminderCharges += expectedReminderCharge;
@@ -1216,6 +1243,10 @@ export const verifyPayment = async (req, res) => {
           const productId = reminder.product_id;
           const reminderTime = reminder.time;
           const reminderPrice = Number(reminder.price ?? 0);
+          const reminderPhoneSource =
+            reminder.reminder_phone_source === "custom" ? "custom" : "profile";
+          const reminderWhatsappNumber =
+            reminder.reminder_whatsapp_number || reminder.custom_phone || null;
 
           // Validate reminder time (prevent fraud)
           if (!ALLOWED_REMINDER_TIMES.includes(reminderTime)) {
@@ -1275,6 +1306,8 @@ export const verifyPayment = async (req, res) => {
               reminderOriginalPrice:
                 Number(product.daily_reminder_original_price) || reminderPrice,
               packageDurationDays: Number(product.package_duration_days) || 30,
+              reminderWhatsappNumber: reminderWhatsappNumber,
+              reminderPhoneSource,
             });
 
             console.info("[VERIFY_PAYMENT] Daily reminder created", {

@@ -196,7 +196,7 @@ const INDIAN_MOBILE_WITH_COUNTRY_CODE_REGEX = /^91[6-9]\d{9}$/;
  * validateMobile("919876543210");  // -> "919876543210"
  * validateMobile("12345");         // -> throws Error
  */
-const validateMobile = (mobile) => {
+export const validateMobile = (mobile) => {
   if (mobile === null || mobile === undefined) {
     throw new Error("Mobile number is required.");
   }
@@ -240,7 +240,7 @@ const validateMobile = (mobile) => {
 
 // Retained as an alias for backward compatibility with any internal
 // callers/tests referencing the previous helper name.
-const normalizeMobile = validateMobile;
+export const normalizeMobile = validateMobile;
 
 /**
  * Masks a normalized mobile number for safe logging, revealing only the

@@ -304,6 +304,44 @@ const ensureOrderShippingColumns = async () => {
   }
 };
 
+const ensureDailyReminderPhoneColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'daily_reminders'`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((c) => c.column_name));
+    const additions = [];
+
+    if (!existing.has("reminder_whatsapp_number")) {
+      additions.push(
+        "ADD COLUMN reminder_whatsapp_number VARCHAR(20) NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("reminder_phone_source")) {
+      additions.push(
+        "ADD COLUMN reminder_phone_source VARCHAR(20) NOT NULL DEFAULT 'profile'",
+      );
+    }
+
+    if (additions.length) {
+      await pool.query(`ALTER TABLE daily_reminders ${additions.join(", ")}`);
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure daily reminder phone columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
 // ── Bulk Order workflow columns ─────────────────────────────────────────────
 // bulk_bookings gains payment tracking (Razorpay), quote-approval tracking,
 // and an order-creation guard (order_created / created_order_id) so the
@@ -1251,6 +1289,7 @@ const ensurePackageNumberSchema = async () => {
 await ensureOrderNumberSchema().catch(console.error);
 await ensureRenewalOrderColumns().catch(console.error);
 await ensureOrderShippingColumns().catch(console.error);
+await ensureDailyReminderPhoneColumns().catch(console.error);
 await ensureBulkBookingWorkflowColumns().catch(console.error);
 await ensureBulkBookingUserIdIndexAndBackfill().catch(console.error);
 await ensureBulkBookingNumberSchema().catch(console.error);
