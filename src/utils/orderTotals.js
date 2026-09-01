@@ -3,6 +3,26 @@ const toNonNegativeNumber = (value) => {
   return Number.isFinite(number) ? Math.max(0, number) : 0;
 };
 
+export const calculateRazorpayShippingFeePaise = ({
+  isFreeShipping = false,
+  shippingCharge = 0,
+  shippingFee = null,
+  value = null,
+} = {}) => {
+  if (isFreeShipping === true) {
+    return 0;
+  }
+
+  const resolvedValue = value ?? shippingFee ?? shippingCharge ?? 0;
+  const normalizedShippingCharge = toNonNegativeNumber(resolvedValue);
+
+  if (normalizedShippingCharge === 0) {
+    return 0;
+  }
+
+  return Math.round(normalizedShippingCharge * 100);
+};
+
 export const calculateOrderTotals = ({
   productSubtotal = 0,
   deliveryCharge = 0,

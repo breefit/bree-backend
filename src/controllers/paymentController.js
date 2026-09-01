@@ -11,7 +11,10 @@ import { createRenewalOrder } from "../services/renewalService.js";
 import { createPackagePurchaseFromOrder } from "../services/packageFulfillmentService.js";
 import { createDailyReminder } from "../services/dailyReminderService.js";
 import delhiveryService from "../services/delhiveryService.js";
-import { calculateOrderTotals } from "../utils/orderTotals.js";
+import {
+  calculateOrderTotals,
+  calculateRazorpayShippingFeePaise,
+} from "../utils/orderTotals.js";
 import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
@@ -261,8 +264,30 @@ export const createOrder = async (req, res) => {
   console.info("Discount:", parsedDiscountAmount);
   console.info("Final Payable Amount:", serverTotal);
   console.info("Razorpay Amount (paise):", Math.round(serverTotal * 100));
-  console.info("Magic Checkout Shipping Fee (paise):", 0);
+  console.info(
+    "Magic Checkout Shipping Fee (paise):",
+    calculateRazorpayShippingFeePaise({
+      isFreeShipping: shippingCharge === 0,
+      shippingCharge,
+    }),
+  );
   console.info("==========================================");
+
+  const razorpayCalculatedShippingFeePaise = calculateRazorpayShippingFeePaise({
+    isFreeShipping: shippingCharge === 0,
+    shippingCharge,
+  });
+
+  console.info("[RAZORPAY PAYMENT]", {
+    productSubtotal: serverSubtotal,
+    deliveryFromAdmin: shippingCharge,
+    reminder: reminderCharges,
+    discount: parsedDiscountAmount,
+    finalBackendTotal: serverTotal,
+    razorpayOrderAmount: Math.round(serverTotal * 100),
+    magicCheckoutDisplayedShipping: razorpayCalculatedShippingFeePaise,
+    magicCheckoutFinalAmount: Math.round(serverTotal * 100),
+  });
 
   console.info("[CREATE_ORDER] Price breakdown", {
     subtotal: serverSubtotal,
@@ -373,6 +398,13 @@ export const createOrder = async (req, res) => {
           lineItemsTotalExclusiveOfShipping * 100,
         );
       }
+
+      console.info("[RAZORPAY PAYMENT] order.create payload", {
+        amount: orderPayload.amount,
+        line_items_total: orderPayload.line_items_total ?? null,
+        deliveryCharge: shippingCharge,
+        finalTotal: serverTotal,
+      });
 
       rzpOrder = await rzp.orders.create(orderPayload);
     } catch (err) {
@@ -1463,7 +1495,9 @@ export const getShippingInfo = async (req, res) => {
   const { rows: orderRows } = await query(
     `SELECT
        id,
+       subtotal,
        shipping,
+       total,
        shipping_charge,
        is_free_shipping,
        estimated_delivery,
@@ -1571,10 +1605,55 @@ export const getShippingInfo = async (req, res) => {
     : Number.isFinite(storedShippingCharge)
       ? Math.max(0, storedShippingCharge)
       : 0;
-  // Delivery is already included in the application-calculated Razorpay
-  // order amount. Magic Checkout must only validate serviceability here;
-  // returning the product delivery amount as shipping_fee charges it again.
-  const razorpayShippingFeePaise = 0;
+
+  // Reuse the same delivery amount already calculated from the product admin
+  // configuration when the order was created. Magic Checkout only needs to know
+  // the effective shipping fee for display/validation; it must not be treated
+  // as an extra charge on top of the already calculated order total.
+  const razorpayShippingFeePaise = calculateRazorpayShippingFeePaise({
+    isFreeShipping,
+    shippingFee,
+  });
+
+  const finalOrderTotal = Number(order.total ?? 0);
+  const productSubtotal = Number(order.subtotal ?? 0);
+  const reminderAmount = Number(
+    (
+      await query(
+        `SELECT COALESCE(SUM(reminder_price_paid), 0) AS reminder_amount
+         FROM daily_reminders
+         WHERE order_id = ?`,
+        [order.id],
+      )
+    ).rows[0]?.reminder_amount ?? 0,
+  );
+  const discountAmount = Math.max(
+    0,
+    productSubtotal + shippingFee + reminderAmount - finalOrderTotal,
+  );
+  const { rows: firstOrderItemRows } = await query(
+    `SELECT product_id, product_name
+     FROM order_items
+     WHERE order_id = ?
+     ORDER BY created_at ASC, id ASC
+     LIMIT 1`,
+    [order.id],
+  );
+  const firstOrderItem = firstOrderItemRows[0] || null;
+
+  console.info("[RAZORPAY SHIPPING DEBUG]", {
+    productId: firstOrderItem?.product_id ?? null,
+    productName: firstOrderItem?.product_name ?? null,
+    adminDeliveryType: isFreeShipping ? "FREE" : "PAID",
+    adminDeliveryAmount: shippingFee,
+    calculatedDeliveryAmount: shippingFee,
+    razorpayShippingFeePaise,
+    productSubtotal,
+    reminderAmount,
+    discount: discountAmount,
+    finalOrderTotal,
+    razorpayOrderAmountPaise: Math.round(finalOrderTotal * 100),
+  });
 
   const estimatedDelivery =
     String(order.estimated_delivery || "").trim() || "3-5 business days";
@@ -1667,6 +1746,14 @@ export const getShippingInfo = async (req, res) => {
       };
     }),
   );
+
+  console.info("[MAGIC CHECKOUT SHIPPING RESPONSE]", {
+    orderId: order.id,
+    shippingFeeRupees: shippingFee,
+    shippingFeePaise: razorpayShippingFeePaise,
+    isFreeShipping,
+    response: responseAddresses,
+  });
 
   console.info("[SHIPPING_INFO] Response ready", {
     orderId: order.id,

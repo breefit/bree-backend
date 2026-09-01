@@ -28,7 +28,6 @@ const client = axios.create({
 // createShipment(). Only method + URL are logged for traceability.
 client.interceptors.request.use(
   (config) => {
-    c
     return config;
   },
   (error) => {
