@@ -56,9 +56,15 @@ const describeRazorpayError = (err) => ({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build Razorpay Magic Checkout line_items from server-validated cart items.
+// Reminder charges are represented as a real positive line item so Razorpay
+// does not infer a fake negative discount when the order amount includes the
+// reminder add-on.
 // ─────────────────────────────────────────────────────────────────────────────
-const buildLineItemsFromValidatedItems = (validatedItems) =>
-  validatedItems.map((item) => {
+export const buildRazorpayLineItems = (
+  validatedItems,
+  validatedReminders = [],
+) => {
+  const lineItems = validatedItems.map((item) => {
     const unitPricePaise = Math.round(item.price * 100);
     return {
       sku: String(item.product_id),
@@ -71,6 +77,30 @@ const buildLineItemsFromValidatedItems = (validatedItems) =>
       quantity: item.quantity,
     };
   });
+
+  for (const reminder of validatedReminders || []) {
+    const reminderAmountPaise = Math.round(Number(reminder.price ?? 0) * 100);
+    if (reminderAmountPaise <= 0) continue;
+
+    lineItems.push({
+      sku: `reminder-${reminder.product_id}`,
+      variant_id: `reminder-${reminder.product_id}`,
+      name: "Daily WhatsApp Reminder",
+      description: "Daily WhatsApp Reminder",
+      image_url: "",
+      price: reminderAmountPaise,
+      offer_price: reminderAmountPaise,
+      quantity: 1,
+    });
+  }
+
+  return lineItems;
+};
+
+const buildLineItemsFromValidatedItems = (
+  validatedItems,
+  validatedReminders = [],
+) => buildRazorpayLineItems(validatedItems, validatedReminders);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/create-order
@@ -386,16 +416,22 @@ export const createOrder = async (req, res) => {
       };
 
       if (isMagicCheckout) {
-        orderPayload.line_items =
-          buildLineItemsFromValidatedItems(validatedItems);
+        const magicCheckoutLineItems = buildLineItemsFromValidatedItems(
+          validatedItems,
+          validatedReminders,
+        );
+        orderPayload.line_items = magicCheckoutLineItems;
+
         const lineItemsTotalExclusiveOfShipping = Math.max(
           0,
-          orderTotals.productSubtotal +
-            orderTotals.dailyReminderPrice -
-            orderTotals.actualDiscount,
+          magicCheckoutLineItems.reduce(
+            (sum, item) => sum + item.offer_price * item.quantity,
+            0,
+          ) -
+            parsedDiscountAmount * 100,
         );
         orderPayload.line_items_total = Math.round(
-          lineItemsTotalExclusiveOfShipping * 100,
+          lineItemsTotalExclusiveOfShipping,
         );
       }
 
@@ -1612,7 +1648,7 @@ export const getShippingInfo = async (req, res) => {
   // as an extra charge on top of the already calculated order total.
   const razorpayShippingFeePaise = calculateRazorpayShippingFeePaise({
     isFreeShipping,
-    shippingFee,
+    shippingCharge: shippingFee,
   });
 
   const finalOrderTotal = Number(order.total ?? 0);
@@ -1746,14 +1782,6 @@ export const getShippingInfo = async (req, res) => {
       };
     }),
   );
-
-  console.info("[MAGIC CHECKOUT SHIPPING RESPONSE]", {
-    orderId: order.id,
-    shippingFeeRupees: shippingFee,
-    shippingFeePaise: razorpayShippingFeePaise,
-    isFreeShipping,
-    response: responseAddresses,
-  });
 
   console.info("[SHIPPING_INFO] Response ready", {
     orderId: order.id,
