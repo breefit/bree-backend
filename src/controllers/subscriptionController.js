@@ -13,7 +13,9 @@ import {
 import {
   sendSubscriptionStatusWhatsApp,
   sendPaymentStatusWhatsApp,
+  validateMobile,
 } from "../services/whatsappNotificationService.js";
+import { createDailyReminder } from "../services/dailyReminderService.js";
 
 // ── Shared logger ────────────────────────────────────────────────────────────
 // NOTE: No shared logging utility was found/confirmed in this codebase during
@@ -98,6 +100,7 @@ const validateSubscriptionRequest = (body) => {
     mobileNumber,
     shippingAddress,
     addressId,
+    reminders,
   } = body;
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -133,6 +136,7 @@ const validateSubscriptionRequest = (body) => {
     mobileNumber,
     shippingAddress,
     addressId,
+    reminders: Array.isArray(reminders) ? reminders : [],
   };
 };
 
@@ -248,6 +252,7 @@ export const createSubscription = async (req, res) => {
     mobileNumber,
     shippingAddress,
     addressId,
+    reminders,
   } = requestValidation;
 
   const itemsExtraction = extractRequestedItems(items);
@@ -278,7 +283,98 @@ export const createSubscription = async (req, res) => {
       .status(itemsValidation.status)
       .json({ message: itemsValidation.message });
   }
-  const { validatedItems, serverTotal } = itemsValidation;
+
+  const { validatedItems } = itemsValidation;
+  let reminderCharges = 0;
+  const validatedReminders = [];
+
+  if (Array.isArray(reminders) && reminders.length > 0) {
+    for (const reminder of reminders) {
+      if (!reminder?.enabled) continue;
+
+      const productId = reminder.product_id || reminder.productId;
+      const reminderTime = reminder.time;
+      const reminderQuantity = Number(reminder.quantity ?? 1);
+      const reminderPrice = Number(reminder.price ?? 0);
+      const reminderPhoneSource =
+        reminder.reminder_phone_source === "custom" ? "custom" : "profile";
+      const reminderWhatsappNumber =
+        reminder.reminder_whatsapp_number || reminder.custom_phone || null;
+
+      if (!productId) {
+        return res.status(400).json({
+          success: false,
+          message: "Reminder product is required.",
+        });
+      }
+
+      const product = productMap.get(String(productId));
+      if (!product) {
+        return res.status(400).json({
+          success: false,
+          message: `Reminder product ${productId} not found`,
+        });
+      }
+
+      const allowedReminderTimes = [
+        "04:00",
+        "04:30",
+        "05:00",
+        "05:30",
+        "06:00",
+      ];
+      if (!allowedReminderTimes.includes(reminderTime)) {
+        return res.status(400).json({
+          success: false,
+          message: "Please select a valid reminder time.",
+        });
+      }
+
+      if (reminderPhoneSource === "custom" && !reminderWhatsappNumber) {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter a valid WhatsApp number.",
+        });
+      }
+
+      try {
+        validateMobile(reminderWhatsappNumber || mobileNumber);
+      } catch {
+        return res.status(400).json({
+          success: false,
+          message: "Please enter a valid WhatsApp number.",
+        });
+      }
+
+      const dbReminderPricePerUnit = Number(product.daily_reminder_price || 0);
+      const expectedReminderCharge = dbReminderPricePerUnit * reminderQuantity;
+
+      if (Math.abs(reminderPrice - expectedReminderCharge) > 0.5) {
+        logger.warn("[SUBSCRIPTION] Reminder price mismatch", {
+          productId,
+          frontend: reminderPrice,
+          calculated: expectedReminderCharge,
+        });
+        return res.status(400).json({
+          success: false,
+          message: "Reminder price mismatch. Please refresh and try again.",
+        });
+      }
+
+      reminderCharges += expectedReminderCharge;
+      validatedReminders.push({
+        product_id: productId,
+        time: reminderTime,
+        price: expectedReminderCharge,
+        reminder_phone_source: reminderPhoneSource,
+        reminder_whatsapp_number: reminderWhatsappNumber
+          ? validateMobile(reminderWhatsappNumber)
+          : validateMobile(mobileNumber),
+      });
+    }
+  }
+
+  const serverTotal = itemsValidation.serverTotal + reminderCharges;
 
   // Validate amount before touching Razorpay.
   if (!(serverTotal > 0)) {
@@ -487,6 +583,44 @@ export const createSubscription = async (req, res) => {
       ) VALUES ${orderItemsPlaceholders.join(", ")}`,
       orderItemsValues,
     );
+
+    if (validatedReminders.length > 0) {
+      for (const reminder of validatedReminders) {
+        const { rows: itemRows } = await client.query(
+          `SELECT id FROM order_items WHERE order_id = ? AND product_id = ? LIMIT 1`,
+          [orderId, reminder.product_id],
+        );
+
+        if (!itemRows.length) continue;
+
+        try {
+          await createDailyReminder({
+            userId,
+            orderId,
+            orderItemId: itemRows[0].id,
+            productId: reminder.product_id,
+            reminderTime: reminder.time,
+            reminderPricePaid: reminder.price,
+            reminderOriginalPrice: Number(
+              productMap.get(String(reminder.product_id))
+                ?.daily_reminder_original_price || reminder.price,
+            ),
+            packageDurationDays: Number(
+              productMap.get(String(reminder.product_id))
+                ?.package_duration_days || 30,
+            ),
+            reminderWhatsappNumber: reminder.reminder_whatsapp_number,
+            reminderPhoneSource: reminder.reminder_phone_source,
+          });
+        } catch (reminderErr) {
+          logger.warn("[SUBSCRIPTION] Daily reminder creation failed", {
+            orderId,
+            productId: reminder.product_id,
+            message: reminderErr?.message || String(reminderErr),
+          });
+        }
+      }
+    }
 
     const paymentId = randomUUID();
     await client.query(
