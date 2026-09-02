@@ -217,7 +217,9 @@ const fetchAndLockProducts = async (productIds) => {
 
     const placeholders = uniqueIds.map(() => "?").join(", ");
     const { rows } = await client.query(
-      `SELECT id, name, image, price, razorpay_plan_id, is_subscription
+      `SELECT id, name, image, price, razorpay_plan_id, is_subscription,
+              daily_reminder_original_price, package_duration_months,
+              package_fulfillment_interval_days, is_recurring_package
        FROM products
        WHERE id IN (${placeholders}) AND is_active = 1`,
       uniqueIds,
@@ -605,10 +607,14 @@ export const createSubscription = async (req, res) => {
               productMap.get(String(reminder.product_id))
                 ?.daily_reminder_original_price || reminder.price,
             ),
-            packageDurationDays: Number(
-              productMap.get(String(reminder.product_id))
-                ?.package_duration_days || 30,
-            ),
+            packageDurationDays: (() => {
+              const product = productMap.get(String(reminder.product_id));
+              return Number(product?.is_recurring_package) === 1 &&
+                Number(product?.package_duration_months) > 0
+                ? Number(product.package_duration_months) *
+                    Number(product.package_fulfillment_interval_days || 30)
+                : null;
+            })(),
             reminderWhatsappNumber: reminder.reminder_whatsapp_number,
             reminderPhoneSource: reminder.reminder_phone_source,
             queryExecutor: client.query.bind(client),

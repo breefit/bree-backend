@@ -1262,10 +1262,11 @@ export const verifyPayment = async (req, res) => {
             continue;
           }
 
-          // Fetch product details (reminder enabled, original price, duration)
+          // Fetch reminder pricing and existing package-duration fields.
           const { rows: prodRows } = await client.query(
             `SELECT daily_reminder_enabled, daily_reminder_original_price,
-                    package_duration_days
+                    is_recurring_package, package_duration_months,
+                    package_fulfillment_interval_days
              FROM products
              WHERE id = ? AND is_active = 1`,
             [productId],
@@ -1280,6 +1281,12 @@ export const verifyPayment = async (req, res) => {
           }
 
           const product = prodRows[0];
+          const packageDurationDays =
+            Number(product.is_recurring_package) === 1 &&
+            Number(product.package_duration_months) > 0
+              ? Number(product.package_duration_months) *
+                Number(product.package_fulfillment_interval_days || 30)
+              : null;
 
           // Fetch order_item to link reminder to order_item
           const { rows: oiRows } = await client.query(
@@ -1310,7 +1317,7 @@ export const verifyPayment = async (req, res) => {
               reminderPricePaid: reminderPrice,
               reminderOriginalPrice:
                 Number(product.daily_reminder_original_price) || reminderPrice,
-              packageDurationDays: Number(product.package_duration_days) || 30,
+              packageDurationDays,
               reminderWhatsappNumber: reminderWhatsappNumber,
               reminderPhoneSource,
               queryExecutor: client.query.bind(client),
