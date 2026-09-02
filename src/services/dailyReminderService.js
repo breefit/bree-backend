@@ -58,6 +58,10 @@ export const createDailyReminder = async ({
     const safePhoneSource =
       reminderPhoneSource === "custom" ? "custom" : "profile";
 
+    if (!(Number(reminderPricePaid) >= 0)) {
+      throw new Error("Invalid reminder price");
+    }
+
     await queryExecutor(
       `
       INSERT INTO daily_reminders
@@ -93,10 +97,7 @@ export const createDailyReminder = async ({
     return { success: true, reminderId };
   } catch (error) {
     console.error("[Reminder] Error creating reminder:", error);
-    return {
-      success: false,
-      error: error.message,
-    };
+    throw error;
   }
 };
 

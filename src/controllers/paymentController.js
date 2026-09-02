@@ -1229,7 +1229,12 @@ export const verifyPayment = async (req, res) => {
     );
 
     // ── Create daily reminders if provided ─────────────────────────────────
-    if (Array.isArray(reminders) && reminders.length > 0 && order.user_id) {
+    console.info("[VERIFY_PAYMENT] Reminder payload received", {
+      orderId: order.id,
+      reminderCount: Array.isArray(reminders) ? reminders.length : 0,
+    });
+
+    if (Array.isArray(reminders) && reminders.length > 0) {
       try {
         const ALLOWED_REMINDER_TIMES = [
           "04:00",
@@ -1296,7 +1301,7 @@ export const verifyPayment = async (req, res) => {
 
           // Create daily reminder
           try {
-            await createDailyReminder({
+            const reminderResult = await createDailyReminder({
               userId: order.user_id,
               orderId: order.id,
               orderItemId,
@@ -1311,6 +1316,12 @@ export const verifyPayment = async (req, res) => {
               queryExecutor: client.query.bind(client),
             });
 
+            if (!reminderResult?.success) {
+              throw new Error(
+                reminderResult?.error || "Daily reminder creation failed",
+              );
+            }
+
             console.info("[VERIFY_PAYMENT] Daily reminder created", {
               orderId: order.id,
               productId,
@@ -1322,7 +1333,7 @@ export const verifyPayment = async (req, res) => {
               productId,
               error: reminderErr.message,
             });
-            // Continue with other reminders even if one fails
+            throw reminderErr;
           }
         }
       } catch (remindersErr) {
@@ -1330,7 +1341,7 @@ export const verifyPayment = async (req, res) => {
           orderId: order.id,
           error: remindersErr.message,
         });
-        // Don't roll back transaction — order payment is valid even if reminders fail
+        throw remindersErr;
       }
     }
 

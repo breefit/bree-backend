@@ -594,7 +594,7 @@ export const createSubscription = async (req, res) => {
         if (!itemRows.length) continue;
 
         try {
-          await createDailyReminder({
+          const reminderResult = await createDailyReminder({
             userId,
             orderId,
             orderItemId: itemRows[0].id,
@@ -613,12 +613,19 @@ export const createSubscription = async (req, res) => {
             reminderPhoneSource: reminder.reminder_phone_source,
             queryExecutor: client.query.bind(client),
           });
+
+          if (!reminderResult?.success) {
+            throw new Error(
+              reminderResult?.error || "Daily reminder creation failed",
+            );
+          }
         } catch (reminderErr) {
           logger.warn("[SUBSCRIPTION] Daily reminder creation failed", {
             orderId,
             productId: reminder.product_id,
             message: reminderErr?.message || String(reminderErr),
           });
+          throw reminderErr;
         }
       }
     }
