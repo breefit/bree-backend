@@ -38,6 +38,7 @@ export const createDailyReminder = async ({
   packageDurationDays = null,
   reminderWhatsappNumber = null,
   reminderPhoneSource = "profile",
+  queryExecutor = query,
 }) => {
   try {
     // Validate reminder time (must be one of: 04:00, 04:30, 05:00, 05:30, 06:00)
@@ -57,7 +58,7 @@ export const createDailyReminder = async ({
     const safePhoneSource =
       reminderPhoneSource === "custom" ? "custom" : "profile";
 
-    await query(
+    await queryExecutor(
       `
       INSERT INTO daily_reminders
       (id, user_id, order_id, order_item_id, product_id,

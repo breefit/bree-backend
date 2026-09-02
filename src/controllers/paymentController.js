@@ -1308,6 +1308,7 @@ export const verifyPayment = async (req, res) => {
               packageDurationDays: Number(product.package_duration_days) || 30,
               reminderWhatsappNumber: reminderWhatsappNumber,
               reminderPhoneSource,
+              queryExecutor: client.query.bind(client),
             });
 
             console.info("[VERIFY_PAYMENT] Daily reminder created", {

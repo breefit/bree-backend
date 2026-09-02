@@ -611,6 +611,7 @@ export const createSubscription = async (req, res) => {
             ),
             reminderWhatsappNumber: reminder.reminder_whatsapp_number,
             reminderPhoneSource: reminder.reminder_phone_source,
+            queryExecutor: client.query.bind(client),
           });
         } catch (reminderErr) {
           logger.warn("[SUBSCRIPTION] Daily reminder creation failed", {
