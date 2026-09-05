@@ -4,6 +4,20 @@ import cache from "../../utils/cache.js";
 
 const DASHBOARD_TTL = 120;
 
+const normalizeRecentOrderItems = (value) => {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+};
+
 // GET /api/admin/dashboard
 export const getDashboardStats = async (req, res) => {
   try {
@@ -97,12 +111,43 @@ export const getDashboardStats = async (req, res) => {
           ${amountExprWithAlias} AS amount,
           o.order_status,
           o.payment_status,
-          o.created_at
+          o.created_at,
+          COALESCE(
+            (
+              SELECT GROUP_CONCAT(DISTINCT COALESCE(p.name, oi2.product_name) ORDER BY oi2.created_at ASC SEPARATOR ', ')
+              FROM order_items oi2
+              LEFT JOIN products p ON p.id = oi2.product_id
+              WHERE oi2.order_id = o.id
+            ),
+            ''
+          ) AS product_names,
+          COALESCE(
+            (
+              SELECT JSON_ARRAYAGG(JSON_OBJECT(
+                'id', oi3.id,
+                'product_id', oi3.product_id,
+                'product_name', COALESCE(p2.name, oi3.product_name),
+                'name', COALESCE(p2.name, oi3.product_name),
+                'quantity', oi3.quantity,
+                'unit_price', oi3.product_price,
+                'total_price', oi3.subtotal
+              ))
+              FROM order_items oi3
+              LEFT JOIN products p2 ON p2.id = oi3.product_id
+              WHERE oi3.order_id = o.id
+            ),
+            JSON_ARRAY()
+          ) AS items
         FROM orders o
         ORDER BY o.created_at DESC
         LIMIT 5
       `),
     ]);
+
+    const recentOrders = (recentOrdersRes.rows || []).map((order) => ({
+      ...order,
+      items: normalizeRecentOrderItems(order.items),
+    }));
 
     const payload = {
       total_orders: Number(ordersRes.rows?.[0]?.total || 0),
@@ -119,7 +164,7 @@ export const getDashboardStats = async (req, res) => {
 
       orders_this_week: Number(weeklyOrdersRes.rows?.[0]?.total || 0),
 
-      recent_orders: recentOrdersRes.rows || [],
+      recent_orders: recentOrders,
     };
 
     cache.set(cacheKey, payload, DASHBOARD_TTL);
