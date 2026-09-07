@@ -898,7 +898,9 @@ const syncMissingUserContactFields = async (
 };
 
 export const shouldClaimOrderConfirmation = ({ paymentStatus, sentAt }) =>
-  paymentStatus === "paid" && !sentAt;
+  String(paymentStatus || "")
+    .trim()
+    .toLowerCase() === "paid" && !sentAt;
 
 export const getOrderConfirmationRecipients = (order = {}) => ({
   email: order.contact_email || order.email || null,
@@ -923,11 +925,23 @@ const claimOrderConfirmationChannel = async (orderId, channel) => {
       ? "order_confirmation_email_sent_at"
       : "order_confirmation_whatsapp_sent_at";
   const { rows } = await query(
-    `SELECT payment_status, ${column} AS sent_at
+    `SELECT TRIM(LOWER(payment_status)) AS payment_status,
+        ${column} AS sent_at
      FROM orders WHERE id = ? LIMIT 1`,
     [orderId],
   );
-  return Boolean(rows[0] && shouldClaimOrderConfirmation(rows[0]));
+  const state = rows[0] || null;
+  const eligible = Boolean(state && shouldClaimOrderConfirmation(state));
+  console.info("[ORDER_CONFIRMATION] Claim decision", {
+    orderId,
+    channel,
+    paymentStatus: state?.payment_status ?? null,
+    sentAt: state?.sent_at ?? null,
+    alreadySent: Boolean(state?.sent_at),
+    inFlight: orderConfirmationInFlight.has(`${orderId}:${channel}`),
+    eligible,
+  });
+  return eligible;
 };
 
 const markOrderConfirmationSent = async (orderId, channel) => {
@@ -2573,6 +2587,10 @@ export const handleWebhook = async (req, res) => {
               storedPaymentId,
               incomingPaymentId: rzpPaymentId,
             });
+            const wasAlreadyPaid =
+              String(lockedOrder?.payment_status || "")
+                .trim()
+                .toLowerCase() === "paid";
 
             console.info("[WEBHOOK] Payment state transition", {
               event,
@@ -2657,6 +2675,8 @@ export const handleWebhook = async (req, res) => {
                  contact_phone = COALESCE(?, contact_phone),
                  shipping_address = COALESCE(?, shipping_address),
                  address_id = COALESCE(?, address_id),
+                 order_confirmation_email_sent_at = CASE WHEN ? = 0 THEN NULL ELSE order_confirmation_email_sent_at END,
+                 order_confirmation_whatsapp_sent_at = CASE WHEN ? = 0 THEN NULL ELSE order_confirmation_whatsapp_sent_at END,
                  paid_at = COALESCE(paid_at, NOW()),
                  updated_at = NOW()
                WHERE id = ?`,
@@ -2670,6 +2690,8 @@ export const handleWebhook = async (req, res) => {
                 webhookPhone || null,
                 webhookShippingAddress,
                 webhookAddressId,
+                wasAlreadyPaid ? 1 : 0,
+                wasAlreadyPaid ? 1 : 0,
                 order.id,
               ],
             );

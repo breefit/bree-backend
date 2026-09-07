@@ -125,6 +125,10 @@ test("claims confirmation only for paid orders without a sent timestamp", () => 
     }),
     false,
   );
+  assert.equal(
+    shouldClaimOrderConfirmation({ paymentStatus: " PAID ", sentAt: null }),
+    true,
+  );
 });
 
 test("resolves guest checkout contacts from the order record", () => {

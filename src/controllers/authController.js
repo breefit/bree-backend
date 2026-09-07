@@ -88,23 +88,6 @@ const getLatestOtpRecord = async (mobile) => {
   return rows[0] || null;
 };
 
-// Looks up a verified, unexpired OTP session for this mobile. Used to gate
-// completeProfile() so it can never be reached without a real prior OTP
-// verification — the frontend-supplied mobile is never trusted on its own.
-const getVerifiedOtpRecord = async (mobile) => {
-  const { rows } = await query(
-    `SELECT id, mobile, expires_at, verified, verified_at
-     FROM otp_verifications
-     WHERE mobile = ?
-       AND verified = TRUE
-       AND expires_at > NOW()
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [mobile],
-  );
-  return rows[0] || null;
-};
-
 const clearOtpRecords = async (mobile) => {
   await query("DELETE FROM otp_verifications WHERE mobile = ?", [mobile]);
 };
@@ -317,23 +300,20 @@ export const verifyOtp = async (req, res, next) => {
 
     const user = rows[0];
 
-    // No existing user — do not create one here. Mark this OTP record as
-    // verified (instead of deleting it) so completeProfile() has a
-    // short-lived, server-side proof that this mobile actually passed OTP
-    // verification. The record is only deleted once the user is created.
+    // First-time mobile login creates the user immediately. Contact details
+    // remain optional and can be completed later through normal profile edits
+    // or verified payment data.
     if (!user) {
-      await query(
-        `UPDATE otp_verifications
-         SET verified = TRUE, verified_at = CURRENT_TIMESTAMP
-         WHERE id = ?`,
-        [record.id],
-      );
-
+      await query("DELETE FROM otp_verifications WHERE id = ?", [record.id]);
+      const createdUser = await createPhoneUserWithCustomerNumber({
+        mobile,
+        name: "BREE Customer",
+      });
+      const accessToken = await setAuthCookies(res, createdUser.id, req);
       return res.json({
         success: true,
-        isNewUser: true,
-        mobile,
-        message: "Profile completion required.",
+        ...safeUser(createdUser),
+        accessToken,
       });
     }
 
@@ -346,63 +326,6 @@ export const verifyOtp = async (req, res, next) => {
     const accessToken = await setAuthCookies(res, user.id, req);
     return res.json({
       success: true,
-      isNewUser: false,
-      ...safeUser(user),
-      accessToken,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// POST /api/auth/complete-profile
-export const completeProfile = async (req, res, next) => {
-  try {
-    const { mobile, name } = req.body;
-
-    if (!isValidMobile(mobile)) {
-      return res.status(400).json({
-        message: "A valid 10-digit mobile number is required.",
-      });
-    }
-
-    const trimmedName = typeof name === "string" ? name.trim() : "";
-    if (trimmedName.length < 2) {
-      return res.status(400).json({
-        message: "Name must contain at least 2 characters.",
-      });
-    }
-
-    // Never trust the mobile number on its own — require a verified,
-    // unexpired OTP session for it before creating anything.
-    const verifiedOtp = await getVerifiedOtpRecord(mobile);
-    if (!verifiedOtp) {
-      return res.status(401).json({ message: "OTP verification required." });
-    }
-
-    const { rows } = await query(
-      `SELECT id, name, email, phone, picture, provider, role, customer_number
-       FROM users WHERE phone = ?`,
-      [mobile],
-    );
-
-    if (rows[0]) {
-      return res.status(409).json({ message: "User already exists." });
-    }
-
-    const user = await createPhoneUserWithCustomerNumber({
-      mobile,
-      name: trimmedName,
-    });
-
-    // User created successfully — the verified OTP session has now been
-    // consumed and must not be reusable for another completeProfile() call.
-    await clearOtpRecords(mobile);
-
-    const accessToken = await setAuthCookies(res, user.id, req);
-    return res.json({
-      success: true,
-      isNewUser: false,
       ...safeUser(user),
       accessToken,
     });

@@ -314,7 +314,7 @@ Customer
   → POST /api/auth/send-otp  (mobile OTP, WhatsApp-delivered)
   → POST /api/auth/verify-otp
        existing user  → session established (cookie + accessToken)
-       new user       → POST /api/auth/complete-profile → session established
+      new user       → user row created during OTP verification → session established
   OR
   → POST /api/auth/google  (Firebase ID token verified server-side via firebase-admin)
   → session established
@@ -323,7 +323,7 @@ Customer
 ```
 
 - OTPs are stored hashed (`bcryptjs`) in `otp_verifications` with a 5-minute expiry, a 5-attempt cap, and a 30-second resend cooldown; WhatsApp delivery is via `sendWhatsAppOtp` (`services/whatsappService.js`, Waplify).
-- A brand-new phone number never gets a user row from `verify-otp` alone — the OTP record is marked `verified` and `complete-profile` (which re-checks that verified/unexpired OTP record server-side, never trusting the mobile number on its own) is what actually creates the `users` row, inside a transaction with `ensureUserCustomerNumber`.
+- A brand-new phone number creates its `users` row during successful OTP verification, inside the existing customer-number transaction. Email and other contact fields remain optional.
 - Google Sign-In verifies the Firebase ID token via `firebase-admin`'s `verifyIdToken`, then upserts the user (`ON DUPLICATE KEY UPDATE`) by email.
 - Sessions use a **short-lived access token** (`JWT_SECRET`, cookie `auth_token`) and a **longer-lived refresh token** (DB-backed, cookie `refresh_token`) — `GET /api/auth/verify` transparently rotates an expired access token using a valid, unrevoked refresh token.
 - `middleware/auth.js` exports `auth` (hard requirement — 401 if no/invalid token or user not found) and `optionalAuth` (attaches `req.user` if a valid token is present, otherwise proceeds unauthenticated) — used for endpoints that behave differently for guests vs. logged-in users (e.g. cart validation, payment status).
@@ -355,17 +355,16 @@ Grouped by area. **Auth** column reflects the actual middleware on each route. O
 
 ### Auth (`/api/auth`, `routes/auth.js`)
 
-| Method | Path                         | Auth                                                            | Purpose                                                                    |
-| ------ | ---------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| POST   | `/api/auth/send-otp`         | Public                                                          | Send a mobile OTP via WhatsApp                                             |
-| POST   | `/api/auth/verify-otp`       | Public                                                          | Verify OTP; logs in existing users, flags new users for profile completion |
-| POST   | `/api/auth/resend-otp`       | Public                                                          | Resend OTP (rate-limited via cooldown)                                     |
-| POST   | `/api/auth/complete-profile` | Public (requires a prior verified OTP record)                   | Create a new user after OTP verification                                   |
-| POST   | `/api/auth/google`           | Public                                                          | Google Sign-In via Firebase ID token                                       |
-| PATCH  | `/api/auth/change-password`  | Required                                                        | Change password (email/password accounts)                                  |
-| GET    | `/api/auth/verify`           | Public (cookie/token optional — returns 401 if session invalid) | Verify/refresh the current session                                         |
-| GET    | `/api/auth/me`               | Required                                                        | Get the current authenticated user                                         |
-| POST   | `/api/auth/logout`           | Public                                                          | Revoke refresh token(s) and clear auth cookies                             |
+| Method | Path                        | Auth                                                            | Purpose                                        |
+| ------ | --------------------------- | --------------------------------------------------------------- | ---------------------------------------------- |
+| POST   | `/api/auth/send-otp`        | Public                                                          | Send a mobile OTP via WhatsApp                 |
+| POST   | `/api/auth/verify-otp`      | Public                                                          | Verify OTP and establish the user session      |
+| POST   | `/api/auth/resend-otp`      | Public                                                          | Resend OTP (rate-limited via cooldown)         |
+| POST   | `/api/auth/google`          | Public                                                          | Google Sign-In via Firebase ID token           |
+| PATCH  | `/api/auth/change-password` | Required                                                        | Change password (email/password accounts)      |
+| GET    | `/api/auth/verify`          | Public (cookie/token optional — returns 401 if session invalid) | Verify/refresh the current session             |
+| GET    | `/api/auth/me`              | Required                                                        | Get the current authenticated user             |
+| POST   | `/api/auth/logout`          | Public                                                          | Revoke refresh token(s) and clear auth cookies |
 
 ### Users / Profile / Addresses
 
