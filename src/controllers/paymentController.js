@@ -79,6 +79,28 @@ export const classifyPaymentState = ({
   return "reconcile";
 };
 
+export const getMissingContactUpdates = ({
+  currentEmail,
+  currentPhone,
+  verifiedEmail,
+  verifiedPhone,
+} = {}) => {
+  const email =
+    typeof verifiedEmail === "string" ? verifiedEmail.trim().toLowerCase() : "";
+  const phone = typeof verifiedPhone === "string" ? verifiedPhone.trim() : "";
+
+  return {
+    email:
+      !String(currentEmail || "").trim() && /^\S+@\S+\.\S+$/.test(email)
+        ? email
+        : null,
+    phone: !String(currentPhone || "").trim() && phone ? phone : null,
+  };
+};
+
+export const shouldRecordPaymentHistory = (paymentStatus) =>
+  paymentStatus !== "paid";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Build Razorpay Magic Checkout line_items from server-validated cart items.
 // Reminder charges are represented as a real positive line item so Razorpay
@@ -806,6 +828,177 @@ const upsertStructuredAddressForOrder = async (
   return addressId;
 };
 
+const syncMissingUserContactFields = async (
+  client,
+  userId,
+  { email, phone } = {},
+) => {
+  if (!userId) return { emailUpdated: false, phoneUpdated: false };
+
+  const { rows: userRows } = await client.query(
+    "SELECT email, phone FROM users WHERE id = ? FOR UPDATE",
+    [userId],
+  );
+  if (!userRows.length) return { emailUpdated: false, phoneUpdated: false };
+
+  const { email: normalizedEmail, phone: normalizedPhone } =
+    getMissingContactUpdates({
+      currentEmail: userRows[0].email,
+      currentPhone: userRows[0].phone,
+      verifiedEmail: email,
+      verifiedPhone: phone,
+    });
+  const updates = { emailUpdated: false, phoneUpdated: false };
+
+  if (normalizedEmail) {
+    const { rows: emailOwners } = await client.query(
+      "SELECT id FROM users WHERE email = ? AND id <> ? LIMIT 1",
+      [normalizedEmail, userId],
+    );
+    if (!emailOwners.length) {
+      try {
+        const result = await client.query(
+          "UPDATE users SET email = ?, updated_at = NOW() WHERE id = ? AND (email IS NULL OR TRIM(email) = '')",
+          [normalizedEmail, userId],
+        );
+        updates.emailUpdated = Boolean(result.affectedRows || result.rowCount);
+      } catch (err) {
+        if (err?.code !== "ER_DUP_ENTRY" && err?.errno !== 1062) throw err;
+      }
+    }
+  }
+
+  if (normalizedPhone) {
+    const { rows: phoneOwners } = await client.query(
+      "SELECT id FROM users WHERE phone = ? AND id <> ? LIMIT 1",
+      [normalizedPhone, userId],
+    );
+    if (!phoneOwners.length) {
+      try {
+        const result = await client.query(
+          "UPDATE users SET phone = ?, updated_at = NOW() WHERE id = ? AND (phone IS NULL OR TRIM(phone) = '')",
+          [normalizedPhone, userId],
+        );
+        updates.phoneUpdated = Boolean(result.affectedRows || result.rowCount);
+      } catch (err) {
+        if (err?.code !== "ER_DUP_ENTRY" && err?.errno !== 1062) throw err;
+      }
+    }
+  }
+
+  if (updates.emailUpdated || updates.phoneUpdated) {
+    console.info("[PAYMENT] Completed missing user contact fields", {
+      userId,
+      emailUpdated: updates.emailUpdated,
+      phoneUpdated: updates.phoneUpdated,
+    });
+  }
+
+  return updates;
+};
+
+export const shouldClaimOrderConfirmation = ({ paymentStatus, sentAt }) =>
+  paymentStatus === "paid" && !sentAt;
+
+export const getOrderConfirmationRecipients = (order = {}) => ({
+  email: order.contact_email || order.email || null,
+  phone: order.contact_phone || order.mobile_number || null,
+});
+
+const claimOrderConfirmationChannel = async (orderId, channel) => {
+  const column =
+    channel === "email"
+      ? "order_confirmation_email_sent_at"
+      : "order_confirmation_whatsapp_sent_at";
+  const client = await getClient();
+
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `SELECT payment_status, ${column} AS sent_at
+       FROM orders WHERE id = ? FOR UPDATE`,
+      [orderId],
+    );
+    const order = rows[0];
+    if (!order || !shouldClaimOrderConfirmation(order)) {
+      await client.query("COMMIT");
+      return false;
+    }
+
+    await client.query(
+      `UPDATE orders SET ${column} = NOW(), updated_at = NOW() WHERE id = ?`,
+      [orderId],
+    );
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+};
+
+const notifyInitialOrderConfirmation = async (orderId) => {
+  try {
+    const { rows: orderRows } = await query(
+      `SELECT id, order_number, customer_name, contact_name, email,
+              contact_email, mobile_number, contact_phone, total, amount,
+              shipping_address, paid_at, payment_status
+       FROM orders WHERE id = ? LIMIT 1`,
+      [orderId],
+    );
+    const order = orderRows[0];
+    if (!order || order.payment_status !== "paid") return;
+
+    const { rows: itemRows } = await query(
+      `SELECT product_name AS name, quantity, product_price AS price, subtotal
+       FROM order_items WHERE order_id = ?`,
+      [order.id],
+    );
+    const name = order.contact_name || order.customer_name || "Customer";
+    const { email, phone } = getOrderConfirmationRecipients(order);
+    const amount = Number(order.total ?? order.amount ?? 0);
+    const orderNumber = order.order_number || order.id;
+
+    if (email && (await claimOrderConfirmationChannel(order.id, "email"))) {
+      sendOrderConfirmationEmail({
+        to: email,
+        name,
+        orderId: order.id,
+        amount,
+        items: itemRows,
+        shippingAddress: order.shipping_address,
+      }).catch((err) => {
+        console.error("[EMAIL] Confirmation email failed", {
+          orderId: order.id,
+          message: err?.message || String(err),
+        });
+      });
+    }
+
+    if (phone && (await claimOrderConfirmationChannel(order.id, "whatsapp"))) {
+      await safelySendWhatsApp("Order Confirmed", () =>
+        sendOrderConfirmationWhatsApp({
+          mobile: phone,
+          customerName: name,
+          orderNumber,
+          orderAmount: amount,
+          orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString(
+            "en-IN",
+          ),
+          orderUuid: order.id,
+        }),
+      );
+    }
+  } catch (err) {
+    console.error("[ORDER_CONFIRMATION] Notification dispatch failed", {
+      orderId,
+      message: err?.message || String(err),
+    });
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Normalise a Delhivery serviceability response into a boolean.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -981,6 +1174,7 @@ export const verifyPayment = async (req, res) => {
     [razorpay_payment_id],
   );
   if (alreadyProcessed.length) {
+    notifyInitialOrderConfirmation(alreadyProcessed[0].id);
     console.info(
       "[VERIFY_PAYMENT] Duplicate blocked (payment_id seen before)",
       {
@@ -1061,6 +1255,7 @@ export const verifyPayment = async (req, res) => {
   });
 
   if (paymentState === "already_paid") {
+    notifyInitialOrderConfirmation(order.id);
     return res.json({
       success: true,
       order_id: order.id,
@@ -1105,6 +1300,7 @@ export const verifyPayment = async (req, res) => {
 
     if (lockedPaymentState === "already_paid") {
       await client.query("COMMIT");
+      notifyInitialOrderConfirmation(lockedOrder.id);
       return res.json({
         success: true,
         order_id: lockedOrder.id,
@@ -1125,6 +1321,11 @@ export const verifyPayment = async (req, res) => {
         message: "Order already processed with a different payment id",
       });
     }
+
+    await syncMissingUserContactFields(client, lockedOrder.user_id, {
+      email: razorpayCustomerDetails?.email,
+      phone: razorpayCustomerDetails?.contact,
+    });
 
     const razorpayShippingAddrObj = razorpayCustomerDetails?.shipping_address;
     const razorpayShippingAddress = formatRazorpayShippingAddress(
@@ -1289,7 +1490,7 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    if (lockedOrder.payment_status !== "paid") {
+    if (shouldRecordPaymentHistory(lockedOrder.payment_status)) {
       await client.query(
         `INSERT INTO order_status_history
            (order_id, previous_status, new_status, changed_by, notes)
@@ -1450,12 +1651,6 @@ export const verifyPayment = async (req, res) => {
     client.release();
   }
 
-  const { rows: itemRows } = await query(
-    `SELECT product_name AS name, quantity, product_price AS price, subtotal
-     FROM order_items WHERE order_id = ?`,
-    [order.id],
-  );
-
   // Recurring package detection — no-op for every normal order (only fires
   // when the order actually contains an is_recurring_package product).
   // Fire-and-forget: must never affect the already-successful payment
@@ -1467,42 +1662,7 @@ export const verifyPayment = async (req, res) => {
     });
   });
 
-  sendOrderConfirmationEmail({
-    to: resolvedEmail,
-    name: resolvedName,
-    orderId: order.id,
-    amount: dbTotal,
-    items: itemRows,
-    shippingAddress: resolvedAddress,
-  }).catch((err) => {
-    console.error("[EMAIL] Confirmation email failed", {
-      orderId: order.id,
-      message: err?.message || String(err),
-    });
-  });
-
-  console.info("[WHATSAPP] Preparing order confirmation", {
-    orderId: order.id,
-    orderNumber: order.order_number,
-    hasPhone: Boolean(resolvedPhone),
-  });
-
-  if (resolvedPhone) {
-    await safelySendWhatsApp("Order Confirmed", () =>
-      sendOrderConfirmationWhatsApp({
-        mobile: resolvedPhone,
-        customerName: resolvedName,
-        orderNumber: order.order_number || order.id,
-        orderAmount: dbTotal,
-        orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString(
-          "en-IN",
-        ),
-        orderUuid: order.id,
-      }),
-    );
-  } else {
-    console.warn("[WhatsApp] Skipped: No mobile number found.");
-  }
+  notifyInitialOrderConfirmation(order.id);
 
   let nextBillingDate = null;
   if (isSubscriptionOrder && razorpay_subscription_id) {
@@ -2388,7 +2548,10 @@ export const handleWebhook = async (req, res) => {
               webhookCustomerDetails?.contact ||
               lockedOrder.mobile_number ||
               lockedOrder.contact_phone;
-            const wasAlreadyPaid = lockedOrder.payment_status === "paid";
+            await syncMissingUserContactFields(whClient, lockedOrder.user_id, {
+              email: webhookCustomerDetails?.email,
+              phone: webhookCustomerDetails?.contact,
+            });
 
             await whClient.query(
               `UPDATE orders SET
@@ -2427,7 +2590,7 @@ export const handleWebhook = async (req, res) => {
               [rzpPaymentId, rzpOrderId],
             );
 
-            if (!wasAlreadyPaid) {
+            if (shouldRecordPaymentHistory(lockedOrder.payment_status)) {
               await whClient.query(
                 `INSERT INTO order_status_history
                    (order_id, previous_status, new_status, changed_by, notes)
@@ -2449,6 +2612,7 @@ export const handleWebhook = async (req, res) => {
             whClient.release();
           }
 
+          notifyInitialOrderConfirmation(order.id);
           emitUpdate(order.id, "paid");
 
           createPackagePurchaseFromOrder(order.id).catch((err) => {

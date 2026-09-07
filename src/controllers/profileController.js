@@ -22,7 +22,7 @@ export const getProfile = async (req, res, next) => {
 // PUT /api/profile
 export const updateProfile = async (req, res, next) => {
   try {
-    const { name, phone } = req.body;
+    const { name, email, phone } = req.body;
     const updates = [];
     const params = [];
     let idx = 1;
@@ -34,6 +34,21 @@ export const updateProfile = async (req, res, next) => {
     if (phone !== undefined) {
       updates.push(`phone = $${idx++}`);
       params.push(phone.trim());
+    }
+    if (email !== undefined) {
+      const normalizedEmail = email.trim().toLowerCase();
+      if (!/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+        return res.status(400).json({ message: "Invalid email address" });
+      }
+      const { rows: emailOwners } = await query(
+        "SELECT id FROM users WHERE email = ? AND id <> ? LIMIT 1",
+        [normalizedEmail, req.user.id],
+      );
+      if (emailOwners.length) {
+        return res.status(409).json({ message: "Email is already in use" });
+      }
+      updates.push(`email = $${idx++}`);
+      params.push(normalizedEmail);
     }
 
     if (!updates.length)

@@ -174,6 +174,8 @@ CREATE TABLE IF NOT EXISTS orders (
 
   razorpay_order_id        VARCHAR(255)  DEFAULT NULL,
   razorpay_payment_id      VARCHAR(255)  DEFAULT NULL,
+  order_confirmation_email_sent_at DATETIME NULL DEFAULT NULL,
+  order_confirmation_whatsapp_sent_at DATETIME NULL DEFAULT NULL,
 
   razorpay_subscription_id VARCHAR(255)  DEFAULT NULL,
   razorpay_plan_id         VARCHAR(255)  DEFAULT NULL,

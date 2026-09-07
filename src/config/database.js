@@ -849,6 +849,49 @@ const ensureOrderShippingAddressColumns = async () => {
   }
 };
 
+// Normal paid orders use these timestamps to claim each customer confirmation
+// channel exactly once across frontend verification and Razorpay webhook races.
+const ensureOrderConfirmationNotificationColumns = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'orders'
+         AND column_name IN (
+           'order_confirmation_email_sent_at',
+           'order_confirmation_whatsapp_sent_at'
+         )`,
+      [currentDb],
+    );
+
+    const existing = new Set(cols.map((column) => column.column_name));
+    const additions = [];
+    if (!existing.has("order_confirmation_email_sent_at")) {
+      additions.push(
+        "ADD COLUMN order_confirmation_email_sent_at DATETIME NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("order_confirmation_whatsapp_sent_at")) {
+      additions.push(
+        "ADD COLUMN order_confirmation_whatsapp_sent_at DATETIME NULL DEFAULT NULL",
+      );
+    }
+
+    if (additions.length) {
+      await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
+    }
+  } catch (err) {
+    console.error(
+      "Could not ensure order confirmation notification columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
 // FIX (Return/Refund audit): controllers/admin/returnController.js has
 // always read and written return_status, refund_status, delivered_at, and
 // friends — its own header comment claims they're "already present on
@@ -1298,6 +1341,7 @@ await ensureBulkBookingCommunicationsTable().catch(console.error);
 await ensureOrderBulkColumns().catch(console.error);
 await ensureOrderUserIdBackfill().catch(console.error);
 await ensureOrderShippingAddressColumns().catch(console.error);
+await ensureOrderConfirmationNotificationColumns().catch(console.error);
 await ensureOrderShipmentColumns().catch(console.error);
 await ensureOrderReturnColumns().catch(console.error);
 await ensureDeliveredAtBackfill().catch(console.error);
