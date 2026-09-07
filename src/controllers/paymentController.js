@@ -902,6 +902,23 @@ export const shouldClaimOrderConfirmation = ({ paymentStatus, sentAt }) =>
     .trim()
     .toLowerCase() === "paid" && !sentAt;
 
+export const getOrderConfirmationClaimDecision = ({
+  paymentStatus,
+  sentAt,
+  inFlight = false,
+  isOwner = false,
+} = {}) => {
+  const alreadySent = Boolean(sentAt);
+  const competingInFlight = inFlight && !isOwner;
+  return {
+    alreadySent,
+    inFlight: competingInFlight,
+    eligible:
+      shouldClaimOrderConfirmation({ paymentStatus, sentAt }) &&
+      !competingInFlight,
+  };
+};
+
 export const getOrderConfirmationRecipients = (order = {}) => ({
   email: order.contact_email || order.email || null,
   phone: order.contact_phone || order.mobile_number || null,
@@ -919,7 +936,11 @@ const maskNotificationPhone = (phone) => {
   return digits ? `***${digits.slice(-4)}` : null;
 };
 
-const claimOrderConfirmationChannel = async (orderId, channel) => {
+const claimOrderConfirmationChannel = async (
+  orderId,
+  channel,
+  { inFlight = false } = {},
+) => {
   const column =
     channel === "email"
       ? "order_confirmation_email_sent_at"
@@ -931,17 +952,21 @@ const claimOrderConfirmationChannel = async (orderId, channel) => {
     [orderId],
   );
   const state = rows[0] || null;
-  const eligible = Boolean(state && shouldClaimOrderConfirmation(state));
+  const decision = getOrderConfirmationClaimDecision({
+    paymentStatus: state?.payment_status,
+    sentAt: state?.sent_at,
+    inFlight,
+  });
   console.info("[ORDER_CONFIRMATION] Claim decision", {
     orderId,
     channel,
     paymentStatus: state?.payment_status ?? null,
     sentAt: state?.sent_at ?? null,
-    alreadySent: Boolean(state?.sent_at),
-    inFlight: orderConfirmationInFlight.has(`${orderId}:${channel}`),
-    eligible,
+    alreadySent: decision.alreadySent,
+    inFlight: decision.inFlight,
+    eligible: decision.eligible,
   });
-  return eligible;
+  return decision.eligible;
 };
 
 const markOrderConfirmationSent = async (orderId, channel) => {
@@ -957,39 +982,66 @@ const markOrderConfirmationSent = async (orderId, channel) => {
 };
 
 const orderConfirmationInFlight = new Map();
+const orderConfirmationClaimLocks = new Map();
 
-const runOrderConfirmationChannel = (orderId, channel, send) => {
+const runOrderConfirmationChannel = async (orderId, channel, send) => {
   const key = `${orderId}:${channel}`;
   if (orderConfirmationInFlight.has(key)) {
     return orderConfirmationInFlight.get(key);
   }
 
-  const operation = (async () => {
-    try {
-      if (!(await claimOrderConfirmationChannel(orderId, channel))) {
-        console.info(
-          "[ORDER_CONFIRMATION] Notification already sent or not claimable",
-          { orderId, channel },
-        );
-        return false;
-      }
+  const existingClaim = orderConfirmationClaimLocks.get(key);
+  if (existingClaim) {
+    await existingClaim;
+    return runOrderConfirmationChannel(orderId, channel, send);
+  }
 
+  let releaseClaim;
+  const claimLock = new Promise((resolve) => {
+    releaseClaim = resolve;
+  });
+  orderConfirmationClaimLocks.set(key, claimLock);
+
+  let eligible;
+  try {
+    eligible = await claimOrderConfirmationChannel(orderId, channel, {
+      inFlight: false,
+    });
+  } finally {
+    orderConfirmationClaimLocks.delete(key);
+    releaseClaim();
+  }
+
+  if (!eligible) {
+    console.info(
+      "[ORDER_CONFIRMATION] Notification already sent or not claimable",
+      { orderId, channel },
+    );
+    return false;
+  }
+
+  let resolveOperation;
+  const operation = new Promise((resolve) => {
+    resolveOperation = resolve;
+  });
+  orderConfirmationInFlight.set(key, operation);
+
+  (async () => {
+    try {
       await send();
       await markOrderConfirmationSent(orderId, channel);
-      return true;
+      resolveOperation(true);
     } catch (err) {
       console.error("[ORDER_CONFIRMATION] Notification failed", {
         orderId,
         channel,
         message: err?.message || String(err),
       });
-      return false;
+      resolveOperation(false);
     } finally {
       orderConfirmationInFlight.delete(key);
     }
-  })();
-
-  orderConfirmationInFlight.set(key, operation);
+  })().catch(() => {});
   return operation;
 };
 

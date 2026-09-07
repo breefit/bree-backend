@@ -6,6 +6,7 @@ import {
   formatRazorpayShippingAddress,
   shouldRecordPaymentHistory,
   shouldClaimOrderConfirmation,
+  getOrderConfirmationClaimDecision,
   getOrderConfirmationRecipients,
 } from "../src/controllers/paymentController.js";
 
@@ -128,6 +129,41 @@ test("claims confirmation only for paid orders without a sent timestamp", () => 
   assert.equal(
     shouldClaimOrderConfirmation({ paymentStatus: " PAID ", sentAt: null }),
     true,
+  );
+});
+
+test("first channel owner is eligible before provider in-flight state is set", () => {
+  assert.deepEqual(
+    getOrderConfirmationClaimDecision({
+      paymentStatus: "paid",
+      sentAt: null,
+      inFlight: false,
+    }),
+    { alreadySent: false, inFlight: false, eligible: true },
+  );
+});
+
+test("a competing in-flight channel attempt is not eligible", () => {
+  assert.deepEqual(
+    getOrderConfirmationClaimDecision({
+      paymentStatus: "paid",
+      sentAt: null,
+      inFlight: true,
+      isOwner: false,
+    }),
+    { alreadySent: false, inFlight: true, eligible: false },
+  );
+});
+
+test("a successful timestamp blocks duplicate channel delivery", () => {
+  assert.deepEqual(
+    getOrderConfirmationClaimDecision({
+      paymentStatus: "paid",
+      sentAt: "2026-09-07T07:23:33.000Z",
+      inFlight: false,
+      isOwner: true,
+    }),
+    { alreadySent: true, inFlight: false, eligible: false },
   );
 });
 
