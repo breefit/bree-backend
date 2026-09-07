@@ -905,38 +905,78 @@ export const getOrderConfirmationRecipients = (order = {}) => ({
   phone: order.contact_phone || order.mobile_number || null,
 });
 
+const maskNotificationEmail = (email) => {
+  if (!email) return null;
+  const [local, domain] = String(email).split("@");
+  if (!domain) return "[invalid-email]";
+  return `${local?.slice(0, 2) || "*"}***@${domain}`;
+};
+
+const maskNotificationPhone = (phone) => {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits ? `***${digits.slice(-4)}` : null;
+};
+
 const claimOrderConfirmationChannel = async (orderId, channel) => {
   const column =
     channel === "email"
       ? "order_confirmation_email_sent_at"
       : "order_confirmation_whatsapp_sent_at";
-  const client = await getClient();
+  const { rows } = await query(
+    `SELECT payment_status, ${column} AS sent_at
+     FROM orders WHERE id = ? LIMIT 1`,
+    [orderId],
+  );
+  return Boolean(rows[0] && shouldClaimOrderConfirmation(rows[0]));
+};
 
-  try {
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `SELECT payment_status, ${column} AS sent_at
-       FROM orders WHERE id = ? FOR UPDATE`,
-      [orderId],
-    );
-    const order = rows[0];
-    if (!order || !shouldClaimOrderConfirmation(order)) {
-      await client.query("COMMIT");
-      return false;
-    }
+const markOrderConfirmationSent = async (orderId, channel) => {
+  const column =
+    channel === "email"
+      ? "order_confirmation_email_sent_at"
+      : "order_confirmation_whatsapp_sent_at";
+  await query(
+    `UPDATE orders SET ${column} = NOW(), updated_at = NOW()
+     WHERE id = ? AND payment_status = 'paid' AND ${column} IS NULL`,
+    [orderId],
+  );
+};
 
-    await client.query(
-      `UPDATE orders SET ${column} = NOW(), updated_at = NOW() WHERE id = ?`,
-      [orderId],
-    );
-    await client.query("COMMIT");
-    return true;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
+const orderConfirmationInFlight = new Map();
+
+const runOrderConfirmationChannel = (orderId, channel, send) => {
+  const key = `${orderId}:${channel}`;
+  if (orderConfirmationInFlight.has(key)) {
+    return orderConfirmationInFlight.get(key);
   }
+
+  const operation = (async () => {
+    try {
+      if (!(await claimOrderConfirmationChannel(orderId, channel))) {
+        console.info(
+          "[ORDER_CONFIRMATION] Notification already sent or not claimable",
+          { orderId, channel },
+        );
+        return false;
+      }
+
+      await send();
+      await markOrderConfirmationSent(orderId, channel);
+      return true;
+    } catch (err) {
+      console.error("[ORDER_CONFIRMATION] Notification failed", {
+        orderId,
+        channel,
+        message: err?.message || String(err),
+      });
+      return false;
+    } finally {
+      orderConfirmationInFlight.delete(key);
+    }
+  })();
+
+  orderConfirmationInFlight.set(key, operation);
+  return operation;
 };
 
 const notifyInitialOrderConfirmation = async (orderId) => {
@@ -961,35 +1001,59 @@ const notifyInitialOrderConfirmation = async (orderId) => {
     const amount = Number(order.total ?? order.amount ?? 0);
     const orderNumber = order.order_number || order.id;
 
-    if (email && (await claimOrderConfirmationChannel(order.id, "email"))) {
-      sendOrderConfirmationEmail({
-        to: email,
-        name,
-        orderId: order.id,
-        amount,
-        items: itemRows,
-        shippingAddress: order.shipping_address,
-      }).catch((err) => {
-        console.error("[EMAIL] Confirmation email failed", {
+    if (email) {
+      await runOrderConfirmationChannel(order.id, "email", async () => {
+        console.info("[ORDER_CONFIRMATION] Email send started", {
           orderId: order.id,
-          message: err?.message || String(err),
+          orderNumber,
+          recipient: maskNotificationEmail(email),
+          template: "email-order-confirmation",
+        });
+        await sendOrderConfirmationEmail({
+          to: email,
+          name,
+          orderId: order.id,
+          amount,
+          items: itemRows,
+          shippingAddress: order.shipping_address,
+        });
+        console.info("[ORDER_CONFIRMATION] Email sent", {
+          orderId: order.id,
+          orderNumber,
         });
       });
     }
 
-    if (phone && (await claimOrderConfirmationChannel(order.id, "whatsapp"))) {
-      await safelySendWhatsApp("Order Confirmed", () =>
-        sendOrderConfirmationWhatsApp({
-          mobile: phone,
-          customerName: name,
+    if (phone) {
+      await runOrderConfirmationChannel(order.id, "whatsapp", async () => {
+        console.info("[ORDER_CONFIRMATION] WhatsApp send started", {
+          orderId: order.id,
           orderNumber,
-          orderAmount: amount,
-          orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString(
-            "en-IN",
-          ),
-          orderUuid: order.id,
-        }),
-      );
+          recipient: maskNotificationPhone(phone),
+          template: "order_confirmed",
+        });
+        const result = await safelySendWhatsApp("Order Confirmed", () =>
+          sendOrderConfirmationWhatsApp({
+            mobile: phone,
+            customerName: name,
+            orderNumber,
+            orderAmount: amount,
+            orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString(
+              "en-IN",
+            ),
+            orderUuid: order.id,
+          }),
+        );
+        if (!result.success) {
+          throw (
+            result.error || new Error("WhatsApp provider rejected the message")
+          );
+        }
+        console.info("[ORDER_CONFIRMATION] WhatsApp sent", {
+          orderId: order.id,
+          orderNumber,
+        });
+      });
     }
   } catch (err) {
     console.error("[ORDER_CONFIRMATION] Notification dispatch failed", {
@@ -1174,7 +1238,7 @@ export const verifyPayment = async (req, res) => {
     [razorpay_payment_id],
   );
   if (alreadyProcessed.length) {
-    notifyInitialOrderConfirmation(alreadyProcessed[0].id);
+    await notifyInitialOrderConfirmation(alreadyProcessed[0].id);
     console.info(
       "[VERIFY_PAYMENT] Duplicate blocked (payment_id seen before)",
       {
@@ -1255,7 +1319,7 @@ export const verifyPayment = async (req, res) => {
   });
 
   if (paymentState === "already_paid") {
-    notifyInitialOrderConfirmation(order.id);
+    await notifyInitialOrderConfirmation(order.id);
     return res.json({
       success: true,
       order_id: order.id,
@@ -1300,7 +1364,7 @@ export const verifyPayment = async (req, res) => {
 
     if (lockedPaymentState === "already_paid") {
       await client.query("COMMIT");
-      notifyInitialOrderConfirmation(lockedOrder.id);
+      await notifyInitialOrderConfirmation(lockedOrder.id);
       return res.json({
         success: true,
         order_id: lockedOrder.id,
@@ -1662,7 +1726,7 @@ export const verifyPayment = async (req, res) => {
     });
   });
 
-  notifyInitialOrderConfirmation(order.id);
+  await notifyInitialOrderConfirmation(order.id);
 
   let nextBillingDate = null;
   if (isSubscriptionOrder && razorpay_subscription_id) {
@@ -1748,6 +1812,7 @@ export const getShippingInfo = async (req, res) => {
     order_id: receiptOrderId,
     razorpay_order_id: razorpayOrderId,
     contact,
+    email,
     addresses,
   } = parsedBody;
 
@@ -1900,6 +1965,32 @@ export const getShippingInfo = async (req, res) => {
       lookupKeyUsed,
     });
     return res.status(404).json({ message: "Order not found", addresses: [] });
+  }
+
+  if (!isBulkBooking) {
+    const checkoutEmail =
+      typeof email === "string" && /^\S+@\S+\.\S+$/.test(email.trim())
+        ? email.trim().toLowerCase()
+        : null;
+    const checkoutPhone = typeof contact === "string" ? contact.trim() : null;
+
+    if (checkoutEmail || checkoutPhone) {
+      await query(
+        `UPDATE orders SET
+           email = COALESCE(NULLIF(email, ''), ?),
+           contact_email = COALESCE(NULLIF(contact_email, ''), ?),
+           mobile_number = COALESCE(NULLIF(mobile_number, ''), ?),
+           contact_phone = COALESCE(NULLIF(contact_phone, ''), ?),
+           updated_at = NOW()
+         WHERE id = ?`,
+        [checkoutEmail, checkoutEmail, checkoutPhone, checkoutPhone, order.id],
+      );
+      console.info("[SHIPPING_INFO] Persisted checkout contact on order", {
+        orderId: order.id,
+        emailPresent: Boolean(checkoutEmail),
+        phonePresent: Boolean(checkoutPhone),
+      });
+    }
   }
 
   console.info("[SHIPPING_INFO] Order loaded", {
@@ -2612,7 +2703,7 @@ export const handleWebhook = async (req, res) => {
             whClient.release();
           }
 
-          notifyInitialOrderConfirmation(order.id);
+          await notifyInitialOrderConfirmation(order.id);
           emitUpdate(order.id, "paid");
 
           createPackagePurchaseFromOrder(order.id).catch((err) => {
