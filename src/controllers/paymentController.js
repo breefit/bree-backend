@@ -44,16 +44,29 @@ const getProductShippingColumnsAvailable = async () => {
 // Normalise any error thrown by the Razorpay Node SDK into a flat, loggable
 // object.
 // ─────────────────────────────────────────────────────────────────────────────
-const describeRazorpayError = (err) => ({
-  message: err?.message || String(err),
-  statusCode: err?.statusCode,
-  code: err?.error?.code,
-  description: err?.error?.description,
-  field: err?.error?.field,
-  source: err?.error?.source,
-  step: err?.error?.step,
-  reason: err?.error?.reason,
-});
+const toErrorText = (value) => {
+  if (typeof value === "string") return value;
+  if (value == null) return undefined;
+  if (typeof value === "object") {
+    return value.description || value.message || value.reason || undefined;
+  }
+  return String(value);
+};
+
+export const describeRazorpayError = (err) => {
+  const details = err?.error || err?.response?.data?.error || {};
+  return {
+    message: toErrorText(err?.message) || toErrorText(details),
+    statusCode: err?.statusCode || err?.response?.status || details?.statusCode,
+    code: err?.code || details?.code,
+    description: toErrorText(details?.description),
+    field: details?.field,
+    source: details?.source,
+    step: details?.step,
+    reason: toErrorText(details?.reason),
+    details: toErrorText(details?.details),
+  };
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build Razorpay Magic Checkout line_items from server-validated cart items.
@@ -472,13 +485,15 @@ export const createOrder = async (req, res) => {
       rzpOrder = await rzp.orders.create(orderPayload);
     } catch (err) {
       await client.query("ROLLBACK");
+      const razorpayError = describeRazorpayError(err);
       console.error(
         "[CREATE_ORDER] Razorpay order creation failed",
-        describeRazorpayError(err),
+        razorpayError,
       );
       return res.status(502).json({
         success: false,
         message: "Failed to create payment order. Please try again.",
+        razorpay: razorpayError,
       });
     }
 

@@ -8,11 +8,14 @@ import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
 import { runDailyReminderScheduler } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
+import { getSafeRazorpayConfig } from "./config/razorpay.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 dotenv.config({ path: path.resolve(__dirname, "../.env") });
+
+console.info("[RAZORPAY] runtime configuration", getSafeRazorpayConfig());
 
 // console.log("STEP 1 - Server file loaded");
 // console.log("STEP 4 - Environment variables loaded");
