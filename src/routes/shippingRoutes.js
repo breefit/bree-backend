@@ -1,6 +1,7 @@
 import { Router } from "express";
 import {
   createShipment,
+  reconcileShipment,
   schedulePickup,
   trackShipment,
   cancelShipment,
@@ -13,6 +14,11 @@ const shippingRouter = Router();
 // ── POST /api/shipping/create-shipment/:orderId
 // Creates a new Delhivery shipment for an order in "ready_to_ship" status
 shippingRouter.post("/create-shipment/:orderId", adminAuth, createShipment);
+shippingRouter.post(
+  "/reconcile-shipment/:orderId",
+  adminAuth,
+  reconcileShipment,
+);
 
 // ── POST /api/shipping/pickup/:orderId
 // Request a pickup from Delhivery for a shipment already created for this order

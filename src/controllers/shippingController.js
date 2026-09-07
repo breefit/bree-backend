@@ -81,6 +81,61 @@ export const shouldRollbackTransaction = ({
   transactionFinished,
 }) => Boolean(transactionStarted && !transactionFinished);
 
+export const getDuplicateDelhiveryOrderDetails = (response) => {
+  if (typeof response === "string") {
+    try {
+      response = JSON.parse(response);
+    } catch {
+      return null;
+    }
+  }
+
+  const packages = Array.isArray(response?.packages) ? response.packages : [];
+  const duplicatePackage = packages.find(
+    (pkg) =>
+      Array.isArray(pkg?.remarks) &&
+      pkg.remarks.some((remark) => /duplicate order id/i.test(String(remark))),
+  );
+
+  if (!duplicatePackage) return null;
+
+  return {
+    waybill: duplicatePackage.waybill || null,
+    shipmentId: response?.upload_wbn || null,
+    remarks: duplicatePackage.remarks,
+  };
+};
+
+export const hasExistingShipmentState = (order) =>
+  Boolean(
+    order?.awb_number ||
+    order?.shipment_id ||
+    order?.shipment_created_at ||
+    getDuplicateDelhiveryOrderDetails(order?.delhivery_response),
+  );
+
+const findShipmentIdentityConflict = async (
+  client,
+  orderId,
+  { waybill, shipmentId, trackingNumber },
+) => {
+  const identifiers = [waybill, shipmentId, trackingNumber].filter(Boolean);
+  if (!identifiers.length) return null;
+
+  const placeholders = identifiers.map(() => "?").join(", ");
+  const { rows } = await client.query(
+    `SELECT id, order_number, awb_number, shipment_id, tracking_number
+     FROM orders
+     WHERE id <> ?
+       AND (awb_number IN (${placeholders})
+         OR shipment_id IN (${placeholders})
+         OR tracking_number IN (${placeholders}))
+     LIMIT 1`,
+    [orderId, ...identifiers, ...identifiers, ...identifiers],
+  );
+  return rows[0] || null;
+};
+
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Build the pickup request payload for delhiveryService.requestPickup().
@@ -454,7 +509,13 @@ export const createShipment = async (req, res) => {
           shipping_pincode,
           shipping_country,
           subtotal,
-          total
+          total,
+          awb_number,
+          shipment_id,
+          tracking_number,
+          tracking_url,
+          shipment_created_at,
+          delhivery_response
         FROM orders
        WHERE id = ?
        FOR UPDATE`,
@@ -475,6 +536,34 @@ export const createShipment = async (req, res) => {
       orderNumber: order.order_number,
       status: order.order_status,
     });
+
+    if (hasExistingShipmentState(order)) {
+      await client.query("ROLLBACK");
+      const storedDuplicate = getDuplicateDelhiveryOrderDetails(
+        order.delhivery_response,
+      );
+      console.warn(
+        "[CREATE_SHIPMENT] Shipment already exists or needs reconciliation",
+        {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          awbNumber: order.awb_number || storedDuplicate?.waybill || null,
+          shipmentId: order.shipment_id || storedDuplicate?.shipmentId || null,
+        },
+      );
+      return res.status(409).json({
+        success: false,
+        message: storedDuplicate
+          ? "Delhivery already has this order reference. Reconcile the existing shipment before retrying."
+          : "Shipment already exists for this order.",
+        shipment: {
+          awbNumber: order.awb_number || storedDuplicate?.waybill || null,
+          shipmentId: order.shipment_id || storedDuplicate?.shipmentId || null,
+          trackingNumber: order.tracking_number || null,
+          trackingUrl: order.tracking_url || null,
+        },
+      });
+    }
 
     // The orders query above (and the orders table) expose the order total
     // as `total`, but buildDelhiveryShipmentPayload() reads `total_amount`
@@ -754,10 +843,72 @@ export const createShipment = async (req, res) => {
 
     // Check if Delhivery response indicates success
     if (!delhiveryResponse || delhiveryResponse.success === false) {
-      await client.query("ROLLBACK");
       const delhiveryMessage = String(
         delhiveryResponse?.rmk || delhiveryResponse?.message || "",
       );
+      const duplicateDetails =
+        getDuplicateDelhiveryOrderDetails(delhiveryResponse);
+      if (duplicateDetails) {
+        const conflictingOrder = await findShipmentIdentityConflict(
+          client,
+          order.id,
+          duplicateDetails,
+        );
+        if (conflictingOrder) {
+          await client.query("ROLLBACK");
+          transactionFinished = true;
+          console.error(
+            "[CREATE_SHIPMENT] Delhivery shipment identity belongs to another order",
+            { orderId: order.id, conflictingOrderId: conflictingOrder.id },
+          );
+          return res.status(409).json({
+            success: false,
+            message:
+              "Delhivery shipment identity is already associated with another order.",
+          });
+        }
+
+        await client.query(
+          `UPDATE orders SET
+             awb_number = COALESCE(awb_number, ?),
+             tracking_number = COALESCE(tracking_number, ?),
+             shipment_id = COALESCE(shipment_id, ?),
+             delhivery_response = ?,
+             updated_at = NOW()
+           WHERE id = ?`,
+          [
+            duplicateDetails.waybill,
+            duplicateDetails.waybill,
+            duplicateDetails.shipmentId,
+            JSON.stringify(delhiveryResponse),
+            order.id,
+          ],
+        );
+        console.info("[CREATE_SHIPMENT] reconciliation persisted", {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          waybill: duplicateDetails.waybill,
+          shipmentId: duplicateDetails.shipmentId,
+        });
+        await client.query("COMMIT");
+        transactionFinished = true;
+        console.warn(
+          "[CREATE_SHIPMENT] Delhivery duplicate order reference persisted for reconciliation",
+          {
+            orderId: order.id,
+            orderNumber: order.order_number,
+            waybill: duplicateDetails.waybill,
+            shipmentId: duplicateDetails.shipmentId,
+          },
+        );
+        return res.status(409).json({
+          success: false,
+          message:
+            "Delhivery already has this order reference. Reconcile the existing shipment before retrying.",
+          shipment: duplicateDetails,
+        });
+      }
+      await client.query("ROLLBACK");
       if (
         /ClientWarehouse matching query does not exist/i.test(delhiveryMessage)
       ) {
@@ -932,6 +1083,136 @@ export const createShipment = async (req, res) => {
     console.info("[DB] transaction connection released", {
       operation: "createShipment",
     });
+  }
+};
+
+// Reconcile a Delhivery shipment that already exists remotely without issuing
+// another create request or changing the order's fulfillment status.
+export const reconcileShipment = async (req, res) => {
+  const { orderId } = req.params;
+  const {
+    waybill,
+    shipment_id: shipmentId,
+    tracking_number: trackingNumber,
+    tracking_url: trackingUrl,
+    delhivery_response: delhiveryResponse,
+  } = req.body || {};
+
+  if (!orderId || !waybill) {
+    return res.status(400).json({
+      success: false,
+      message: "Order ID and Delhivery waybill are required",
+    });
+  }
+
+  const client = await getClient();
+  let transactionStarted = false;
+  let transactionFinished = false;
+
+  try {
+    await client.query("BEGIN");
+    transactionStarted = true;
+
+    const { rows } = await client.query(
+      `SELECT id, order_number, order_status, awb_number, shipment_id,
+              tracking_number, tracking_url, delhivery_response
+       FROM orders WHERE id = ? FOR UPDATE`,
+      [orderId],
+    );
+    if (!rows.length) {
+      await client.query("ROLLBACK");
+      return res
+        .status(404)
+        .json({ success: false, message: "Order not found" });
+    }
+
+    const order = rows[0];
+    const conflictingOrder = await findShipmentIdentityConflict(
+      client,
+      orderId,
+      {
+        waybill,
+        shipmentId,
+        trackingNumber,
+      },
+    );
+    if (conflictingOrder) {
+      await client.query("ROLLBACK");
+      transactionFinished = true;
+      return res.status(409).json({
+        success: false,
+        message:
+          "Delhivery shipment identity is already associated with another order.",
+      });
+    }
+
+    const persistedResponse =
+      delhiveryResponse || order.delhivery_response || null;
+    await client.query(
+      `UPDATE orders SET
+         awb_number = COALESCE(awb_number, ?),
+         shipment_id = COALESCE(shipment_id, ?),
+         tracking_number = COALESCE(tracking_number, ?),
+         tracking_url = COALESCE(tracking_url, ?),
+         delhivery_response = COALESCE(delhivery_response, ?),
+         updated_at = NOW()
+       WHERE id = ?`,
+      [
+        waybill,
+        shipmentId || null,
+        trackingNumber || waybill,
+        trackingUrl || null,
+        persistedResponse
+          ? typeof persistedResponse === "string"
+            ? persistedResponse
+            : JSON.stringify(persistedResponse)
+          : null,
+        orderId,
+      ],
+    );
+
+    await client.query("COMMIT");
+    transactionFinished = true;
+    console.info("[RECONCILE_SHIPMENT] Existing Delhivery shipment persisted", {
+      orderId,
+      orderNumber: order.order_number,
+      waybill,
+      shipmentId: shipmentId || order.shipment_id || null,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Existing Delhivery shipment reconciled",
+      shipment: {
+        awbNumber: waybill,
+        shipmentId: shipmentId || order.shipment_id || null,
+        trackingNumber: trackingNumber || waybill,
+        trackingUrl: trackingUrl || order.tracking_url || null,
+      },
+    });
+  } catch (error) {
+    if (
+      shouldRollbackTransaction({ transactionStarted, transactionFinished })
+    ) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("[RECONCILE_SHIPMENT] Rollback failed", {
+          orderId,
+          message: rollbackError?.message || String(rollbackError),
+        });
+      }
+    }
+    console.error("[RECONCILE_SHIPMENT] Failed", {
+      orderId,
+      message: error?.message || String(error),
+    });
+    return res.status(500).json({
+      success: false,
+      message: "Failed to reconcile Delhivery shipment",
+    });
+  } finally {
+    client.release();
   }
 };
 

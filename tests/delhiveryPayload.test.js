@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildDelhiveryShipmentPayload } from "../src/utils/delhiveryPayload.js";
-import { shouldRollbackTransaction } from "../src/controllers/shippingController.js";
+import {
+  getDuplicateDelhiveryOrderDetails,
+  hasExistingShipmentState,
+  shouldRollbackTransaction,
+} from "../src/controllers/shippingController.js";
 
 test("uses the registered Delhivery pickup location for shipment creation", () => {
   const payload = buildDelhiveryShipmentPayload({
@@ -90,6 +94,51 @@ test("only rolls back an active unfinished transaction", () => {
     shouldRollbackTransaction({
       transactionStarted: false,
       transactionFinished: false,
+    }),
+    false,
+  );
+});
+
+test("detects Delhivery duplicate order responses and returned waybills", () => {
+  const duplicate = getDuplicateDelhiveryOrderDetails({
+    upload_wbn: "UPL123",
+    packages: [
+      {
+        waybill: "58045510000022",
+        remarks: ["Duplicate order id"],
+      },
+    ],
+  });
+
+  assert.deepEqual(duplicate, {
+    waybill: "58045510000022",
+    shipmentId: "UPL123",
+    remarks: ["Duplicate order id"],
+  });
+  assert.equal(
+    hasExistingShipmentState({
+      delhivery_response: JSON.stringify({
+        upload_wbn: "UPL123",
+        packages: [
+          {
+            waybill: "58045510000022",
+            remarks: ["Duplicate order id"],
+          },
+        ],
+      }),
+    }),
+    true,
+  );
+});
+
+test("does not classify a clean ready-to-ship order as already shipped", () => {
+  assert.equal(
+    hasExistingShipmentState({
+      order_status: "ready_to_ship",
+      awb_number: null,
+      shipment_id: null,
+      shipment_created_at: null,
+      delhivery_response: null,
     }),
     false,
   );
