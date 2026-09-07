@@ -68,6 +68,17 @@ export const describeRazorpayError = (err) => {
   };
 };
 
+export const classifyPaymentState = ({
+  paymentStatus,
+  storedPaymentId,
+  incomingPaymentId,
+}) => {
+  if (paymentStatus !== "paid") return "process";
+  if (storedPaymentId === incomingPaymentId) return "already_paid";
+  if (storedPaymentId) return "conflict";
+  return "reconcile";
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Build Razorpay Magic Checkout line_items from server-validated cart items.
 // Reminder charges are represented as a real positive line item so Razorpay
@@ -619,7 +630,7 @@ export const createOrder = async (req, res) => {
 // Format a Razorpay Magic Checkout `customer_details.shipping_address` object
 // into the single-string format `orders.shipping_address` already expects.
 // ─────────────────────────────────────────────────────────────────────────────
-const formatRazorpayShippingAddress = (addr) => {
+export const formatRazorpayShippingAddress = (addr) => {
   if (!addr) return null;
   return (
     [
@@ -634,6 +645,30 @@ const formatRazorpayShippingAddress = (addr) => {
       .filter(Boolean)
       .join(", ") || null
   );
+};
+
+const fetchRazorpayCustomerDetails = async (
+  razorpayOrderId,
+  logPrefix,
+  { throwOnError = false } = {},
+) => {
+  if (!razorpayOrderId) return null;
+
+  try {
+    const rzp = getRazorpay();
+    const rzpOrderDetails = await rzp.orders.fetch(razorpayOrderId);
+    return rzpOrderDetails?.customer_details || null;
+  } catch (err) {
+    console.warn(
+      `${logPrefix} Could not fetch Razorpay order customer_details`,
+      {
+        razorpayOrderId,
+        ...describeRazorpayError(err),
+      },
+    );
+    if (throwOnError) throw err;
+    return null;
+  }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1008,18 +1043,10 @@ export const verifyPayment = async (req, res) => {
 
   let razorpayCustomerDetails = null;
   if (!isSubscriptionOrder && razorpay_order_id) {
-    try {
-      const rzp = getRazorpay();
-      const rzpOrderDetails = await rzp.orders.fetch(razorpay_order_id);
-      if (rzpOrderDetails?.customer_details) {
-        razorpayCustomerDetails = rzpOrderDetails.customer_details;
-      }
-    } catch (err) {
-      console.warn(
-        "[VERIFY_PAYMENT] Could not fetch Razorpay order for customer_details — continuing without it",
-        { orderId: order.id, ...describeRazorpayError(err) },
-      );
-    }
+    razorpayCustomerDetails = await fetchRazorpayCustomerDetails(
+      razorpay_order_id,
+      `[VERIFY_PAYMENT] Order ${order.id}`,
+    );
   }
 
   console.info("[VERIFY_PAYMENT] Razorpay shipping address received", {
@@ -1027,15 +1054,22 @@ export const verifyPayment = async (req, res) => {
     shippingAddress: razorpayCustomerDetails?.shipping_address || null,
   });
 
-  if (order.payment_status === "paid") {
-    if (order.razorpay_payment_id === razorpay_payment_id) {
-      return res.json({
-        success: true,
-        order_id: order.id,
-        payment_id: razorpay_payment_id,
-        message: "Order already paid",
-      });
-    }
+  const paymentState = classifyPaymentState({
+    paymentStatus: order.payment_status,
+    storedPaymentId: order.razorpay_payment_id,
+    incomingPaymentId: razorpay_payment_id,
+  });
+
+  if (paymentState === "already_paid") {
+    return res.json({
+      success: true,
+      order_id: order.id,
+      payment_id: razorpay_payment_id,
+      message: "Order already paid",
+    });
+  }
+
+  if (paymentState === "conflict") {
     console.warn("[VERIFY_PAYMENT] Already paid with different payment_id", {
       orderId: order.id,
       existing: order.razorpay_payment_id,
@@ -1063,13 +1097,32 @@ export const verifyPayment = async (req, res) => {
     );
     const lockedOrder = lockedRows[0];
 
-    if (lockedOrder.payment_status === "paid") {
+    const lockedPaymentState = classifyPaymentState({
+      paymentStatus: lockedOrder.payment_status,
+      storedPaymentId: lockedOrder.razorpay_payment_id,
+      incomingPaymentId: razorpay_payment_id,
+    });
+
+    if (lockedPaymentState === "already_paid") {
       await client.query("COMMIT");
       return res.json({
         success: true,
         order_id: lockedOrder.id,
         payment_id: lockedOrder.razorpay_payment_id || razorpay_payment_id,
         message: "Order already paid",
+      });
+    }
+
+    if (lockedPaymentState === "conflict") {
+      await client.query("ROLLBACK");
+      console.warn("[VERIFY_PAYMENT] Locked payment ID conflict", {
+        orderId: lockedOrder.id,
+        existing: lockedOrder.razorpay_payment_id,
+        incoming: razorpay_payment_id,
+      });
+      return res.status(409).json({
+        success: false,
+        message: "Order already processed with a different payment id",
       });
     }
 
@@ -1236,12 +1289,14 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    await client.query(
-      `INSERT INTO order_status_history
-         (order_id, previous_status, new_status, changed_by, notes)
-       VALUES (?, ?, ?, NULL, 'Payment completed via Razorpay')`,
-      [order.id, lockedOrder.order_status, newOrderStatus],
-    );
+    if (lockedOrder.payment_status !== "paid") {
+      await client.query(
+        `INSERT INTO order_status_history
+           (order_id, previous_status, new_status, changed_by, notes)
+         VALUES (?, ?, ?, NULL, 'Payment completed via Razorpay')`,
+        [order.id, lockedOrder.order_status, newOrderStatus],
+      );
+    }
 
     // ── Create daily reminders if provided ─────────────────────────────────
     console.info("[VERIFY_PAYMENT] Reminder payload received", {
@@ -2246,28 +2301,123 @@ export const handleWebhook = async (req, res) => {
         }
       } else if (rzpOrderId) {
         const order = await loadByRazorpayOrder();
-        if (order && order.payment_status === "paid") {
-          return res.json({ status: "already_processed" });
-        }
-        if (order && order.payment_status !== "paid") {
+        if (order) {
+          const webhookCustomerDetails = await fetchRazorpayCustomerDetails(
+            rzpOrderId,
+            `[WEBHOOK] Order ${order.id}`,
+            { throwOnError: true },
+          );
           const whClient = await getClient();
           try {
             await whClient.query("BEGIN");
 
             const { rows: lockedWh } = await whClient.query(
-              "SELECT payment_status, order_status FROM orders WHERE id = ? FOR UPDATE",
+              "SELECT * FROM orders WHERE id = ? FOR UPDATE",
               [order.id],
             );
-            if (lockedWh[0]?.payment_status === "paid") {
+            const lockedOrder = lockedWh[0];
+            const storedPaymentId = lockedOrder?.razorpay_payment_id;
+            const lockedPaymentState = classifyPaymentState({
+              paymentStatus: lockedOrder?.payment_status,
+              storedPaymentId,
+              incomingPaymentId: rzpPaymentId,
+            });
+
+            console.info("[WEBHOOK] Payment state transition", {
+              event,
+              orderId: order.id,
+              razorpayOrderId: rzpOrderId,
+              incomingPaymentId: rzpPaymentId,
+              storedOrderPaymentId: storedPaymentId,
+              storedPaymentStatus: lockedOrder?.payment_status,
+              shippingAddressPresent: Boolean(
+                webhookCustomerDetails?.shipping_address,
+              ),
+            });
+
+            if (lockedPaymentState === "conflict") {
               await whClient.query("COMMIT");
+              console.warn(
+                "[WEBHOOK] Payment ID conflict; preserving stored payment",
+                {
+                  orderId: order.id,
+                  razorpayOrderId: rzpOrderId,
+                  storedOrderPaymentId: storedPaymentId,
+                  incomingPaymentId: rzpPaymentId,
+                },
+              );
               break;
             }
 
+            const webhookShippingAddress = formatRazorpayShippingAddress(
+              webhookCustomerDetails?.shipping_address,
+            );
+            const webhookAddressUserId = lockedOrder.user_id || null;
+            let webhookAddressId = lockedOrder.address_id || null;
+
+            if (
+              !webhookAddressId &&
+              webhookCustomerDetails?.shipping_address &&
+              webhookAddressUserId
+            ) {
+              const address = webhookCustomerDetails.shipping_address;
+              webhookAddressId = await upsertStructuredAddressForOrder(
+                whClient,
+                {
+                  userId: webhookAddressUserId,
+                  line1: address.line1,
+                  line2: address.line2,
+                  city: address.city,
+                  state: address.state,
+                  pincode: address.zipcode,
+                  country: address.country,
+                },
+              );
+            }
+
+            const webhookName =
+              webhookCustomerDetails?.shipping_address?.name ||
+              webhookCustomerDetails?.name ||
+              lockedOrder.customer_name ||
+              lockedOrder.contact_name;
+            const webhookEmail =
+              webhookCustomerDetails?.email ||
+              lockedOrder.email ||
+              lockedOrder.contact_email;
+            const webhookPhone =
+              webhookCustomerDetails?.contact ||
+              lockedOrder.mobile_number ||
+              lockedOrder.contact_phone;
+            const wasAlreadyPaid = lockedOrder.payment_status === "paid";
+
             await whClient.query(
               `UPDATE orders SET
-                 payment_status = 'paid', order_status = 'paid', updated_at = NOW()
+                 payment_status = 'paid',
+                 order_status = 'paid',
+                 razorpay_payment_id = ?,
+                 customer_name = COALESCE(?, customer_name),
+                 email = COALESCE(?, email),
+                 mobile_number = COALESCE(?, mobile_number),
+                 contact_name = COALESCE(?, contact_name),
+                 contact_email = COALESCE(?, contact_email),
+                 contact_phone = COALESCE(?, contact_phone),
+                 shipping_address = COALESCE(?, shipping_address),
+                 address_id = COALESCE(?, address_id),
+                 paid_at = COALESCE(paid_at, NOW()),
+                 updated_at = NOW()
                WHERE id = ?`,
-              [order.id],
+              [
+                rzpPaymentId,
+                webhookName || null,
+                webhookEmail || null,
+                webhookPhone || null,
+                webhookName || null,
+                webhookEmail || null,
+                webhookPhone || null,
+                webhookShippingAddress,
+                webhookAddressId,
+                order.id,
+              ],
             );
 
             await whClient.query(
@@ -2277,12 +2427,14 @@ export const handleWebhook = async (req, res) => {
               [rzpPaymentId, rzpOrderId],
             );
 
-            await whClient.query(
-              `INSERT INTO order_status_history
-                 (order_id, previous_status, new_status, changed_by, notes)
-               VALUES (?, ?, 'paid', NULL, 'Payment captured via webhook')`,
-              [order.id, lockedWh[0].order_status],
-            );
+            if (!wasAlreadyPaid) {
+              await whClient.query(
+                `INSERT INTO order_status_history
+                   (order_id, previous_status, new_status, changed_by, notes)
+                 VALUES (?, ?, 'paid', NULL, 'Payment captured via webhook')`,
+                [order.id, lockedOrder.order_status],
+              );
+            }
 
             await whClient.query("COMMIT");
           } catch (err) {
