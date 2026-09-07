@@ -258,6 +258,7 @@ DELHIVERY_API_TOKEN=YOUR_VALUE_HERE
 DELHIVERY_TIMEOUT=YOUR_VALUE_HERE          # ms, optional (defaults to 30000)
 DELHIVERY_TRACKING_URL=YOUR_VALUE_HERE     # optional, tracking link base
 DELHIVERY_PICKUP_TIME=YOUR_VALUE_HERE      # optional, default pickup time
+DELHIVERY_PICKUP_LOCATION=BREE FIT         # exact registered Delhivery client warehouse name
 
 # ── Warehouse (pickup/origin address for Delhivery shipments) ──────────
 WAREHOUSE_NAME=YOUR_VALUE_HERE
@@ -908,17 +909,17 @@ There are no destructive migration commands documented or present — the only s
 
 ## 32. Third-Party Services
 
-| Service                 | Purpose                                                                   | Required Configuration                                                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| MySQL                   | Primary data store                                                        | `DATABASE_URL` or `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`                                                                                  |
-| Razorpay                | Payments — Orders, Magic Checkout, Subscriptions, Refunds, webhooks       | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`                                                                                      |
-| Firebase Admin SDK      | Verifying Google Sign-In ID tokens                                        | `GOOGLE_APPLICATION_CREDENTIALS` (path to a service-account JSON file — the active code path; see [§7](#7-authentication))                               |
-| Cloudinary              | Product image storage/CDN                                                 | `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `CLOUDINARY_UPLOAD_FOLDER`                                                       |
-| SMTP (Nodemailer)       | Transactional email                                                       | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`                                                                                          |
-| Waplify                 | WhatsApp notifications (order/bulk/subscription/return/OTP)               | `WAPLIFY_BASE_URL`, `WAPLIFY_API_KEY`, `WAPLIFY_TEMPLATE_*`, `WAPLIFY_OTP_TEMPLATE`                                                                      |
-| Meta WhatsApp Cloud API | Inbound webhook receiver only                                             | `META_VERIFY_TOKEN`                                                                                                                                      |
-| Delhivery               | Shipping — shipment creation, tracking, pickup, labels, reverse shipments | `DELHIVERY_BASE_URL`, `DELHIVERY_API_TOKEN`, `DELHIVERY_TIMEOUT` (optional)                                                                              |
-| Warehouse config        | Pickup/origin address for all Delhivery shipments                         | `WAREHOUSE_NAME`, `WAREHOUSE_ADDRESS`, `WAREHOUSE_CITY`, `WAREHOUSE_STATE`, `WAREHOUSE_PINCODE`, `WAREHOUSE_COUNTRY`, `WAREHOUSE_PHONE`, `WAREHOUSE_GST` |
+| Service                 | Purpose                                                                   | Required Configuration                                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| MySQL                   | Primary data store                                                        | `DATABASE_URL` or `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`                                                                                             |
+| Razorpay                | Payments — Orders, Magic Checkout, Subscriptions, Refunds, webhooks       | `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`                                                                                                 |
+| Firebase Admin SDK      | Verifying Google Sign-In ID tokens                                        | `GOOGLE_APPLICATION_CREDENTIALS` (path to a service-account JSON file — the active code path; see [§7](#7-authentication))                                          |
+| Cloudinary              | Product image storage/CDN                                                 | `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, `CLOUDINARY_UPLOAD_FOLDER`                                                                  |
+| SMTP (Nodemailer)       | Transactional email                                                       | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`                                                                                                     |
+| Waplify                 | WhatsApp notifications (order/bulk/subscription/return/OTP)               | `WAPLIFY_BASE_URL`, `WAPLIFY_API_KEY`, `WAPLIFY_TEMPLATE_*`, `WAPLIFY_OTP_TEMPLATE`                                                                                 |
+| Meta WhatsApp Cloud API | Inbound webhook receiver only                                             | `META_VERIFY_TOKEN`                                                                                                                                                 |
+| Delhivery               | Shipping — shipment creation, tracking, pickup, labels, reverse shipments | `DELHIVERY_BASE_URL`, `DELHIVERY_API_TOKEN`, `DELHIVERY_TIMEOUT` (optional)                                                                                         |
+| Warehouse config        | Pickup/origin address for all Delhivery shipments                         | `DELHIVERY_PICKUP_LOCATION`, `WAREHOUSE_ADDRESS`, `WAREHOUSE_CITY`, `WAREHOUSE_STATE`, `WAREHOUSE_PINCODE`, `WAREHOUSE_COUNTRY`, `WAREHOUSE_PHONE`, `WAREHOUSE_GST` |
 
 No credentials are shown above — names only.
 

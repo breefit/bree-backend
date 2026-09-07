@@ -13,7 +13,8 @@ import { ORDER_STATUSES } from "../constants/orderStatus.js";
 // ─────────────────────────────────────────────────────────────────────────────
 export const getWarehouseConfig = () => {
   return {
-    name: process.env.WAREHOUSE_NAME || "BREE Warehouse",
+    name: process.env.WAREHOUSE_NAME?.trim() || "BREE Warehouse",
+    pickupLocation: process.env.DELHIVERY_PICKUP_LOCATION?.trim() || "",
     address: process.env.WAREHOUSE_ADDRESS || "",
     city: process.env.WAREHOUSE_CITY || "",
     state: process.env.WAREHOUSE_STATE || "",
@@ -95,8 +96,14 @@ export const buildPickupRequestPayload = (
   overrides = {},
   expectedPackageCount = 1,
 ) => {
+  if (!warehouse?.pickupLocation?.trim()) {
+    throw new Error(
+      "DELHIVERY_PICKUP_LOCATION is missing. Configure the exact pickup location registered in Delhivery.",
+    );
+  }
+
   return {
-    pickup_location: warehouse.name,
+    pickup_location: warehouse.pickupLocation,
     expected_package_count:
       overrides.expected_package_count || expectedPackageCount || 1,
     pickup_date: overrides.pickup_date || getDefaultPickupDate(),
@@ -610,6 +617,13 @@ export const createShipment = async (req, res) => {
     // ── 5. Build Delhivery shipment payload ──────────────────────────────────
     const warehouse = getWarehouseConfig();
 
+    if (!warehouse.pickupLocation) {
+      await client.query("ROLLBACK");
+      throw new Error(
+        "DELHIVERY_PICKUP_LOCATION is missing. Configure the exact pickup location registered in Delhivery.",
+      );
+    }
+
     // ── 5a. Validate warehouse (pickup/origin) config before proceeding ──────
     const warehouseValidation = validateWarehouseConfig(warehouse);
 
@@ -671,6 +685,7 @@ export const createShipment = async (req, res) => {
     console.log("[CREATE_SHIPMENT] Preparing to create shipment", {
       orderId: order.id,
       orderNumber: order.order_number,
+      pickup_location: payload.pickup_location?.name,
       addressId: order.address_id || null,
       shippingAddress: {
         city: shippingAddress.city,
@@ -684,6 +699,9 @@ export const createShipment = async (req, res) => {
         pincode: warehouse.pincode,
       },
     });
+    console.info("[CREATE_SHIPMENT] Delhivery pickup location:", {
+      pickup_location: payload.pickup_location?.name,
+    });
 
     // ── 6. Call Delhivery API to create shipment ─────────────────────────────
     let delhiveryResponse;
@@ -694,7 +712,15 @@ export const createShipment = async (req, res) => {
       delhiveryResponse = await delhiveryService.createShipment(payload);
     } catch (error) {
       await client.query("ROLLBACK");
-      console.error("[CREATE_SHIPMENT] Delhivery API error", error);
+      const errorMessage = String(error?.message || error?.rmk || "");
+      if (/ClientWarehouse matching query does not exist/i.test(errorMessage)) {
+        console.error(
+          "[CREATE_SHIPMENT] Delhivery pickup location was not found.",
+          { configuredPickupLocation: payload.pickup_location?.name },
+        );
+      } else {
+        console.error("[CREATE_SHIPMENT] Delhivery API error", error);
+      }
       return res.status(500).json({
         success: false,
         message: "Unable to create Delhivery shipment.",
@@ -705,10 +731,22 @@ export const createShipment = async (req, res) => {
     // Check if Delhivery response indicates success
     if (!delhiveryResponse || delhiveryResponse.success === false) {
       await client.query("ROLLBACK");
-      console.warn(
-        "[CREATE_SHIPMENT] Delhivery returned error",
-        delhiveryResponse,
+      const delhiveryMessage = String(
+        delhiveryResponse?.rmk || delhiveryResponse?.message || "",
       );
+      if (
+        /ClientWarehouse matching query does not exist/i.test(delhiveryMessage)
+      ) {
+        console.error(
+          "[CREATE_SHIPMENT] Delhivery pickup location was not found.",
+          { configuredPickupLocation: payload.pickup_location?.name },
+        );
+      } else {
+        console.warn(
+          "[CREATE_SHIPMENT] Delhivery returned error",
+          delhiveryResponse,
+        );
+      }
       return res.status(400).json({
         success: false,
         message:

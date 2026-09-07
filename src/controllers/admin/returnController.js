@@ -154,7 +154,8 @@ const isReturnWindowOpen = (order) => {
   }
 
   const deadline = new Date(
-    new Date(order.delivered_at).getTime() + RETURN_WINDOW_HOURS * 60 * 60 * 1000,
+    new Date(order.delivered_at).getTime() +
+      RETURN_WINDOW_HOURS * 60 * 60 * 1000,
   );
 
   if (Date.now() > deadline.getTime()) {
@@ -648,6 +649,7 @@ export const createReverseShipment = async (req, res) => {
       customerAddress,
       warehouse,
     );
+    originAsWarehouse.pickupLocation = warehouse.pickupLocation;
 
     let payload;
     try {
@@ -1152,7 +1154,8 @@ export const approveInspection = async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
-        message: "This return already failed quality check and cannot be re-approved.",
+        message:
+          "This return already failed quality check and cannot be re-approved.",
       });
     }
 
@@ -1638,9 +1641,10 @@ export const completeRefund = async (req, res) => {
       orderId,
       error: err?.message || err,
     });
-    return res
-      .status(500)
-      .json({ success: false, message: "Unable to initiate refund. Please try again." });
+    return res.status(500).json({
+      success: false,
+      message: "Unable to initiate refund. Please try again.",
+    });
   } finally {
     phase1.release();
   }
@@ -1755,10 +1759,14 @@ export const completeRefund = async (req, res) => {
     );
   }
 
-  log("info", isProcessed ? "return.refund_completed" : "return.refund_initiated", {
-    orderId,
-    refundId: razorpayRefund.id,
-  });
+  log(
+    "info",
+    isProcessed ? "return.refund_completed" : "return.refund_initiated",
+    {
+      orderId,
+      refundId: razorpayRefund.id,
+    },
+  );
 
   res.json({
     success: true,

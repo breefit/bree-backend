@@ -10,6 +10,11 @@ export const buildDelhiveryShipmentPayload = ({
   if (!order) throw new Error("Order is required");
   if (!shippingAddress) throw new Error("Shipping address is required");
   if (!items?.length) throw new Error("Order items are required");
+  if (!warehouse?.pickupLocation?.trim()) {
+    throw new Error(
+      "DELHIVERY_PICKUP_LOCATION is missing. Configure the exact pickup location registered in Delhivery.",
+    );
+  }
 
   // ---------- Helpers ----------
   const cleanPhone = (phone = "") =>
@@ -205,7 +210,7 @@ export const buildDelhiveryShipmentPayload = ({
   const payload = {
     shipments: [shipment],
     pickup_location: {
-      name: warehouse.name,
+      name: warehouse.pickupLocation,
     },
   };
 
