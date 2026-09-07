@@ -104,6 +104,12 @@ const convertPlaceholders = (text) => {
 const runQuery = async (connection, text, params = []) => {
   const sql = convertPlaceholders(text);
 
+  if (connection._released) {
+    const error = new Error("Database connection has already been released");
+    error.code = "DB_CONNECTION_RELEASED";
+    throw error;
+  }
+
   try {
     const raw = connection._originalQuery
       ? await connection._originalQuery(sql, params)
@@ -1356,10 +1362,27 @@ export const query = async (text, params = []) => {
 
 export const getClient = async () => {
   const connection = await pool.getConnection();
+  console.info("[DB] transaction connection acquired");
 
-  await connection.query("SET time_zone = '+05:30'");
+  try {
+    await connection.ping();
+    await connection.query("SET time_zone = '+05:30'");
+  } catch (error) {
+    connection.destroy();
+    console.error("[DB] transaction connection health check failed", {
+      message: error?.message || String(error),
+    });
+    throw error;
+  }
 
   connection._originalQuery = connection.query.bind(connection);
+  connection._released = false;
+  const originalRelease = connection.release.bind(connection);
+  connection.release = () => {
+    if (connection._released) return;
+    connection._released = true;
+    originalRelease();
+  };
 
   connection.query = async (text, params = []) => {
     return runQuery(connection, text, params);

@@ -76,6 +76,11 @@ export const validateWarehouseConfig = (warehouse) => {
   return { valid: !hasMissingField, missing };
 };
 
+export const shouldRollbackTransaction = ({
+  transactionStarted,
+  transactionFinished,
+}) => Boolean(transactionStarted && !transactionFinished);
+
 // ===== Delhivery Pickup Integration =====
 // ─────────────────────────────────────────────────────────────────────────────
 // Build the pickup request payload for delhiveryService.requestPickup().
@@ -411,9 +416,16 @@ export const createShipment = async (req, res) => {
   }
 
   const client = await getClient();
+  let transactionStarted = false;
+  let transactionFinished = false;
+  console.info("[CREATE_SHIPMENT] transaction connection acquired", {
+    orderId,
+  });
 
   try {
     await client.query("BEGIN");
+    transactionStarted = true;
+    console.info("[DB] transaction started", { operation: "createShipment" });
 
     // ── 1. Fetch the order ───────────────────────────────────────────────────
     // FIX (Delhivery shipment audit — idempotency): locked with FOR UPDATE so
@@ -458,6 +470,11 @@ export const createShipment = async (req, res) => {
     }
 
     const order = orderRows[0];
+    console.info("[CREATE_SHIPMENT] order loaded", {
+      orderId: order.id,
+      orderNumber: order.order_number,
+      status: order.order_status,
+    });
 
     // The orders query above (and the orders table) expose the order total
     // as `total`, but buildDelhiveryShipmentPayload() reads `total_amount`
@@ -618,7 +635,6 @@ export const createShipment = async (req, res) => {
     const warehouse = getWarehouseConfig();
 
     if (!warehouse.pickupLocation) {
-      await client.query("ROLLBACK");
       throw new Error(
         "DELHIVERY_PICKUP_LOCATION is missing. Configure the exact pickup location registered in Delhivery.",
       );
@@ -709,7 +725,15 @@ export const createShipment = async (req, res) => {
     // console.log(JSON.stringify(payload, null, 2));
     // console.log("\n=======================================\n");
     try {
+      console.info("[CREATE_SHIPMENT] Delhivery shipment request started", {
+        orderId: order.id,
+        pickup_location: payload.pickup_location?.name,
+      });
       delhiveryResponse = await delhiveryService.createShipment(payload);
+      console.info("[CREATE_SHIPMENT] Delhivery shipment request completed", {
+        orderId: order.id,
+        success: delhiveryResponse?.success !== false,
+      });
     } catch (error) {
       await client.query("ROLLBACK");
       const errorMessage = String(error?.message || error?.rmk || "");
@@ -816,6 +840,7 @@ export const createShipment = async (req, res) => {
       `UPDATE orders SET ${updateColumns.join(", ")} WHERE id = ?`,
       updateParams,
     );
+    console.info("[CREATE_SHIPMENT] order updated", { orderId });
 
     // ── 9. Record status transition in order_status_history ──────────────────
     await appendStatusHistory({
@@ -824,7 +849,9 @@ export const createShipment = async (req, res) => {
       newStatus: "shipped",
       changedBy: null,
       notes: `Shipment created with Delhivery. AWB: ${awbNumber}`,
+      queryExecutor: client.query.bind(client),
     });
+    console.info("[CREATE_SHIPMENT] status history updated", { orderId });
 
     // ── 10. Fetch updated order ──────────────────────────────────────────────
     const { rows: updatedOrderRows } = await client.query(
@@ -838,6 +865,8 @@ export const createShipment = async (req, res) => {
     );
 
     await client.query("COMMIT");
+    transactionFinished = true;
+    console.info("[DB] transaction committed", { operation: "createShipment" });
 
     const updatedOrder = updatedOrderRows[0];
 
@@ -877,7 +906,21 @@ export const createShipment = async (req, res) => {
       },
     });
   } catch (error) {
-    await client.query("ROLLBACK");
+    if (
+      shouldRollbackTransaction({ transactionStarted, transactionFinished })
+    ) {
+      try {
+        await client.query("ROLLBACK");
+        console.info("[DB] transaction rolled back", {
+          operation: "createShipment",
+        });
+      } catch (rollbackError) {
+        console.error("[DB] transaction rollback failed", {
+          operation: "createShipment",
+          message: rollbackError?.message || String(rollbackError),
+        });
+      }
+    }
     console.error("[CREATE_SHIPMENT] Unexpected error", error);
     res.status(500).json({
       success: false,
@@ -886,6 +929,9 @@ export const createShipment = async (req, res) => {
     });
   } finally {
     client.release();
+    console.info("[DB] transaction connection released", {
+      operation: "createShipment",
+    });
   }
 };
 

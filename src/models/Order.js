@@ -7,8 +7,9 @@ export const appendStatusHistory = async ({
   newStatus,
   changedBy = null,
   notes = null,
+  queryExecutor = query,
 }) => {
-  return query(
+  return queryExecutor(
     `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes) VALUES (?, ?, ?, ?, ?)`,
     [orderId, previousStatus, newStatus, changedBy, notes],
   );

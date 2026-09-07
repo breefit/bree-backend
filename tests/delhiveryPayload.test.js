@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { buildDelhiveryShipmentPayload } from "../src/utils/delhiveryPayload.js";
+import { shouldRollbackTransaction } from "../src/controllers/shippingController.js";
 
 test("uses the registered Delhivery pickup location for shipment creation", () => {
   const payload = buildDelhiveryShipmentPayload({
@@ -67,5 +68,29 @@ test("fails clearly when the registered Delhivery pickup location is missing", (
         },
       }),
     /DELHIVERY_PICKUP_LOCATION is missing/,
+  );
+});
+
+test("only rolls back an active unfinished transaction", () => {
+  assert.equal(
+    shouldRollbackTransaction({
+      transactionStarted: true,
+      transactionFinished: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldRollbackTransaction({
+      transactionStarted: true,
+      transactionFinished: true,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldRollbackTransaction({
+      transactionStarted: false,
+      transactionFinished: false,
+    }),
+    false,
   );
 });
