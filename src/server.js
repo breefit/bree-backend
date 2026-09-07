@@ -13,9 +13,28 @@ import { getSafeRazorpayConfig } from "./config/razorpay.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config({ path: path.resolve(__dirname, "../.env") });
+const preloadedRazorpayEnv = {
+  keyId: Boolean(process.env.RAZORPAY_KEY_ID),
+  keySecret: Boolean(process.env.RAZORPAY_KEY_SECRET),
+};
+const dotenvResult = dotenv.config({
+  path: path.resolve(__dirname, "../.env"),
+});
 
-console.info("[RAZORPAY] runtime configuration", getSafeRazorpayConfig());
+const razorpayEnvSource =
+  preloadedRazorpayEnv.keyId && preloadedRazorpayEnv.keySecret
+    ? "process environment (Hostinger/PM2)"
+    : dotenvResult.parsed?.RAZORPAY_KEY_ID &&
+        dotenvResult.parsed?.RAZORPAY_KEY_SECRET
+      ? "backend .env fallback"
+      : "mixed or missing sources";
+
+console.info("[RAZORPAY] runtime configuration", {
+  nodeEnv: process.env.NODE_ENV || "development",
+  envSource: razorpayEnvSource,
+  dotenvLoaded: Boolean(dotenvResult.parsed),
+  ...getSafeRazorpayConfig(),
+});
 
 // console.log("STEP 1 - Server file loaded");
 // console.log("STEP 4 - Environment variables loaded");

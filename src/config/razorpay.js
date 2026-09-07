@@ -24,6 +24,33 @@ const maskKeyId = (keyId) =>
     ? `${keyId.slice(0, 9)}...${keyId.slice(-4)}`
     : `${keyId.slice(0, 3)}...`;
 
+const getCredentialDiagnostics = () => {
+  const rawKeyId = process.env.RAZORPAY_KEY_ID;
+  const rawKeySecret = process.env.RAZORPAY_KEY_SECRET;
+  const keyId = normalizeCredential(rawKeyId);
+  const keySecret = normalizeCredential(rawKeySecret);
+
+  return {
+    keyIdPresent: Boolean(keyId),
+    keyIdPrefix: keyId.slice(0, 9) || null,
+    keyIdMasked: keyId ? maskKeyId(keyId) : null,
+    keyIdLooksLive: keyId.startsWith("rzp_live_"),
+    keyIdLooksTest: keyId.startsWith("rzp_test_"),
+    keyIdFormatValid: /^rzp_(live|test)_[A-Za-z0-9]+$/.test(keyId),
+    keyIdContainsNonAscii: /[^\x00-\x7F]/.test(keyId),
+    keyIdContainsWhitespace: hasCredentialWhitespace(rawKeyId || ""),
+    keySecretPresent: Boolean(keySecret),
+    keySecretLength: keySecret.length,
+    keySecretContainsWhitespace: hasCredentialWhitespace(rawKeySecret || ""),
+    keySecretContainsNewline: /[\r\n]/.test(rawKeySecret || ""),
+    keySecretWrappedInQuotes:
+      typeof rawKeySecret === "string" &&
+      rawKeySecret.length >= 2 &&
+      ((rawKeySecret.startsWith('"') && rawKeySecret.endsWith('"')) ||
+        (rawKeySecret.startsWith("'") && rawKeySecret.endsWith("'"))),
+  };
+};
+
 export const getRazorpayConfig = () => {
   const keyId = normalizeCredential(process.env.RAZORPAY_KEY_ID);
   const keySecret = normalizeCredential(process.env.RAZORPAY_KEY_SECRET);
@@ -37,9 +64,12 @@ export const getRazorpayConfig = () => {
     throw new Error("RAZORPAY_KEY_SECRET is missing or empty");
   }
 
-  if (hasCredentialWhitespace(keyId) || hasCredentialWhitespace(keySecret)) {
+  if (
+    /[\r\n]/.test(process.env.RAZORPAY_KEY_ID || "") ||
+    /[\r\n]/.test(process.env.RAZORPAY_KEY_SECRET || "")
+  ) {
     throw new Error(
-      "Razorpay credentials contain whitespace; remove quotes, spaces, and newlines",
+      "Razorpay credentials contain a newline; remove quotes and newlines",
     );
   }
 
@@ -49,27 +79,29 @@ export const getRazorpayConfig = () => {
     );
   }
 
+  if (!/^rzp_(live|test)_[A-Za-z0-9]+$/.test(keyId)) {
+    throw new Error(
+      "Razorpay key ID format is invalid; use the exact ASCII key ID from the matching Razorpay account",
+    );
+  }
+
   return { keyId, keySecret, mode };
 };
 
 export const getSafeRazorpayConfig = () => {
+  const diagnostics = getCredentialDiagnostics();
   try {
     const { keyId, keySecret, mode } = getRazorpayConfig();
     return {
       configured: true,
-      keyIdPresent: true,
-      keyIdMasked: maskKeyId(keyId),
-      keySecretPresent: Boolean(keySecret),
       mode,
+      ...diagnostics,
     };
   } catch (err) {
     return {
       configured: false,
-      keyIdPresent: Boolean(normalizeCredential(process.env.RAZORPAY_KEY_ID)),
-      keySecretPresent: Boolean(
-        normalizeCredential(process.env.RAZORPAY_KEY_SECRET),
-      ),
       mode: process.env.NODE_ENV === "production" ? "live" : "test-or-live",
+      ...diagnostics,
       error: err.message,
     };
   }
