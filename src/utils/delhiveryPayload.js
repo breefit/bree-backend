@@ -1,11 +1,14 @@
 // backend/src/utils/delhiveryPayload.js
 
+import { resolveShipmentWeight } from "./shippingWeight.js";
+
 export const buildDelhiveryShipmentPayload = ({
   order,
   customer,
   shippingAddress,
   items,
   warehouse,
+  bottleWeightKg,
 }) => {
   if (!order) throw new Error("Order is required");
   if (!shippingAddress) throw new Error("Shipping address is required");
@@ -25,11 +28,13 @@ export const buildDelhiveryShipmentPayload = ({
     return Number.isFinite(num) ? num : fallback;
   };
 
-  // ---------- Package ----------
-  const totalWeight = items.reduce(
-    (sum, item) => sum + getNumber(item.weight, 0.5),
-    0,
-  );
+  // Delhivery expects shipment weight in grams. Bottle volume is fixed at
+  // 50 ml, but it is not a weight measurement.
+  const shippingWeight = resolveShipmentWeight({
+    order,
+    items,
+    ...(bottleWeightKg === undefined ? {} : { bottleWeightKg }),
+  });
 
   const totalLength = Math.max(
     ...items.map((item) => getNumber(item.length, 10)),
@@ -41,11 +46,6 @@ export const buildDelhiveryShipmentPayload = ({
 
   const totalHeight = items.reduce(
     (sum, item) => sum + getNumber(item.height, 5),
-    0,
-  );
-
-  const totalQuantity = items.reduce(
-    (sum, item) => sum + getNumber(item.quantity, 1),
     0,
   );
 
@@ -99,7 +99,7 @@ export const buildDelhiveryShipmentPayload = ({
       order.payment_method === "COD" ? getNumber(order.total_amount, 0) : 0,
     ),
 
-    quantity: String(totalQuantity),
+    quantity: String(shippingWeight.bottleCount),
 
     products_desc: items.map((item) => item.product_name).join(", "),
 
@@ -139,7 +139,7 @@ export const buildDelhiveryShipmentPayload = ({
 
     shipment_height: totalHeight,
 
-    weight: Number(totalWeight.toFixed(2)),
+    weight: shippingWeight.totalWeightGrams,
 
     shipping_mode: "Surface",
 

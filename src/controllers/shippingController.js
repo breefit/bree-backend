@@ -510,6 +510,9 @@ export const createShipment = async (req, res) => {
           shipping_country,
           subtotal,
           total,
+          is_bulk_order,
+          parent_package_id,
+          fulfillment_cycle,
           awb_number,
           shipment_id,
           tracking_number,
@@ -706,9 +709,12 @@ export const createShipment = async (req, res) => {
 
     // ── 4. Fetch order items ─────────────────────────────────────────────────
     const { rows: items } = await client.query(
-      `SELECT id, product_id, product_name, product_price, quantity
-       FROM order_items
-       WHERE order_id = ?`,
+      `SELECT oi.id, oi.product_id, oi.product_name, oi.product_price, oi.quantity,
+              p.quantity AS pack_bottle_count,
+              p.is_recurring_package
+       FROM order_items oi
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE oi.order_id = ?`,
       [orderId],
     );
 

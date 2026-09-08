@@ -259,6 +259,7 @@ DELHIVERY_TIMEOUT=YOUR_VALUE_HERE          # ms, optional (defaults to 30000)
 DELHIVERY_TRACKING_URL=YOUR_VALUE_HERE     # optional, tracking link base
 DELHIVERY_PICKUP_TIME=YOUR_VALUE_HERE      # optional, default pickup time
 DELHIVERY_PICKUP_LOCATION=BREE FIT         # exact registered Delhivery client warehouse name
+DELHIVERY_BOTTLE_WEIGHT_KG=YOUR_VALUE_HERE # actual filled 50 ml bottle weight in kg; required
 
 # ── Warehouse (pickup/origin address for Delhivery shipments) ──────────
 WAREHOUSE_NAME=YOUR_VALUE_HERE

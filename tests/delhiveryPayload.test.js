@@ -29,9 +29,11 @@ test("uses the registered Delhivery pickup location for shipment creation", () =
       {
         product_name: "Amla Shots",
         quantity: 1,
+        pack_bottle_count: 7,
         product_price: 1048,
       },
     ],
+    bottleWeightKg: 0.02,
     warehouse: {
       name: "Legacy Warehouse Label",
       pickupLocation: "BREE FIT",
@@ -46,6 +48,8 @@ test("uses the registered Delhivery pickup location for shipment creation", () =
 
   assert.equal(payload.pickup_location.name, "BREE FIT");
   assert.equal(payload.shipments[0].seller_name, "Legacy Warehouse Label");
+  assert.equal(payload.shipments[0].quantity, "7");
+  assert.equal(payload.shipments[0].weight, 140);
 });
 
 test("fails clearly when the registered Delhivery pickup location is missing", () => {
