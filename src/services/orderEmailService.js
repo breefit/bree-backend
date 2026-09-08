@@ -17,8 +17,23 @@ const getFromAddress = () =>
   process.env.SMTP_USER ||
   "BREE Wellness <no-reply@breewellness.com>";
 
-const getFrontendUrl = () =>
-  (process.env.FRONTEND_URL || "https://breefit.in").trim().replace(/\/+$/, "");
+const getFrontendUrl = () => {
+  const configuredUrl = (
+    process.env.FRONTEND_URL || "https://www.breefit.in"
+  ).trim();
+  const embeddedAbsoluteUrl = configuredUrl.match(/\/((?:https?:\/\/).+)$/);
+  const candidateUrl = embeddedAbsoluteUrl?.[1] || configuredUrl;
+  const absoluteUrl = candidateUrl.match(/^https?:\/\//)
+    ? candidateUrl
+    : `https://${candidateUrl}`;
+  const frontendUrl = new URL(absoluteUrl);
+
+  if (frontendUrl.hostname === "breefit.in") {
+    frontendUrl.hostname = "www.breefit.in";
+  }
+
+  return frontendUrl.origin.replace(/\/+$/, "");
+};
 
 const sendEmail = async ({ to, subject, html }) => {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS || !to) {

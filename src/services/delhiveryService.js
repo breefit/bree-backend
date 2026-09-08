@@ -248,7 +248,13 @@ class DelhiveryService {
     }
 
     try {
-      const response = await client.post("/fm/request/new/", data);
+      const response = await client.post("/fm/request/new/", data, {
+        headers: {
+          Authorization: `Token ${API_TOKEN}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+      });
 
       if (!response.data) {
         throw new Error("Empty response received from Delhivery.");

@@ -10,7 +10,7 @@ test("order status email uses one normalized absolute tracking URL", async () =>
   const previousSmtpPass = process.env.SMTP_PASS;
   let message;
 
-  process.env.FRONTEND_URL = "https://breefit.in/";
+  process.env.FRONTEND_URL = "https://breefit.in/https://www.breefit.in/";
   process.env.SMTP_USER = "test@example.com";
   process.env.SMTP_PASS = "test-password";
   mock.method(nodemailer, "createTransport", () => ({
@@ -45,10 +45,11 @@ test("order status email uses one normalized absolute tracking URL", async () =>
     }
   }
 
-  const expectedUrl = "https://breefit.in/order/order-123/tracking";
+  const expectedUrl = "https://www.breefit.in/order/order-123/tracking";
   assert.match(message.html, new RegExp(`href="${expectedUrl}"`));
   assert.match(message.html, new RegExp(`>${expectedUrl}<`));
   assert.doesNotMatch(message.html, /breefit\.in\.https:\/\//);
+  assert.doesNotMatch(message.html, /breefit\.in\/https:\/\//);
   assert.doesNotMatch(message.html, /https:\/\/[^\s"<]+https:\/\//);
   assert.doesNotMatch(
     message.html,

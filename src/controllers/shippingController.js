@@ -142,12 +142,16 @@ const findShipmentIdentityConflict = async (
 // Uses the same warehouse config as shipment creation, plus sensible
 // defaults for pickup scheduling fields, all overridable via req.body.
 // ─────────────────────────────────────────────────────────────────────────────
-const getDefaultPickupDate = () => {
-  // Defaults to today's date (server local time) in YYYY-MM-DD format.
+const getDefaultPickupDate = (pickupTime) => {
+  // Delhivery rejects a pickup window that has already passed today.
   const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth() + 1).padStart(2, "0");
-  const dd = String(now.getDate()).padStart(2, "0");
+  const [hours, minutes, seconds] = String(pickupTime).split(":").map(Number);
+  const pickupToday = new Date(now);
+  pickupToday.setHours(hours || 0, minutes || 0, seconds || 0, 0);
+  const date = now >= pickupToday ? new Date(now.getTime() + 86400000) : now;
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, "0");
+  const dd = String(date.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 };
 
@@ -162,15 +166,58 @@ export const buildPickupRequestPayload = (
     );
   }
 
+  const pickupTime =
+    overrides.pickup_time || process.env.DELHIVERY_PICKUP_TIME || "14:00:00";
+
   return {
     pickup_location: warehouse.pickupLocation,
     expected_package_count:
       overrides.expected_package_count || expectedPackageCount || 1,
-    pickup_date: overrides.pickup_date || getDefaultPickupDate(),
-    pickup_time:
-      overrides.pickup_time || process.env.DELHIVERY_PICKUP_TIME || "14:00:00",
+    pickup_date: overrides.pickup_date || getDefaultPickupDate(pickupTime),
+    pickup_time: pickupTime,
   };
 };
+
+export const extractPickupRequestId = (pickupResponse) =>
+  pickupResponse?.pickup_id ||
+  pickupResponse?.request_id ||
+  pickupResponse?.pickup_request_id ||
+  pickupResponse?.pickup_request_ids?.[0] ||
+  pickupResponse?.data?.pickup_id ||
+  pickupResponse?.data?.request_id ||
+  pickupResponse?.data?.pickup_request_id ||
+  pickupResponse?.data?.pickup_request_ids?.[0] ||
+  null;
+
+export const isValidPickupRequestId = (pickupRequestId) =>
+  Boolean(String(pickupRequestId || "").trim());
+
+export const hasPickupShipmentReference = (order) =>
+  Boolean(
+    String(order?.awb_number || "").trim() &&
+    String(order?.shipment_id || "").trim(),
+  );
+
+const getDelhiveryErrorMessage = (error) => {
+  const responseBody = error?.data;
+  if (typeof responseBody === "string" && responseBody.trim()) {
+    return responseBody.trim();
+  }
+
+  return (
+    responseBody?.message ||
+    responseBody?.rmk ||
+    responseBody?.error ||
+    error?.message ||
+    "Delhivery API returned an error"
+  );
+};
+
+export const formatDelhiveryPickupError = (error) => ({
+  status: Number(error?.status) || 502,
+  message: getDelhiveryErrorMessage(error),
+  delhiveryError: error?.data || error,
+});
 // ===== End Delhivery Pickup Integration =====
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1272,7 +1319,7 @@ export const schedulePickup = async (req, res) => {
     const order = orderRows[0];
 
     // ── 2. Validate AWB exists (shipment already created) ───────────────────
-    if (!order.awb_number || !order.shipment_id) {
+    if (!hasPickupShipmentReference(order)) {
       await client.query("ROLLBACK");
       console.warn(
         `[SCHEDULE_PICKUP] No AWB/shipment found for order ${orderId}`,
@@ -1284,7 +1331,7 @@ export const schedulePickup = async (req, res) => {
     }
 
     // ── 3. Validate pickup_request_id is empty ───────────────────────────────
-    if (order.pickup_request_id) {
+    if (isValidPickupRequestId(order.pickup_request_id)) {
       await client.query("ROLLBACK");
       console.warn(
         `[SCHEDULE_PICKUP] Pickup already scheduled for order ${orderId}: ${order.pickup_request_id}`,
@@ -1348,11 +1395,19 @@ export const schedulePickup = async (req, res) => {
       pickupResponse = await delhiveryService.requestPickup(pickupPayload);
     } catch (error) {
       await client.query("ROLLBACK");
-      console.error("[SCHEDULE_PICKUP] Delhivery API error", error);
-      return res.status(500).json({
+      const formattedError = formatDelhiveryPickupError(error);
+      console.error("[SCHEDULE_PICKUP] Delhivery API error", {
+        orderId,
+        awb: order.awb_number,
+        shipmentId: order.shipment_id,
+        status: formattedError.status,
+        responseBody: formattedError.delhiveryError,
+      });
+      return res.status(formattedError.status).json({
         success: false,
-        message: "Failed to schedule pickup with Delhivery",
-        error: error.message || error,
+        message: `Delhivery rejected the pickup request: ${formattedError.message}`,
+        error: formattedError.message,
+        delhiveryError: formattedError.delhiveryError,
       });
     }
 
@@ -1373,16 +1428,7 @@ export const schedulePickup = async (req, res) => {
     // Checks request_id, pickup_request_ids[], and their data.-nested
     // variants, in addition to the previously supported keys.
     // First valid (truthy) value found wins.
-    const pickupRequestId =
-      pickupResponse.pickup_id ||
-      pickupResponse.request_id ||
-      pickupResponse.pickup_request_id ||
-      pickupResponse.pickup_request_ids?.[0] ||
-      pickupResponse.data?.pickup_id ||
-      pickupResponse.data?.request_id ||
-      pickupResponse.data?.pickup_request_id ||
-      pickupResponse.data?.pickup_request_ids?.[0] ||
-      null;
+    const pickupRequestId = extractPickupRequestId(pickupResponse);
 
     if (!pickupRequestId) {
       await client.query("ROLLBACK");
