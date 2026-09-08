@@ -1,5 +1,5 @@
 import { query, getClient } from "../config/database.js";
-import delhiveryService from "../services/delhiveryService.js";
+import delhiveryService, { isPdfBuffer } from "../services/delhiveryService.js";
 import {
   sendShipmentCreatedEmail,
   sendShipmentCancelledEmail,
@@ -1876,11 +1876,11 @@ export const downloadShippingLabel = async (req, res) => {
       });
     }
 
-    if (!labelBuffer) {
-      console.warn(`[DOWNLOAD_LABEL] Empty label response for AWB ${awb}`);
-      return res.status(404).json({
+    if (!isPdfBuffer(labelBuffer)) {
+      console.error(`[DOWNLOAD_LABEL] Invalid PDF response for AWB ${awb}`);
+      return res.status(502).json({
         success: false,
-        message: "Shipping label not found for this AWB",
+        message: "Delhivery returned an invalid shipping label",
       });
     }
 
@@ -1892,7 +1892,7 @@ export const downloadShippingLabel = async (req, res) => {
 
     console.log(`[DOWNLOAD_LABEL] Label served successfully for AWB ${awb}`);
 
-    return res.status(200).send(Buffer.from(labelBuffer));
+    return res.status(200).send(labelBuffer);
   } catch (error) {
     console.error("[DOWNLOAD_LABEL] Unexpected error", error);
     res.status(500).json({

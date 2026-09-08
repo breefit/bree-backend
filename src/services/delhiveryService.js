@@ -1,4 +1,5 @@
 import axios from "axios";
+import PDFDocument from "pdfkit";
 
 const BASE_URL = process.env.DELHIVERY_BASE_URL;
 const API_TOKEN = process.env.DELHIVERY_API_TOKEN;
@@ -47,7 +48,6 @@ client.interceptors.response.use(
     if (error.response) {
       console.error(
         `[Delhivery] <-- ${error.response.status} ${error.config?.method?.toUpperCase()} ${error.config?.url}`,
-        error.response.data,
       );
     } else if (error.request) {
       console.error(
@@ -271,10 +271,23 @@ class DelhiveryService {
     try {
       const response = await client.get(`/api/p/packing_slip?wbns=${waybill}`, {
         responseType: "arraybuffer",
+        headers: {
+          Accept: "application/pdf, application/json",
+        },
       });
 
-      return response.data;
+      console.log("[Delhivery] Shipping label response:", {
+        status: response.status,
+        contentType: response.headers?.["content-type"] || "unknown",
+        dataType: describeResponseData(response.data),
+        format: classifyLabelData(response.data),
+      });
+
+      return await normalizeShippingLabelResponse(response);
     } catch (error) {
+      if (error.code === "DELHIVERY_LABEL_INVALID") {
+        throw error;
+      }
       throw this.handleError(error);
     }
   }
@@ -337,5 +350,251 @@ class DelhiveryService {
     };
   }
 }
+
+const PDF_SIGNATURE = Buffer.from("%PDF-");
+
+export const isPdfBuffer = (value) => {
+  if (value instanceof ArrayBuffer) value = Buffer.from(value);
+  if (!Buffer.isBuffer(value)) return false;
+  const buffer = value;
+  return (
+    buffer.length >= PDF_SIGNATURE.length &&
+    buffer.subarray(0, 5).equals(PDF_SIGNATURE)
+  );
+};
+
+const describeResponseData = (data) => {
+  if (Buffer.isBuffer(data)) return "Buffer";
+  if (data instanceof ArrayBuffer) return "ArrayBuffer";
+  if (typeof data === "string") return "string";
+  if (data === null) return "null";
+  return typeof data;
+};
+
+const classifyLabelData = (data) => {
+  if (!data || (Buffer.isBuffer(data) && data.length === 0)) return "empty";
+  if (isPdfBuffer(data)) return "pdf-binary";
+  if (typeof data === "object" && !Buffer.isBuffer(data)) return "json";
+
+  const text = Buffer.isBuffer(data)
+    ? data.toString("utf8").trim()
+    : String(data).trim();
+  if (!text) return "empty";
+  try {
+    JSON.parse(text);
+    return "json";
+  } catch {
+    return "base64-or-invalid-text";
+  }
+};
+
+const invalidLabelError = (message) => {
+  const error = new Error(message);
+  error.code = "DELHIVERY_LABEL_INVALID";
+  error.status = 502;
+  return error;
+};
+
+const findEncodedLabel = (value) => {
+  if (!value || typeof value !== "object") return null;
+
+  const preferredKeys = [
+    "label_url",
+    "labelUrl",
+    "url",
+    "pdf_url",
+    "pdfUrl",
+    "label",
+    "pdf",
+    "pdf_base64",
+    "base64",
+    "encoded_label",
+    "encodedLabel",
+    "packing_slip",
+  ];
+
+  for (const key of preferredKeys) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return { key, value: candidate.trim() };
+    }
+  }
+
+  for (const child of Object.values(value)) {
+    const found = findEncodedLabel(child);
+    if (found) return found;
+  }
+
+  return null;
+};
+
+const addPackingSlipField = (document, label, value) => {
+  if (value === undefined || value === null || value === "") return;
+  document.fontSize(8).fillColor("#444444").text(`${label}: ${value}`);
+};
+
+const renderPackingSlipJson = (data) => {
+  if (!Array.isArray(data?.packages) || data.packages.length === 0) {
+    throw invalidLabelError(
+      "Delhivery returned an empty packing-slip package list.",
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    const document = new PDFDocument({ size: [288, 432], margin: 18 });
+    const chunks = [];
+
+    document.on("data", (chunk) => chunks.push(chunk));
+    document.on("end", () => resolve(Buffer.concat(chunks)));
+    document.on("error", reject);
+
+    data.packages.forEach((shipment, index) => {
+      if (index > 0) document.addPage();
+
+      document
+        .fontSize(15)
+        .fillColor("#111111")
+        .text("DELHIVERY", { align: "center" });
+      document.moveDown(0.5);
+      document
+        .fontSize(11)
+        .text(`Shipping Label${shipment.wbn ? ` - ${shipment.wbn}` : ""}`, {
+          align: "center",
+        });
+      document.moveDown(0.75);
+
+      addPackingSlipField(document, "Order", shipment.oid);
+      addPackingSlipField(document, "Consignee", shipment.name);
+      addPackingSlipField(document, "Address", shipment.address);
+      addPackingSlipField(document, "City", shipment.destination_city);
+      addPackingSlipField(document, "State", shipment.st);
+      addPackingSlipField(document, "PIN", shipment.pin);
+      addPackingSlipField(document, "Product", shipment.prd);
+      addPackingSlipField(document, "Payment", shipment.pt);
+      addPackingSlipField(document, "Weight", shipment.weight);
+      addPackingSlipField(document, "Sort Code", shipment.sort_code);
+
+      for (const barcodeKey of ["barcode", "oid_barcode"]) {
+        const barcode = shipment[barcodeKey];
+        if (!barcode?.startsWith("data:image/")) continue;
+        const encoded = barcode.split(",", 2)[1];
+        if (!encoded) continue;
+        try {
+          document.moveDown(0.5).image(Buffer.from(encoded, "base64"), {
+            fit: [230, 70],
+            align: "center",
+          });
+        } catch {
+          // Barcode rendering is optional; the shipment details remain usable.
+        }
+      }
+
+      document
+        .moveDown(0.5)
+        .fontSize(7)
+        .fillColor("#666666")
+        .text("Generated from Delhivery packing-slip response", {
+          align: "center",
+        });
+    });
+
+    document.end();
+  });
+};
+
+const decodeBase64Pdf = (value) => {
+  const normalized = value
+    .replace(/^data:application\/pdf;base64,/, "")
+    .replace(/\s/g, "");
+  if (
+    !normalized ||
+    !/^[A-Za-z0-9+/]+={0,2}$/.test(normalized) ||
+    normalized.length % 4 === 1
+  ) {
+    throw invalidLabelError(
+      "Delhivery returned an invalid base64 shipping label.",
+    );
+  }
+
+  const buffer = Buffer.from(normalized, "base64");
+  if (!isPdfBuffer(buffer)) {
+    throw invalidLabelError("Decoded Delhivery shipping label is not a PDF.");
+  }
+  return buffer;
+};
+
+const normalizeShippingLabelResponse = async (response) => {
+  const rawData = response?.data;
+  if (rawData === undefined || rawData === null) {
+    throw invalidLabelError(
+      "Delhivery returned an empty shipping label response.",
+    );
+  }
+
+  const rawBuffer = Buffer.isBuffer(rawData)
+    ? rawData
+    : rawData instanceof ArrayBuffer
+      ? Buffer.from(rawData)
+      : null;
+
+  if (rawBuffer) {
+    if (rawBuffer.length === 0) {
+      throw invalidLabelError(
+        "Delhivery returned an empty shipping label response.",
+      );
+    }
+    if (isPdfBuffer(rawBuffer)) return rawBuffer;
+
+    const text = rawBuffer.toString("utf8").trim();
+    try {
+      return await normalizeShippingLabelResponse({
+        data: JSON.parse(text),
+        headers: response.headers,
+        status: response.status,
+      });
+    } catch (error) {
+      if (error.code === "DELHIVERY_LABEL_INVALID" && !text) throw error;
+      if (text) return decodeBase64Pdf(text);
+      throw invalidLabelError(
+        "Delhivery returned a non-PDF shipping label response.",
+      );
+    }
+  }
+
+  if (typeof rawData === "string") {
+    if (rawData.trim().startsWith("%PDF-"))
+      return Buffer.from(rawData, "binary");
+    return decodeBase64Pdf(rawData);
+  }
+
+  if (Array.isArray(rawData?.packages)) {
+    return renderPackingSlipJson(rawData);
+  }
+
+  const encodedLabel = findEncodedLabel(rawData);
+  if (!encodedLabel) {
+    throw invalidLabelError(
+      "Delhivery response did not contain a PDF, base64 label, or label URL.",
+    );
+  }
+
+  if (/^https?:\/\//i.test(encodedLabel.value)) {
+    const labelResponse = await client.get(encodedLabel.value, {
+      responseType: "arraybuffer",
+      headers: { Accept: "application/pdf" },
+    });
+    console.log("[Delhivery] Shipping label URL response:", {
+      status: labelResponse.status,
+      contentType: labelResponse.headers?.["content-type"] || "unknown",
+      dataType: describeResponseData(labelResponse.data),
+      format: classifyLabelData(labelResponse.data),
+    });
+    return normalizeShippingLabelResponse(labelResponse);
+  }
+
+  return decodeBase64Pdf(encodedLabel.value);
+};
+
+export { normalizeShippingLabelResponse };
 
 export default new DelhiveryService();

@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
+    "test": "node --test",
     "migrate": "node migrations/mysql-migrate.js",
     "seed": "node migrations/seed.js"
   },
@@ -36,6 +37,7 @@
     "mysql2": "^3.4.4",
     "node-cron": "^4.6.0",
     "nodemailer": "^6.9.9",
+    "pdfkit": "^0.20.2",
     "razorpay": "^2.9.6",
     "socket.io": "^4.8.3"
   },
