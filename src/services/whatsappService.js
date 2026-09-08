@@ -11,9 +11,14 @@ const WAPLIFY_OTP_TEMPLATE = process.env.WAPLIFY_OTP_TEMPLATE || "otp_login";
 const DEFAULT_CONTACT_NAME = "BREE User";
 
 // Retry configuration for transient/upstream failures.
-const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
+// A 429 is a deliberate upstream rate-limit response. Retrying it multiplies
+// the OTP request and can make the login page appear stuck or rate-limited.
+const RETRYABLE_STATUS_CODES = [500, 502, 503, 504];
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
+
+export const isRetryableWhatsAppStatus = (status) =>
+  RETRYABLE_STATUS_CODES.includes(status);
 
 const validateConfig = () => {
   if (!WAPLIFY_BASE_URL) {
@@ -210,7 +215,7 @@ const sendTemplateRequest = async ({
       logFailure(error);
 
       const status = error.response?.status;
-      const isRetryable = RETRYABLE_STATUS_CODES.includes(status);
+      const isRetryable = isRetryableWhatsAppStatus(status);
 
       if (isRetryable && retryCount < MAX_RETRIES) {
         const delay = resolveRetryDelay(error, retryCount + 1);
@@ -245,7 +250,7 @@ export const sendWhatsAppOtp = async (mobile, otp) => {
     // uses named variables instead (e.g. {{otp}}), update the key below -
     // the rest of the payload/logic does not need to change.
     body_data: {
-      "1": otp,
+      1: otp,
     },
   };
 
@@ -259,5 +264,3 @@ export const sendWhatsAppOtp = async (mobile, otp) => {
 export default {
   sendWhatsAppOtp,
 };
-
-

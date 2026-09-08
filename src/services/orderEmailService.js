@@ -18,7 +18,7 @@ const getFromAddress = () =>
   "BREE Wellness <no-reply@breewellness.com>";
 
 const getFrontendUrl = () =>
-  (process.env.FRONTEND_URL || "http://localhost:3000").replace(/\/$/, "");
+  (process.env.FRONTEND_URL || "https://breefit.in").trim().replace(/\/+$/, "");
 
 const sendEmail = async ({ to, subject, html }) => {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS || !to) {
@@ -57,7 +57,7 @@ const formatOrderItems = (items = []) => {
   `;
 };
 
-const getOrderTrackingLink = (orderId) =>
+export const buildOrderTrackingUrl = (orderId) =>
   `${getFrontendUrl()}/order/${orderId}/tracking`;
 
 /**
@@ -97,6 +97,7 @@ export const sendOrderConfirmationEmail = async ({
   // FIX: Use shippingAddress directly — do NOT fall back to "Address Not Found"
   // If it's empty we simply omit the address block rather than showing a bad message
   const addressBlock = formatAddressBlock(shippingAddress || "");
+  const trackingLink = buildOrderTrackingUrl(orderId);
 
   await sendEmail({
     to,
@@ -108,7 +109,7 @@ export const sendOrderConfirmationEmail = async ({
         ${formatOrderItems(items)}
         <p style="font-weight:700;margin-top:16px;">Total: ₹${Number(amount || 0).toLocaleString()}</p>
         ${addressBlock}
-        <p style="margin-top:24px;">Track your order anytime: <a href="${getOrderTrackingLink(orderId)}">${getOrderTrackingLink(orderId)}</a></p>
+        <p style="margin-top:24px;">Track your order anytime: <a href="${trackingLink}">${trackingLink}</a></p>
         <p style="color:#6b7280;font-size:13px;margin-top:28px;">Thanks for choosing BREE Wellness.</p>
       </div>
     `,
@@ -123,6 +124,7 @@ export const sendOrderStatusUpdateEmail = async ({
   notes,
 }) => {
   const label = getOrderStatusLabel(status);
+  const trackingLink = buildOrderTrackingUrl(orderId);
   await sendEmail({
     to,
     subject: `Order Status Updated — ${label} (#${String(orderId).slice(-8).toUpperCase()})`,
@@ -131,7 +133,7 @@ export const sendOrderStatusUpdateEmail = async ({
         <h2 style="color:#047857;">Hi ${name || "there"},</h2>
         <p>Your order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> is now <strong>${label}</strong>.</p>
         ${notes ? `<p><strong>Note:</strong> ${notes}</p>` : ""}
-        <p>Track the latest update here: <a href="${getOrderTrackingLink(orderId)}">${getOrderTrackingLink(orderId)}</a></p>
+        <p>Track the latest update here: <a href="${trackingLink}">${trackingLink}</a></p>
         <p style="color:#6b7280;font-size:13px;margin-top:28px;">Thanks for shopping with BREE Wellness.</p>
       </div>
     `,
@@ -179,7 +181,7 @@ export const sendShipmentCreatedEmail = async ({
   courier = "Delhivery",
 }) => {
   const orderReference = String(orderId).slice(-8).toUpperCase();
-  const trackingLink = trackingUrl || getOrderTrackingLink(orderId);
+  const trackingLink = buildOrderTrackingUrl(orderId);
   const frontendUrl = getFrontendUrl();
 
   await sendEmail({
@@ -210,7 +212,7 @@ export const sendOutForDeliveryEmail = async ({
   expectedDeliveryDate,
 }) => {
   const orderReference = String(orderId).slice(-8).toUpperCase();
-  const trackingLink = trackingUrl || getOrderTrackingLink(orderId);
+  const trackingLink = buildOrderTrackingUrl(orderId);
   const frontendUrl = getFrontendUrl();
 
   await sendEmail({
