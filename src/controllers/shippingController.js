@@ -178,19 +178,36 @@ export const buildPickupRequestPayload = (
   };
 };
 
-export const extractPickupRequestId = (pickupResponse) =>
-  pickupResponse?.pickup_id ||
-  pickupResponse?.request_id ||
-  pickupResponse?.pickup_request_id ||
-  pickupResponse?.pickup_request_ids?.[0] ||
-  pickupResponse?.data?.pickup_id ||
-  pickupResponse?.data?.request_id ||
-  pickupResponse?.data?.pickup_request_id ||
-  pickupResponse?.data?.pickup_request_ids?.[0] ||
-  null;
+const getPickupResponseNodes = (pickupResponse) => {
+  const nodes = [];
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== "object" || depth > 3) return;
+    nodes.push(value);
+    for (const key of ["data", "delhiveryError", "error"]) {
+      visit(value[key], depth + 1);
+    }
+  };
+  visit(pickupResponse);
+  return nodes;
+};
+
+export const extractPickupRequestId = (pickupResponse) => {
+  for (const response of getPickupResponseNodes(pickupResponse)) {
+    const pickupRequestId =
+      response.pickup_id ||
+      response.request_id ||
+      response.pickup_request_id ||
+      response.pickup_request_ids?.[0];
+    if (isValidPickupRequestId(pickupRequestId)) return pickupRequestId;
+  }
+  return null;
+};
 
 export const isValidPickupRequestId = (pickupRequestId) =>
   Boolean(String(pickupRequestId || "").trim());
+
+export const shouldRequestPickup = (order) =>
+  !isValidPickupRequestId(order?.pickup_request_id);
 
 export const hasPickupShipmentReference = (order) =>
   Boolean(
@@ -198,19 +215,85 @@ export const hasPickupShipmentReference = (order) =>
     String(order?.shipment_id || "").trim(),
   );
 
+const getPickupResponseMessage = (pickupResponse) => {
+  const messages = [];
+  for (const response of getPickupResponseNodes(pickupResponse)) {
+    if (typeof response.message === "string" && response.message.trim()) {
+      messages.push(response.message.trim());
+    }
+    if (typeof response.rmk === "string" && response.rmk.trim()) {
+      messages.push(response.rmk.trim());
+    }
+  }
+  return (
+    messages.find(
+      (message) => message.toLowerCase() !== "delhivery api returned an error",
+    ) ||
+    messages[0] ||
+    "Delhivery API returned an error"
+  );
+};
+
+export const isExistingPickupResponse = (pickupResponse) => {
+  const message = getPickupResponseMessage(pickupResponse);
+  return getPickupResponseNodes(pickupResponse).some(
+    (response) =>
+      response.pr_exist === true ||
+      String(response.code || response.error?.code || "") === "669" ||
+      /pickup request .*already exist/i.test(message),
+  );
+};
+
+export const formatExistingPickupMessage = (
+  pickupResponse,
+  pickupRequestId,
+) => {
+  const message = getPickupResponseMessage(pickupResponse);
+  const scheduledWindow = message.match(
+    /already exist(?:s)? for (.+?) in slot (.+)$/i,
+  );
+
+  if (scheduledWindow) {
+    return `Pickup is already scheduled for this location on ${scheduledWindow[1]}, ${scheduledWindow[2]}. Pickup Request ID: ${pickupRequestId}.`;
+  }
+
+  return `Pickup is already scheduled for this location. Pickup Request ID: ${pickupRequestId}.`;
+};
+
+export const formatStoredPickupMessage = (pickupRequestId) =>
+  `Pickup is already scheduled. Pickup Request ID: ${pickupRequestId}.`;
+
+export const classifyDelhiveryPickupError = (pickupResponse) => {
+  const message = getPickupResponseMessage(pickupResponse);
+  const normalizedMessage = message.toLowerCase();
+  let category = "other";
+
+  if (/wallet|insufficient balance|low balance/.test(normalizedMessage)) {
+    category = "insufficient_wallet_balance";
+  } else if (
+    /expired|already passed|past pickup|invalid pickup time/.test(
+      normalizedMessage,
+    )
+  ) {
+    category = "invalid_or_expired_pickup_time";
+  } else if (
+    /auth|unauthori[sz]ed|token|session|login|credential/.test(
+      normalizedMessage,
+    )
+  ) {
+    category = "authentication_or_session";
+  }
+
+  return { category, message };
+};
+
 const getDelhiveryErrorMessage = (error) => {
   const responseBody = error?.data;
   if (typeof responseBody === "string" && responseBody.trim()) {
     return responseBody.trim();
   }
 
-  return (
-    responseBody?.message ||
-    responseBody?.rmk ||
-    responseBody?.error ||
-    error?.message ||
-    "Delhivery API returned an error"
-  );
+  return getPickupResponseMessage(responseBody || error);
 };
 
 export const formatDelhiveryPickupError = (error) => ({
@@ -1331,15 +1414,25 @@ export const schedulePickup = async (req, res) => {
     }
 
     // ── 3. Validate pickup_request_id is empty ───────────────────────────────
-    if (isValidPickupRequestId(order.pickup_request_id)) {
+    if (!shouldRequestPickup(order)) {
       await client.query("ROLLBACK");
       console.warn(
         `[SCHEDULE_PICKUP] Pickup already scheduled for order ${orderId}: ${order.pickup_request_id}`,
       );
-      return res.status(400).json({
-        success: false,
-        message: "Pickup has already been scheduled for this order",
+      return res.status(200).json({
+        success: true,
+        alreadyScheduled: true,
+        message: formatStoredPickupMessage(order.pickup_request_id),
+        order: {
+          id: order.id,
+          orderNumber: order.order_number,
+          pickupRequestId: order.pickup_request_id,
+          trackingStatus: order.tracking_status || "Pickup Scheduled",
+        },
         pickupRequestId: order.pickup_request_id,
+        delhivery: {
+          pickupRequestId: order.pickup_request_id,
+        },
       });
     }
 
@@ -1391,37 +1484,62 @@ export const schedulePickup = async (req, res) => {
 
     // ── 7. Call Delhivery API to request pickup ──────────────────────────────
     let pickupResponse;
+    let pickupAlreadyExists = false;
     try {
       pickupResponse = await delhiveryService.requestPickup(pickupPayload);
     } catch (error) {
-      await client.query("ROLLBACK");
-      const formattedError = formatDelhiveryPickupError(error);
-      console.error("[SCHEDULE_PICKUP] Delhivery API error", {
-        orderId,
-        awb: order.awb_number,
-        shipmentId: order.shipment_id,
-        status: formattedError.status,
-        responseBody: formattedError.delhiveryError,
-      });
-      return res.status(formattedError.status).json({
-        success: false,
-        message: `Delhivery rejected the pickup request: ${formattedError.message}`,
-        error: formattedError.message,
-        delhiveryError: formattedError.delhiveryError,
-      });
+      if (isExistingPickupResponse(error)) {
+        pickupAlreadyExists = true;
+        pickupResponse = error;
+        console.warn(
+          `[SCHEDULE_PICKUP] Delhivery rejected a duplicate pickup request for order ${orderId}; recovering existing pickup`,
+          error,
+        );
+      } else {
+        await client.query("ROLLBACK");
+        const formattedError = formatDelhiveryPickupError(error);
+        const classifiedError = classifyDelhiveryPickupError(error);
+        console.error("[SCHEDULE_PICKUP] Delhivery API error", {
+          orderId,
+          awb: order.awb_number,
+          shipmentId: order.shipment_id,
+          status: formattedError.status,
+          category: classifiedError.category,
+          responseBody: formattedError.delhiveryError,
+        });
+        return res.status(formattedError.status).json({
+          success: false,
+          message: `Delhivery rejected the pickup request: ${classifiedError.message}`,
+          error: classifiedError.message,
+          errorCategory: classifiedError.category,
+          delhiveryError: formattedError.delhiveryError,
+        });
+      }
     }
 
     if (!pickupResponse || pickupResponse.success === false) {
-      await client.query("ROLLBACK");
+      pickupAlreadyExists = isExistingPickupResponse(pickupResponse);
+
+      if (!pickupAlreadyExists) {
+        await client.query("ROLLBACK");
+        const classifiedError = classifyDelhiveryPickupError(pickupResponse);
+        console.warn("[SCHEDULE_PICKUP] Delhivery returned error", {
+          orderId,
+          category: classifiedError.category,
+          response: pickupResponse,
+        });
+        return res.status(400).json({
+          success: false,
+          message: classifiedError.message,
+          errorCategory: classifiedError.category,
+          delhiveryError: pickupResponse,
+        });
+      }
+
       console.warn(
-        "[SCHEDULE_PICKUP] Delhivery returned error",
+        `[SCHEDULE_PICKUP] Delhivery reports an existing pickup for order ${orderId}`,
         pickupResponse,
       );
-      return res.status(400).json({
-        success: false,
-        message: pickupResponse?.message || "Delhivery API returned an error",
-        delhiveryError: pickupResponse,
-      });
     }
 
     // ── 8. Extract pickup_request_id from response ───────────────────────────
@@ -1438,7 +1556,9 @@ export const schedulePickup = async (req, res) => {
       );
       return res.status(400).json({
         success: false,
-        message: "Delhivery response did not include a pickup request ID",
+        message: pickupAlreadyExists
+          ? "Delhivery reported an existing pickup but did not provide its pickup request ID"
+          : "Delhivery response did not include a pickup request ID",
         delhiveryResponse: pickupResponse,
       });
     }
@@ -1473,7 +1593,7 @@ export const schedulePickup = async (req, res) => {
       previousStatus: order.order_status,
       newStatus: order.order_status,
       changedBy: null,
-      notes: `Pickup scheduled with Delhivery. Pickup Request ID: ${pickupRequestId}`,
+      notes: `${pickupAlreadyExists ? "Existing pickup recovered" : "Pickup scheduled"} with Delhivery. Pickup Request ID: ${pickupRequestId}`,
     });
 
     await client.query("COMMIT");
@@ -1485,7 +1605,9 @@ export const schedulePickup = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: "Pickup scheduled successfully",
+      message: pickupAlreadyExists
+        ? formatExistingPickupMessage(pickupResponse, pickupRequestId)
+        : "Pickup scheduled successfully",
       order: {
         id: order.id,
         orderNumber: order.order_number,

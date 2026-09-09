@@ -6,9 +6,14 @@ process.env.DELHIVERY_API_TOKEN ||= "test-token";
 
 const {
   buildPickupRequestPayload,
+  classifyDelhiveryPickupError,
   extractPickupRequestId,
+  formatExistingPickupMessage,
   formatDelhiveryPickupError,
+  formatStoredPickupMessage,
   hasPickupShipmentReference,
+  isExistingPickupResponse,
+  shouldRequestPickup,
   isValidPickupRequestId,
 } = await import("../src/controllers/shippingController.js");
 
@@ -50,6 +55,69 @@ test("extracts a successful pickup request ID", () => {
   );
 });
 
+const existingPickupResponse = {
+  success: false,
+  message: "Delhivery API returned an error",
+  delhiveryError: {
+    data: {
+      message:
+        "A Pickup Request 319322489 for this Pickup Location Already Exist for 09 Sep in slot 14:00 - 18:00",
+    },
+    pr_exist: true,
+    pickup_id: 319322489,
+    error: {
+      code: 669,
+      message:
+        "A Pickup Request 319322489 for this Pickup Location Already Exist for 09 Sep in slot 14:00 - 18:00",
+    },
+    success: false,
+    status: true,
+  },
+};
+
+test("recognizes a provider-reported existing pickup and persists its ID", () => {
+  assert.equal(isExistingPickupResponse(existingPickupResponse), true);
+  assert.equal(extractPickupRequestId(existingPickupResponse), 319322489);
+  assert.equal(
+    formatExistingPickupMessage(existingPickupResponse, 319322489),
+    "Pickup is already scheduled for this location on 09 Sep, 14:00 - 18:00. Pickup Request ID: 319322489.",
+  );
+});
+
+test("recognizes Delhivery pickup error code 669 without pr_exist", () => {
+  assert.equal(
+    isExistingPickupResponse({
+      success: false,
+      data: { error: { code: 669, message: "Pickup already exists" } },
+    }),
+    true,
+  );
+});
+
+test("keeps wallet and expired-time errors as real failures", () => {
+  assert.equal(
+    classifyDelhiveryPickupError({
+      success: false,
+      data: { message: "Insufficient wallet balance" },
+    }).category,
+    "insufficient_wallet_balance",
+  );
+  assert.equal(
+    classifyDelhiveryPickupError({
+      success: false,
+      data: { message: "Pickup time has already passed" },
+    }).category,
+    "invalid_or_expired_pickup_time",
+  );
+  assert.equal(
+    isExistingPickupResponse({
+      success: false,
+      data: { message: "Insufficient wallet balance" },
+    }),
+    false,
+  );
+});
+
 test("rejects a Delhivery success response without a pickup request ID", () => {
   assert.equal(
     extractPickupRequestId({ success: true, message: "Accepted" }),
@@ -61,6 +129,18 @@ test("detects duplicate and missing pickup scheduling state", () => {
   assert.equal(isValidPickupRequestId("PICKUP-123"), true);
   assert.equal(isValidPickupRequestId("  "), false);
   assert.equal(isValidPickupRequestId(null), false);
+});
+
+test("returns a stable idempotent message for a database-stored pickup", () => {
+  assert.equal(
+    formatStoredPickupMessage("319322489"),
+    "Pickup is already scheduled. Pickup Request ID: 319322489.",
+  );
+});
+
+test("does not call the pickup provider when the order is already scheduled", () => {
+  assert.equal(shouldRequestPickup({ pickup_request_id: "319322489" }), false);
+  assert.equal(shouldRequestPickup({ pickup_request_id: null }), true);
 });
 
 test("requires both the existing AWB and shipment reference", () => {

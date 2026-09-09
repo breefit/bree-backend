@@ -49,48 +49,328 @@ const sendEmail = async ({ to, subject, html }) => {
   });
 };
 
-const formatOrderItems = (items = []) => {
-  if (!items.length) return "<p>No items found</p>";
-  const rows = items
-    .map(
-      (item) =>
-        `<tr><td style="padding:8px;border:1px solid #e5e7eb">${item.name}</td><td style="padding:8px;border:1px solid #e5e7eb;text-align:center">${item.quantity}</td><td style="padding:8px;border:1px solid #e5e7eb;text-align:right">₹${Number(item.price || item.unit_price || 0).toLocaleString()}</td></tr>`,
-    )
-    .join("");
+export const buildOrderTrackingUrl = (orderId) =>
+  `${getFrontendUrl()}/order/${orderId}/tracking`;
 
+const WEBSITE_URL = "https://www.breefit.in/";
+
+// ==================================================
+// BREE brand palette
+// ==================================================
+const COLORS = {
+  primary: "#004B52", // dark teal
+  text: "#222222", // dark text
+  muted: "#666666", // muted text
+  bg: "#F7F8F7", // light background
+  border: "#E5E5E5",
+  white: "#FFFFFF",
+};
+
+const formatOrderRef = (orderId) => String(orderId).slice(-8).toUpperCase();
+
+const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString()}`;
+
+// ==================================================
+// Reusable email building blocks
+// ==================================================
+
+const buildHeader = (frontendUrl) => {
+  const logoUrl = `${frontendUrl}/images/logo.PNG`;
   return `
-    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
-      <thead>
-        <tr style="background:#f3f4f6;color:#111827;text-align:left;">
-          <th style="padding:10px;border:1px solid #e5e7eb">Product</th>
-          <th style="padding:10px;border:1px solid #e5e7eb">Qty</th>
-          <th style="padding:10px;border:1px solid #e5e7eb;text-align:right">Price</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">
+      <tr>
+        <td style="padding:32px 24px 20px 24px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td align="center" style="width:100%;">
+                <img src="${logoUrl}" alt="BREE Wellness" width="160" style="display:block;width:160px;max-width:160px;height:auto;margin:0 auto;" />
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
     </table>
   `;
 };
 
-export const buildOrderTrackingUrl = (orderId) =>
-  `${getFrontendUrl()}/order/${orderId}/tracking`;
+const buildIntro = ({ name, heading, subtext }) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center" style="padding:8px 24px 24px 24px;">
+        <h1 style="margin:0 0 16px 0;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:26px;line-height:34px;font-weight:700;text-align:center;">
+          ${heading}
+        </h1>
+        <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:22px;text-align:center;">
+          ${subtext}
+        </p>
+      </td>
+    </tr>
+  </table>
+`;
 
-/**
- * Format a shipping address block for email display.
- * Returns an HTML string if address is available, or empty string.
- *
- * FIX: Uses order.shipping_address as primary source.
- * Falls back to passed address object only if shipping_address is empty.
- */
-const formatAddressBlock = (shippingAddress) => {
-  if (!shippingAddress || !shippingAddress.trim()) return "";
+const buildOrderInfoCard = ({ orderId, orderDate }) => {
+  const orderRef = formatOrderRef(orderId);
+  const dateCell = orderDate
+    ? `
+      <td style="padding:16px 20px;border-left:1px solid ${COLORS.border};">
+        <table role="presentation" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="padding-right:10px;vertical-align:top;font-family:Arial,Helvetica,sans-serif;font-size:16px;">📅</td>
+            <td>
+              <p style="margin:0 0 4px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">Order Placed On</p>
+              <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;">${orderDate}</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    `
+    : "";
+
   return `
-    <div style="margin-top:8px;padding:10px 14px;background:#f9fafb;border-radius:6px;color:#374151;font-size:14px;">
-      <strong>Shipping To:</strong><br/>
-      ${shippingAddress.replace(/,\s*/g, "<br/>")}
-    </div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;background:${COLORS.bg};border-radius:8px;">
+      <tr>
+        <td style="padding:0;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td align="center" style="padding:16px 20px;">
+                <p style="margin:0 0 4px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">Order ID</p>
+                <p style="margin:0;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:16px;font-weight:700;">#${orderRef}</p>
+              </td>
+              ${dateCell}
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
   `;
 };
+
+const buildOrderItemsTable = (items = []) => {
+  if (!items.length) return "";
+
+  const rows = items
+    .map((item) => {
+      const price = Number(item.price || item.unit_price || 0);
+      return `
+        <tr>
+          <td style="padding:12px 16px;border-top:1px solid ${COLORS.border};color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;">${item.name}</td>
+          <td align="center" style="padding:12px 16px;border-top:1px solid ${COLORS.border};color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;">${item.quantity}</td>
+          <td align="right" style="padding:12px 16px;border-top:1px solid ${COLORS.border};color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;">${formatCurrency(price)}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;">
+      <tr>
+        <td>
+          <p style="margin:0 0 12px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:17px;font-weight:700;">Order Items</p>
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${COLORS.border};border-radius:6px;overflow:hidden;border-collapse:separate;">
+            <tr style="background:${COLORS.bg};">
+              <td style="padding:12px 16px;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">Product</td>
+              <td align="center" style="padding:12px 16px;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">Qty</td>
+              <td align="right" style="padding:12px 16px;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">Price</td>
+            </tr>
+            ${rows}
+          </table>
+        </td>
+      </tr>
+    </table>
+  `;
+};
+
+const buildOrderTotalRow = (amount) => {
+  if (amount === undefined || amount === null) return "";
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:-16px 0 24px 0;">
+      <tr>
+        <td style="padding:12px 16px;background:${COLORS.bg};border:1px solid ${COLORS.border};border-top:none;border-radius:0 0 6px 6px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td style="color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;">Total</td>
+              <td align="right" style="color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;">${formatCurrency(amount)}</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  `;
+};
+
+const buildShippingAddressCard = (shippingAddress) => {
+  if (!shippingAddress || !shippingAddress.trim()) return "";
+
+  const lines = shippingAddress
+    .split(",")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("<br/>");
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 28px 0;background:${COLORS.bg};border-radius:8px;">
+      <tr>
+        <td style="padding:18px 20px;">
+          <table role="presentation" cellpadding="0" cellspacing="0">
+            <tr>
+              <td style="padding-right:10px;vertical-align:top;font-family:Arial,Helvetica,sans-serif;font-size:16px;">📍</td>
+              <td>
+                <p style="margin:0 0 6px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;">Shipping To:</p>
+                <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:22px;">${lines}</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  `;
+};
+
+const buildInfoCard = (rows = []) => {
+  const filteredRows = rows.filter((row) => row && row.value);
+  if (!filteredRows.length) return "";
+
+  const rowsHtml = filteredRows
+    .map(
+      (row) => `
+        <tr>
+          <td style="padding:10px 20px;${row === filteredRows[0] ? "" : `border-top:1px solid ${COLORS.border};`}">
+            <p style="margin:0 0 4px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">${row.label}</p>
+            <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;">${row.value}</p>
+          </td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;background:${COLORS.bg};border-radius:8px;">
+      ${rowsHtml}
+    </table>
+  `;
+};
+
+const buildPrimaryButton = (url, label) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 12px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:500px;">
+          <tr>
+            <td align="center" bgcolor="${COLORS.primary}" style="border-radius:6px;">
+              <a href="${url}" target="_blank" style="display:block;padding:16px 24px;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;text-decoration:none;text-align:center;letter-spacing:0.3px;">
+                ${label} &nbsp;&rarr;
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildSecondaryButton = (url, label) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:500px;">
+          <tr>
+            <td align="center" bgcolor="${COLORS.white}" style="border-radius:6px;border:2px solid ${COLORS.primary};">
+              <a href="${url}" target="_blank" style="display:block;padding:14px 24px;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;text-decoration:none;text-align:center;letter-spacing:0.3px;">
+                ${label} &nbsp;&#8599;
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildSupportingText = (text) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center" style="padding:0 24px 24px 24px;">
+        <p style="margin:0;color:${COLORS.muted};font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:20px;text-align:center;">
+          ${text}
+        </p>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildSignOff = (message) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td style="padding:0 24px;">
+        <hr style="border:none;border-top:1px solid ${COLORS.border};margin:0 0 24px 0;" />
+      </td>
+    </tr>
+    <tr>
+      <td align="center" style="padding:0 24px 32px 24px;">
+        <p style="margin:0 0 12px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;text-align:center;">${message}</p>
+        <p style="margin:0 0 6px 0;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:18px;text-align:center;">&#9825;</p>
+        <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;text-align:center;">Team BREE</p>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildFooter = () => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.primary};">
+    <tr>
+      <td align="center" style="padding:32px 24px;">
+        <p style="margin:0 0 4px 0;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:20px;font-weight:700;letter-spacing:2px;">BREE</p>
+        <p style="margin:0 0 16px 0;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:11px;letter-spacing:2px;">WELLNESS</p>
+        <p style="margin:0;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;opacity:0.85;">
+          © ${new Date().getFullYear()} BREE Wellness.<br/>All rights reserved.
+        </p>
+      </td>
+    </tr>
+  </table>
+`;
+
+/**
+ * Wraps arbitrary body content in the shared BREE branded shell:
+ * white container, logo header, body content, footer.
+ */
+const buildBrandedEmail = ({ frontendUrl, content, preheader }) => `
+  <!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>BREE Wellness</title>
+    </head>
+    <body style="margin:0;padding:0;background:${COLORS.bg};">
+      ${preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;">${preheader}</div>` : ""}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.bg};padding:24px 0;">
+        <tr>
+          <td align="center">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:${COLORS.white};border-radius:10px;overflow:hidden;">
+              <tr>
+                <td>
+                  ${buildHeader(frontendUrl)}
+                  ${content}
+                  ${buildFooter()}
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>
+`;
+
+const buildActionSection = ({ trackingLink }) => `
+  ${buildPrimaryButton(trackingLink, "TRACK YOUR ORDER")}
+  ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+  ${buildSupportingText("You can track your order anytime or visit our website for more information.")}
+`;
+
+// ==================================================
+// Email functions (business logic preserved)
+// ==================================================
 
 export const sendOrderConfirmationEmail = async ({
   to,
@@ -109,25 +389,38 @@ export const sendOrderConfirmationEmail = async ({
     !!shippingAddress,
   );
 
-  // FIX: Use shippingAddress directly — do NOT fall back to "Address Not Found"
-  // If it's empty we simply omit the address block rather than showing a bad message
-  const addressBlock = formatAddressBlock(shippingAddress || "");
+  const frontendUrl = getFrontendUrl();
   const trackingLink = buildOrderTrackingUrl(orderId);
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},<br/>your order is confirmed!`,
+      subtext:
+        "Thank you for shopping with BREE Wellness.<br/>We've received your order and will keep you updated on its progress.",
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildOrderItemsTable(items)}
+          ${buildOrderTotalRow(amount)}
+          ${buildShippingAddressCard(shippingAddress || "")}
+          ${buildActionSection({ trackingLink })}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thanks for choosing BREE Wellness.")}
+  `;
 
   await sendEmail({
     to,
-    subject: `Order Confirmed — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"}, your order is confirmed!</h2>
-        <p>Order ID: <strong>#${String(orderId).slice(-8).toUpperCase()}</strong></p>
-        ${formatOrderItems(items)}
-        <p style="font-weight:700;margin-top:16px;">Total: ₹${Number(amount || 0).toLocaleString()}</p>
-        ${addressBlock}
-        <p style="margin-top:24px;">Track your order anytime: <a href="${trackingLink}">${trackingLink}</a></p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">Thanks for choosing BREE Wellness.</p>
-      </div>
-    `,
+    subject: `Order Confirmed — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness order is confirmed.",
+    }),
   });
 };
 
@@ -139,50 +432,99 @@ export const sendOrderStatusUpdateEmail = async ({
   notes,
 }) => {
   const label = getOrderStatusLabel(status);
+  const frontendUrl = getFrontendUrl();
   const trackingLink = buildOrderTrackingUrl(orderId);
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your order <strong>#${formatOrderRef(orderId)}</strong> is now <strong>${label}</strong>.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Note", value: notes }])}
+          ${buildActionSection({ trackingLink })}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thanks for shopping with BREE Wellness.")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Order Status Updated — ${label} (#${String(orderId).slice(-8).toUpperCase()})`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>Your order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> is now <strong>${label}</strong>.</p>
-        ${notes ? `<p><strong>Note:</strong> ${notes}</p>` : ""}
-        <p>Track the latest update here: <a href="${trackingLink}">${trackingLink}</a></p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">Thanks for shopping with BREE Wellness.</p>
-      </div>
-    `,
+    subject: `Order Status Updated — ${label} (#${formatOrderRef(orderId)})`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: `Your order status is now ${label}.`,
+    }),
   });
 };
 
 export const sendOrderDeliveredEmail = async ({ to, name, orderId }) => {
+  const frontendUrl = getFrontendUrl();
+  const trackingLink = buildOrderTrackingUrl(orderId);
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Great news — your order <strong>#${formatOrderRef(orderId)}</strong> has been delivered.<br/>We hope you love it. If you have any questions, feel free to reach out.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildActionSection({ trackingLink })}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thank you for choosing BREE Wellness.")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Order Delivered — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>Great news — your order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> has been delivered.</p>
-        <p>We hope you love it. If you have any questions, feel free to reach out.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">Thank you for choosing BREE Wellness.</p>
-      </div>
-    `,
+    subject: `Order Delivered — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness order has been delivered.",
+    }),
   });
 };
 
 export const sendOrderCancelledEmail = async ({ to, name, orderId, notes }) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your order <strong>#${formatOrderRef(orderId)}</strong> has been cancelled.<br/>If you would like help placing a replacement order, we are here to support you.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Reason", value: notes }])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Sincerely, BREE Wellness.")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Order Cancelled — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#b91c1c;">Hi ${name || "there"},</h2>
-        <p>Your order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> has been cancelled.</p>
-        ${notes ? `<p><strong>Reason:</strong> ${notes}</p>` : ""}
-        <p>If you would like help placing a replacement order, we are here to support you.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">Sincerely, BREE Wellness.</p>
-      </div>
-    `,
+    subject: `Order Cancelled — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness order has been cancelled.",
+    }),
   });
 };
 
@@ -195,25 +537,39 @@ export const sendShipmentCreatedEmail = async ({
   expectedDeliveryDate,
   courier = "Delhivery",
 }) => {
-  const orderReference = String(orderId).slice(-8).toUpperCase();
-  const trackingLink = buildOrderTrackingUrl(orderId);
   const frontendUrl = getFrontendUrl();
+  const trackingLink = buildOrderTrackingUrl(orderId);
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your shipment for order <strong>#${formatOrderRef(orderId)}</strong> has been created.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([
+            { label: "Courier", value: courier },
+            { label: "AWB Number", value: awbNumber || "Pending" },
+            { label: "Expected Delivery", value: expectedDeliveryDate },
+          ])}
+          ${buildActionSection({ trackingLink })}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thanks for choosing BREE Wellness.")}
+  `;
 
   await sendEmail({
     to,
-    subject: `Shipment Created — BREE #${orderReference}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>Your shipment for order <strong>#${orderReference}</strong> has been created.</p>
-        <p><strong>Courier:</strong> ${courier}</p>
-        <p><strong>AWB Number:</strong> ${awbNumber || "Pending"}</p>
-        <p><strong>Tracking URL:</strong> <a href="${trackingLink}">${trackingLink}</a></p>
-        ${expectedDeliveryDate ? `<p><strong>Expected delivery:</strong> ${expectedDeliveryDate}</p>` : ""}
-        <p style="margin-top:20px;"><a href="${trackingLink}" style="background:#047857;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:6px;display:inline-block;">Track Shipment</a></p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">You can also visit <a href="${frontendUrl}">${frontendUrl}</a> for updates.</p>
-      </div>
-    `,
+    subject: `Shipment Created — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness shipment has been created.",
+    }),
   });
 };
 
@@ -226,42 +582,70 @@ export const sendOutForDeliveryEmail = async ({
   currentLocation,
   expectedDeliveryDate,
 }) => {
-  const orderReference = String(orderId).slice(-8).toUpperCase();
-  const trackingLink = buildOrderTrackingUrl(orderId);
   const frontendUrl = getFrontendUrl();
+  const trackingLink = buildOrderTrackingUrl(orderId);
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your order <strong>#${formatOrderRef(orderId)}</strong> is out for delivery.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([
+            { label: "AWB Number", value: awbNumber || "Pending" },
+            { label: "Current Location", value: currentLocation },
+            { label: "Expected Delivery", value: expectedDeliveryDate },
+          ])}
+          ${buildActionSection({ trackingLink })}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thanks for choosing BREE Wellness.")}
+  `;
 
   await sendEmail({
     to,
-    subject: `Out for Delivery — BREE #${orderReference}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>Your order <strong>#${orderReference}</strong> is out for delivery.</p>
-        <p><strong>AWB Number:</strong> ${awbNumber || "Pending"}</p>
-        ${currentLocation ? `<p><strong>Current location:</strong> ${currentLocation}</p>` : ""}
-        ${expectedDeliveryDate ? `<p><strong>Expected delivery:</strong> ${expectedDeliveryDate}</p>` : ""}
-        <p style="margin-top:20px;"><a href="${trackingLink}" style="background:#047857;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:6px;display:inline-block;">Track Shipment</a></p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">Visit <a href="${frontendUrl}">${frontendUrl}</a> for the latest order updates.</p>
-      </div>
-    `,
+    subject: `Out for Delivery — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness order is out for delivery.",
+    }),
   });
 };
 
 export const sendShipmentDeliveredEmail = async ({ to, name, orderId }) => {
-  const orderReference = String(orderId).slice(-8).toUpperCase();
   const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Delivery confirmation for order <strong>#${formatOrderRef(orderId)}</strong> is complete.<br/>Thank you for choosing BREE Wellness. We hope you enjoy your order.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thank you for choosing BREE Wellness.")}
+  `;
 
   await sendEmail({
     to,
-    subject: `Delivered — BREE #${orderReference}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>Delivery confirmation for order <strong>#${orderReference}</strong> is complete.</p>
-        <p>Thank you for choosing BREE Wellness. We hope you enjoy your order.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">If you have any questions, visit <a href="${frontendUrl}">${frontendUrl}</a>.</p>
-      </div>
-    `,
+    subject: `Delivered — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness order has been delivered.",
+    }),
   });
 };
 
@@ -271,20 +655,34 @@ export const sendShipmentCancelledEmail = async ({
   orderId,
   cancellationReason,
 }) => {
-  const orderReference = String(orderId).slice(-8).toUpperCase();
   const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your shipment for order <strong>#${formatOrderRef(orderId)}</strong> has been cancelled.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Reason", value: cancellationReason }])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("For support, reach out anytime.")}
+  `;
 
   await sendEmail({
     to,
-    subject: `Shipment Cancelled — BREE #${orderReference}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#b91c1c;">Hi ${name || "there"},</h2>
-        <p>Your shipment for order <strong>#${orderReference}</strong> has been cancelled.</p>
-        ${cancellationReason ? `<p><strong>Reason:</strong> ${cancellationReason}</p>` : ""}
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">For support, please visit <a href="${frontendUrl}">${frontendUrl}</a>.</p>
-      </div>
-    `,
+    subject: `Shipment Cancelled — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness shipment has been cancelled.",
+    }),
   });
 };
 
@@ -295,19 +693,37 @@ export const sendSubscriptionChargeReceiptEmail = async ({
   amount,
   subscriptionId,
 }) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `We received your subscription payment successfully for order <strong>#${formatOrderRef(orderId)}</strong>.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([
+            { label: "Subscription ID", value: subscriptionId },
+            { label: "Amount Charged", value: formatCurrency(amount) },
+          ])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thank you for continuing your wellness journey with BREE.")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Subscription Renewal Received — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>We received your subscription payment successfully for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong>.</p>
-        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
-        <p><strong>Amount charged:</strong> ₹${Number(amount || 0).toLocaleString()}</p>
-        <p>Thank you for continuing your wellness journey with BREE.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
-      </div>
-    `,
+    subject: `Subscription Renewal Received — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription payment was received.",
+    }),
   });
 };
 
@@ -318,19 +734,37 @@ export const sendSubscriptionFailedEmail = async ({
   subscriptionId,
   notes,
 }) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription payment for order <strong>#${formatOrderRef(orderId)}</strong> could not be processed.<br/>Please update your payment details or contact support to avoid interruption.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([
+            { label: "Subscription ID", value: subscriptionId },
+            { label: "Details", value: notes },
+          ])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("— The BREE Team")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Subscription Payment Failed — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#d97706;">Hi ${name || "there"},</h2>
-        <p>Your subscription payment for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> could not be processed.</p>
-        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
-        ${notes ? `<p><strong>Details:</strong> ${notes}</p>` : ""}
-        <p>Please update your payment details or contact support to avoid interruption.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
-      </div>
-    `,
+    subject: `Subscription Payment Failed — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "We couldn't process your BREE Wellness subscription payment.",
+    }),
   });
 };
 
@@ -340,18 +774,34 @@ export const sendSubscriptionCancellationEmail = async ({
   orderId,
   subscriptionId,
 }) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription for order <strong>#${formatOrderRef(orderId)}</strong> has been cancelled.<br/>If you wish to restart your plan, you can subscribe again anytime from your account.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Subscription ID", value: subscriptionId }])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("— The BREE Team")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Subscription Cancelled — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#b91c1c;">Hi ${name || "there"},</h2>
-        <p>Your subscription for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> has been cancelled.</p>
-        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
-        <p>If you wish to restart your plan, you can subscribe again anytime from your account.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
-      </div>
-    `,
+    subject: `Subscription Cancelled — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription has been cancelled.",
+    }),
   });
 };
 
@@ -361,17 +811,33 @@ export const sendSubscriptionResumeEmail = async ({
   orderId,
   subscriptionId,
 }) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription for order <strong>#${formatOrderRef(orderId)}</strong> has been resumed.<br/>We will continue delivering your monthly wellness plan as scheduled.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Subscription ID", value: subscriptionId }])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("— The BREE Team")}
+  `;
+
   await sendEmail({
     to,
-    subject: `Subscription Resumed — BREE #${String(orderId).slice(-8).toUpperCase()}`,
-    html: `
-      <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-        <h2 style="color:#047857;">Hi ${name || "there"},</h2>
-        <p>Your subscription for order <strong>#${String(orderId).slice(-8).toUpperCase()}</strong> has been resumed.</p>
-        <p><strong>Subscription ID:</strong> ${subscriptionId}</p>
-        <p>We will continue delivering your monthly wellness plan as scheduled.</p>
-        <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Team</p>
-      </div>
-    `,
+    subject: `Subscription Resumed — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription has been resumed.",
+    }),
   });
 };
