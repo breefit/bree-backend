@@ -3,10 +3,14 @@ import delhiveryService, { isPdfBuffer } from "../services/delhiveryService.js";
 import {
   sendShipmentCreatedEmail,
   sendShipmentCancelledEmail,
+  sendOutForDeliveryEmail,
+  sendShipmentDeliveredEmail,
+  sendOrderStatusUpdateEmail,
 } from "../services/orderEmailService.js";
 import { buildDelhiveryShipmentPayload } from "../utils/delhiveryPayload.js";
 import { appendStatusHistory } from "../models/Order.js";
 import { ORDER_STATUSES } from "../constants/orderStatus.js";
+import { sendOrderStatusUpdateWhatsApp } from "../services/whatsappNotificationService.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Get warehouse configuration from environment variables
@@ -1670,10 +1674,13 @@ export const trackShipment = async (req, res) => {
     // ── 1. Fetch the order by AWB ────────────────────────────────────────────
     const { rows: orderRows } = await client.query(
       `SELECT id, order_number, order_status, awb_number, tracking_status,
-              tracking_url, courier_name, shipment_id
+              tracking_url, courier_name, shipment_id,
+              contact_name, customer_name, email, contact_email,
+              mobile_number, contact_phone
        FROM orders
        WHERE awb_number = ?
-       LIMIT 1`,
+       LIMIT 1
+       FOR UPDATE`,
       [awb],
     );
 
@@ -1798,6 +1805,75 @@ export const trackShipment = async (req, res) => {
     }
 
     await client.query("COMMIT");
+
+    if (shouldTransitionOrderStatus) {
+      const recipientEmail = order.contact_email || order.email;
+      const recipientName =
+        order.contact_name || order.customer_name || "Customer";
+      const recipientPhone = order.contact_phone || order.mobile_number;
+
+      if (recipientEmail) {
+        try {
+          if (normalizeTrackingStatus(trackingStatus) === "out for delivery") {
+            await sendOutForDeliveryEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: order.id,
+              orderNumber: order.order_number,
+              awbNumber: order.awb_number,
+              trackingUrl: order.tracking_url,
+              currentLocation,
+              expectedDeliveryDate: expectedDelivery,
+            });
+          } else if (normalizeTrackingStatus(trackingStatus) === "delivered") {
+            await sendShipmentDeliveredEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: order.id,
+              orderNumber: order.order_number,
+            });
+          } else if (mappedOrderStatus === "shipped") {
+            await sendOrderStatusUpdateEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: order.id,
+              orderNumber: order.order_number,
+              status: mappedOrderStatus,
+            });
+          }
+        } catch (emailError) {
+          console.error(
+            `[TRACK_SHIPMENT] Failed to send ${mappedOrderStatus} email for order ${order.id}`,
+            emailError,
+          );
+        }
+      } else {
+        console.error(
+          `[TRACK_SHIPMENT] Cannot send ${mappedOrderStatus} email for order ${order.id}: no customer email`,
+        );
+      }
+
+      if (recipientPhone) {
+        try {
+          await sendOrderStatusUpdateWhatsApp({
+            customerName: recipientName,
+            mobile: recipientPhone,
+            orderNumber: order.order_number,
+            orderUuid: order.id,
+            status: mappedOrderStatus,
+          });
+        } catch (whatsappError) {
+          console.error(
+            `[TRACK_SHIPMENT] Failed to send ${mappedOrderStatus} WhatsApp for order ${order.id}`,
+            whatsappError,
+          );
+        }
+      } else {
+        console.error(
+          `[TRACK_SHIPMENT] Cannot send ${mappedOrderStatus} WhatsApp for order ${order.id}: no customer phone`,
+        );
+      }
+    }
 
     // ── 6. Logging — AWB, tracking status, location, execution time, and
     //      whether anything changed. No customer PII is ever logged here. ──

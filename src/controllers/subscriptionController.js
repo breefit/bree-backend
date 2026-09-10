@@ -8,6 +8,7 @@ import {
   sendSubscriptionChargeReceiptEmail,
   sendSubscriptionFailedEmail,
   sendSubscriptionCancellationEmail,
+  sendSubscriptionPauseEmail,
   sendSubscriptionResumeEmail,
 } from "../services/orderEmailService.js";
 import {
@@ -16,6 +17,7 @@ import {
   validateMobile,
 } from "../services/whatsappNotificationService.js";
 import { createDailyReminder } from "../services/dailyReminderService.js";
+import { sendSubscriptionEmailOnce } from "../services/subscriptionEmailNotificationService.js";
 
 // ── Shared logger ────────────────────────────────────────────────────────────
 // NOTE: No shared logging utility was found/confirmed in this codebase during
@@ -858,6 +860,7 @@ const updateSubscriptionOrder = async ({
   paymentStatus,
   nextBillingDate,
   notes,
+  expectedSubscriptionStatuses,
 }) => {
   const updates = [];
   const params = [];
@@ -882,10 +885,20 @@ const updateSubscriptionOrder = async ({
   if (!updates.length) return;
 
   params.push(orderId);
-  await query(
-    `UPDATE orders SET ${updates.join(", ")}, updated_at = NOW() WHERE id = ?`,
+  let whereClause = "id = ?";
+  if (expectedSubscriptionStatuses?.length) {
+    whereClause += ` AND subscription_status IN (${expectedSubscriptionStatuses
+      .map(() => "?")
+      .join(", ")})`;
+    params.push(...expectedSubscriptionStatuses);
+  }
+
+  const result = await query(
+    `UPDATE orders SET ${updates.join(", ")}, updated_at = NOW() WHERE ${whereClause}`,
     params,
   );
+
+  if (!result.rowCount) return false;
 
   await query(
     `INSERT INTO order_status_history
@@ -899,12 +912,14 @@ const updateSubscriptionOrder = async ({
       notes ?? null,
     ],
   );
+  return true;
 };
 
 // ── cancelSubscription ──────────────────────────────────────────────────────
 export const cancelSubscription = async (req, res) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
+  let stateChanged = false;
 
   try {
     const { rows } = await query(
@@ -954,32 +969,37 @@ export const cancelSubscription = async (req, res) => {
       // CRITICAL: Only update subscription_status. order_status is a
       // fulfillment field and must NEVER be overwritten by a billing/cancel
       // event. The fulfillment team manages order_status independently.
-      await updateSubscriptionOrder({
+      stateChanged = await updateSubscriptionOrder({
         orderId: order.id,
         subscriptionStatus: SUBSCRIPTION_STATUS.CANCELLATION_REQUESTED,
         notes: "Subscription cancellation requested by user",
+        expectedSubscriptionStatuses: ACTIVE_SUBSCRIPTION_STATUSES.filter(
+          (status) => status !== SUBSCRIPTION_STATUS.CANCELLATION_REQUESTED,
+        ),
       });
 
-      // WhatsApp: Subscription Cancelled — only fired once the DB update
-      // above has succeeded.
-      sendWhatsAppSafe(
-        (payload) =>
-          sendSubscriptionStatusWhatsApp({
-            customerName: payload.name,
-            mobile: payload.to,
-            planName: payload.planName,
-            subscriptionUuid: payload.subscriptionId,
-            status: payload.status,
-          }),
-        {
-          to: order.contact_phone,
-          name: order.contact_name,
-          planName: order.product_name,
-          subscriptionId: order.razorpay_subscription_id,
-          status: "cancelled",
-        },
-        "Subscription Cancelled",
-      );
+      if (stateChanged) {
+        // WhatsApp: Subscription Cancelled — only fired once the DB update
+        // above has succeeded.
+        sendWhatsAppSafe(
+          (payload) =>
+            sendSubscriptionStatusWhatsApp({
+              customerName: payload.name,
+              mobile: payload.to,
+              planName: payload.planName,
+              subscriptionUuid: payload.subscriptionId,
+              status: payload.status,
+            }),
+          {
+            to: order.contact_phone,
+            name: order.contact_name,
+            planName: order.product_name,
+            subscriptionId: order.razorpay_subscription_id,
+            status: "cancelled",
+          },
+          "Subscription Cancelled",
+        );
+      }
     } catch (dbErr) {
       logger.error("[CANCEL] DB update failed after Razorpay cancel", {
         orderId: order.id,
@@ -988,12 +1008,18 @@ export const cancelSubscription = async (req, res) => {
       });
     }
 
-    sendSubscriptionCancellationEmail({
-      to: order.contact_email,
-      name: order.contact_name,
-      orderId: order.id,
-      subscriptionId: order.razorpay_subscription_id,
-    }).catch((err) => logger.error("[EMAIL] Cancellation email failed", err));
+    if (stateChanged) {
+      sendSubscriptionEmailOnce({
+        notificationKey: `subscription:${order.razorpay_subscription_id}:cancelled`,
+        send: () =>
+          sendSubscriptionCancellationEmail({
+            to: order.contact_email,
+            name: order.contact_name,
+            orderId: order.id,
+            subscriptionId: order.razorpay_subscription_id,
+          }),
+      }).catch((err) => logger.error("[EMAIL] Cancellation email failed", err));
+    }
 
     return res.json({ success: true, subscription_status: response.status });
   } catch (error) {
@@ -1012,6 +1038,7 @@ export const cancelSubscription = async (req, res) => {
 export const pauseSubscription = async (req, res) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
+  let stateChanged = false;
 
   try {
     const { rows } = await query(
@@ -1061,32 +1088,55 @@ export const pauseSubscription = async (req, res) => {
     try {
       // CRITICAL: Only update subscription_status. order_status is a
       // fulfillment field and must NEVER be overwritten by a billing event.
-      await updateSubscriptionOrder({
+      stateChanged = await updateSubscriptionOrder({
         orderId: order.id,
         subscriptionStatus: SUBSCRIPTION_STATUS.PAUSED,
         notes: "Subscription paused by user",
+        expectedSubscriptionStatuses: [
+          SUBSCRIPTION_STATUS.ACTIVE,
+          SUBSCRIPTION_STATUS.AUTHENTICATED,
+          SUBSCRIPTION_STATUS.PENDING,
+        ],
       });
 
-      // WhatsApp: Subscription Paused — only fired once the DB update
-      // above has succeeded.
-      sendWhatsAppSafe(
-        (payload) =>
-          sendSubscriptionStatusWhatsApp({
-            customerName: payload.name,
-            mobile: payload.to,
-            planName: payload.planName,
-            subscriptionUuid: payload.subscriptionId,
-            status: payload.status,
+      if (stateChanged) {
+        // WhatsApp: Subscription Paused — only fired once the DB update
+        // above has succeeded.
+        sendWhatsAppSafe(
+          (payload) =>
+            sendSubscriptionStatusWhatsApp({
+              customerName: payload.name,
+              mobile: payload.to,
+              planName: payload.planName,
+              subscriptionUuid: payload.subscriptionId,
+              status: payload.status,
+            }),
+          {
+            to: order.contact_phone,
+            name: order.contact_name,
+            planName: order.product_name,
+            subscriptionId: order.razorpay_subscription_id,
+            status: "paused",
+          },
+          "Subscription Paused",
+        );
+
+        sendSubscriptionEmailOnce({
+          notificationKey: `subscription:${order.razorpay_subscription_id}:paused`,
+          send: () =>
+            sendSubscriptionPauseEmail({
+              to: order.contact_email,
+              name: order.contact_name,
+              orderId: order.id,
+              subscriptionId: order.razorpay_subscription_id,
+            }),
+        }).catch((error) =>
+          logger.error("[EMAIL] Pause email failed", {
+            orderId: order.id,
+            message: error?.message || String(error),
           }),
-        {
-          to: order.contact_phone,
-          name: order.contact_name,
-          planName: order.product_name,
-          subscriptionId: order.razorpay_subscription_id,
-          status: "paused",
-        },
-        "Subscription Paused",
-      );
+        );
+      }
     } catch (dbErr) {
       logger.error("[PAUSE] DB update failed after Razorpay pause", {
         orderId: order.id,
@@ -1112,6 +1162,7 @@ export const pauseSubscription = async (req, res) => {
 export const resumeSubscription = async (req, res) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
+  let stateChanged = false;
 
   try {
     const { rows } = await query(
@@ -1165,33 +1216,36 @@ export const resumeSubscription = async (req, res) => {
       : undefined;
 
     try {
-      await updateSubscriptionOrder({
+      stateChanged = await updateSubscriptionOrder({
         orderId: order.id,
         subscriptionStatus: response.status || SUBSCRIPTION_STATUS.ACTIVE,
         nextBillingDate,
         notes: "Subscription resumed by user",
+        expectedSubscriptionStatuses: [SUBSCRIPTION_STATUS.PAUSED],
       });
 
-      // WhatsApp: Subscription Resumed — only fired once the DB update
-      // above has succeeded.
-      sendWhatsAppSafe(
-        (payload) =>
-          sendSubscriptionStatusWhatsApp({
-            customerName: payload.name,
-            mobile: payload.to,
-            planName: payload.planName,
-            subscriptionUuid: payload.subscriptionId,
-            status: payload.status,
-          }),
-        {
-          to: order.contact_phone,
-          name: order.contact_name,
-          planName: order.product_name,
-          subscriptionId: order.razorpay_subscription_id,
-          status: response.status || SUBSCRIPTION_STATUS.ACTIVE,
-        },
-        "Subscription Resumed",
-      );
+      if (stateChanged) {
+        // WhatsApp: Subscription Resumed — only fired once the DB update
+        // above has succeeded.
+        sendWhatsAppSafe(
+          (payload) =>
+            sendSubscriptionStatusWhatsApp({
+              customerName: payload.name,
+              mobile: payload.to,
+              planName: payload.planName,
+              subscriptionUuid: payload.subscriptionId,
+              status: payload.status,
+            }),
+          {
+            to: order.contact_phone,
+            name: order.contact_name,
+            planName: order.product_name,
+            subscriptionId: order.razorpay_subscription_id,
+            status: response.status || SUBSCRIPTION_STATUS.ACTIVE,
+          },
+          "Subscription Resumed",
+        );
+      }
     } catch (dbErr) {
       logger.error("[RESUME] DB update failed after Razorpay resume", {
         orderId: order.id,
@@ -1200,12 +1254,18 @@ export const resumeSubscription = async (req, res) => {
       });
     }
 
-    sendSubscriptionResumeEmail({
-      to: order.contact_email,
-      name: order.contact_name,
-      orderId: order.id,
-      subscriptionId: order.razorpay_subscription_id,
-    }).catch((err) => logger.error("[EMAIL] Resume email failed", err));
+    if (stateChanged) {
+      sendSubscriptionEmailOnce({
+        notificationKey: `subscription:${order.razorpay_subscription_id}:resumed`,
+        send: () =>
+          sendSubscriptionResumeEmail({
+            to: order.contact_email,
+            name: order.contact_name,
+            orderId: order.id,
+            subscriptionId: order.razorpay_subscription_id,
+          }),
+      }).catch((err) => logger.error("[EMAIL] Resume email failed", err));
+    }
 
     return res.json({ success: true, subscription_status: response.status });
   } catch (error) {

@@ -75,7 +75,7 @@ const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString()}`;
 // ==================================================
 
 const buildHeader = (frontendUrl) => {
-  const logoUrl = `${frontendUrl}/images/logo.PNG`;
+  const logoUrl = `https://www.breefit.in/images/logo.PNG`;
   return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">
       <tr>
@@ -428,23 +428,25 @@ export const sendOrderStatusUpdateEmail = async ({
   to,
   name,
   orderId,
+  orderNumber,
   status,
   notes,
 }) => {
   const label = getOrderStatusLabel(status);
   const frontendUrl = getFrontendUrl();
   const trackingLink = buildOrderTrackingUrl(orderId);
+  const orderReference = orderNumber || orderId;
 
   const content = `
     ${buildIntro({
       name,
       heading: `Hi ${name || "there"},`,
-      subtext: `Your order <strong>#${formatOrderRef(orderId)}</strong> is now <strong>${label}</strong>.`,
+      subtext: `Your order <strong>#${formatOrderRef(orderReference)}</strong> is now <strong>${label}</strong>.`,
     })}
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
       <tr>
         <td style="padding:0 24px;">
-          ${buildOrderInfoCard({ orderId })}
+          ${buildOrderInfoCard({ orderId: orderReference })}
           ${buildInfoCard([{ label: "Note", value: notes }])}
           ${buildActionSection({ trackingLink })}
         </td>
@@ -455,7 +457,7 @@ export const sendOrderStatusUpdateEmail = async ({
 
   await sendEmail({
     to,
-    subject: `Order Status Updated — ${label} (#${formatOrderRef(orderId)})`,
+    subject: `Order Status Updated — ${label} (#${formatOrderRef(orderReference)})`,
     html: buildBrandedEmail({
       frontendUrl,
       content,
@@ -464,20 +466,26 @@ export const sendOrderStatusUpdateEmail = async ({
   });
 };
 
-export const sendOrderDeliveredEmail = async ({ to, name, orderId }) => {
+export const sendOrderDeliveredEmail = async ({
+  to,
+  name,
+  orderId,
+  orderNumber,
+}) => {
   const frontendUrl = getFrontendUrl();
   const trackingLink = buildOrderTrackingUrl(orderId);
+  const orderReference = orderNumber || orderId;
 
   const content = `
     ${buildIntro({
       name,
       heading: `Hi ${name || "there"},`,
-      subtext: `Great news — your order <strong>#${formatOrderRef(orderId)}</strong> has been delivered.<br/>We hope you love it. If you have any questions, feel free to reach out.`,
+      subtext: `Great news — your order <strong>#${formatOrderRef(orderReference)}</strong> has been delivered.<br/>We hope you love it. If you have any questions, feel free to reach out.`,
     })}
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
       <tr>
         <td style="padding:0 24px;">
-          ${buildOrderInfoCard({ orderId })}
+          ${buildOrderInfoCard({ orderId: orderReference })}
           ${buildActionSection({ trackingLink })}
         </td>
       </tr>
@@ -487,7 +495,7 @@ export const sendOrderDeliveredEmail = async ({ to, name, orderId }) => {
 
   await sendEmail({
     to,
-    subject: `Order Delivered — BREE #${formatOrderRef(orderId)}`,
+    subject: `Order Delivered — BREE #${formatOrderRef(orderReference)}`,
     html: buildBrandedEmail({
       frontendUrl,
       content,
@@ -577,6 +585,7 @@ export const sendOutForDeliveryEmail = async ({
   to,
   name,
   orderId,
+  orderNumber,
   awbNumber,
   trackingUrl,
   currentLocation,
@@ -584,17 +593,18 @@ export const sendOutForDeliveryEmail = async ({
 }) => {
   const frontendUrl = getFrontendUrl();
   const trackingLink = buildOrderTrackingUrl(orderId);
+  const orderReference = orderNumber || orderId;
 
   const content = `
     ${buildIntro({
       name,
       heading: `Hi ${name || "there"},`,
-      subtext: `Your order <strong>#${formatOrderRef(orderId)}</strong> is out for delivery.`,
+      subtext: `Your order <strong>#${formatOrderRef(orderReference)}</strong> is out for delivery.`,
     })}
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
       <tr>
         <td style="padding:0 24px;">
-          ${buildOrderInfoCard({ orderId })}
+          ${buildOrderInfoCard({ orderId: orderReference })}
           ${buildInfoCard([
             { label: "AWB Number", value: awbNumber || "Pending" },
             { label: "Current Location", value: currentLocation },
@@ -609,7 +619,7 @@ export const sendOutForDeliveryEmail = async ({
 
   await sendEmail({
     to,
-    subject: `Out for Delivery — BREE #${formatOrderRef(orderId)}`,
+    subject: `Out for Delivery — BREE #${formatOrderRef(orderReference)}`,
     html: buildBrandedEmail({
       frontendUrl,
       content,
@@ -618,19 +628,25 @@ export const sendOutForDeliveryEmail = async ({
   });
 };
 
-export const sendShipmentDeliveredEmail = async ({ to, name, orderId }) => {
+export const sendShipmentDeliveredEmail = async ({
+  to,
+  name,
+  orderId,
+  orderNumber,
+}) => {
   const frontendUrl = getFrontendUrl();
+  const orderReference = orderNumber || orderId;
 
   const content = `
     ${buildIntro({
       name,
       heading: `Hi ${name || "there"},`,
-      subtext: `Delivery confirmation for order <strong>#${formatOrderRef(orderId)}</strong> is complete.<br/>Thank you for choosing BREE Wellness. We hope you enjoy your order.`,
+      subtext: `Delivery confirmation for order <strong>#${formatOrderRef(orderReference)}</strong> is complete.<br/>Thank you for choosing BREE Wellness. We hope you enjoy your order.`,
     })}
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
       <tr>
         <td style="padding:0 24px;">
-          ${buildOrderInfoCard({ orderId })}
+          ${buildOrderInfoCard({ orderId: orderReference })}
           ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
         </td>
       </tr>
@@ -640,7 +656,7 @@ export const sendShipmentDeliveredEmail = async ({ to, name, orderId }) => {
 
   await sendEmail({
     to,
-    subject: `Delivered — BREE #${formatOrderRef(orderId)}`,
+    subject: `Delivered — BREE #${formatOrderRef(orderReference)}`,
     html: buildBrandedEmail({
       frontendUrl,
       content,
@@ -723,6 +739,47 @@ export const sendSubscriptionChargeReceiptEmail = async ({
       frontendUrl,
       content,
       preheader: "Your BREE Wellness subscription payment was received.",
+    }),
+  });
+};
+
+export const sendSubscriptionActivationEmail = async ({
+  to,
+  name,
+  orderId,
+  amount,
+  subscriptionId,
+}) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription for order <strong>#${formatOrderRef(orderId)}</strong> is now active.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([
+            { label: "Subscription ID", value: subscriptionId },
+            { label: "Amount", value: formatCurrency(amount) },
+          ])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thank you for choosing BREE Wellness.")}
+  `;
+
+  await sendEmail({
+    to,
+    subject: `Subscription Activated — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription is now active.",
     }),
   });
 };
@@ -838,6 +895,84 @@ export const sendSubscriptionResumeEmail = async ({
       frontendUrl,
       content,
       preheader: "Your BREE Wellness subscription has been resumed.",
+    }),
+  });
+};
+
+export const sendSubscriptionPauseEmail = async ({
+  to,
+  name,
+  orderId,
+  subscriptionId,
+}) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription for order <strong>#${formatOrderRef(orderId)}</strong> has been paused.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Subscription ID", value: subscriptionId }])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("You can resume your subscription whenever you are ready.")}
+  `;
+
+  await sendEmail({
+    to,
+    subject: `Subscription Paused — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription has been paused.",
+    }),
+  });
+};
+
+export const sendSubscriptionHaltedEmail = async ({
+  to,
+  name,
+  orderId,
+  subscriptionId,
+  notes,
+}) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription for order <strong>#${formatOrderRef(orderId)}</strong> has been halted because recurring payment could not be completed.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([
+            { label: "Subscription ID", value: subscriptionId },
+            { label: "Details", value: notes },
+          ])}
+          ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Please contact support if you need help restarting your subscription.")}
+  `;
+
+  await sendEmail({
+    to,
+    subject: `Subscription Halted — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription has been halted.",
     }),
   });
 };

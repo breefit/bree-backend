@@ -714,11 +714,15 @@ export const buildOrderStatusMessage = (status) => {
   const messages = {
     pending_payment: "Your order has been placed and is awaiting payment.",
     paid: "Payment received successfully. Your order has been confirmed.",
-    processing: "Our team has started preparing your order.",
-    ready_to_ship: "Your order has been packed and is ready for shipment.",
-    shipped: "Your order has been shipped.",
-    out_for_delivery: "Your order is out for delivery.",
-    delivered: "Your order has been delivered successfully.",
+    processing:
+      "Your order is now being processed. We'll keep you updated as it moves forward.",
+    ready_to_ship:
+      "Your order is ready to ship. We'll notify you once it has been shipped.",
+    shipped: "Your order has been shipped and is on its way to you.",
+    out_for_delivery:
+      "Your order is out for delivery and should reach you soon.",
+    delivered:
+      "Your order has been delivered. Thank you for shopping with BREE.",
     cancelled: "Your order has been cancelled.",
     returned: "Your returned order has been received.",
     ...RETURN_STATUS_MESSAGES,

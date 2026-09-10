@@ -1,5 +1,11 @@
 import { query } from "../../config/database.js";
 import { getRazorpay } from "../../config/razorpay.js";
+import {
+  sendSubscriptionCancellationEmail,
+  sendSubscriptionPauseEmail,
+  sendSubscriptionResumeEmail,
+} from "../../services/orderEmailService.js";
+import { sendSubscriptionEmailOnce } from "../../services/subscriptionEmailNotificationService.js";
 
 const formatDate = (dateValue) => {
   if (!dateValue) return null;
@@ -348,6 +354,7 @@ const updateSubscriptionOrder = async ({
   cancelReason,
   cancelledBy,
   cancelledAt,
+  expectedSubscriptionStatuses,
 }) => {
   const updates = [];
   const params = [];
@@ -379,11 +386,20 @@ const updateSubscriptionOrder = async ({
 
   if (!updates.length) return;
   params.push(orderId);
+  let whereClause = "id = ?";
+  if (expectedSubscriptionStatuses?.length) {
+    whereClause += ` AND subscription_status IN (${expectedSubscriptionStatuses
+      .map(() => "?")
+      .join(", ")})`;
+    params.push(...expectedSubscriptionStatuses);
+  }
 
-  await query(
-    `UPDATE orders SET ${updates.join(", ")}, updated_at = NOW() WHERE id = ?`,
+  const result = await query(
+    `UPDATE orders SET ${updates.join(", ")}, updated_at = NOW() WHERE ${whereClause}`,
     params,
   );
+
+  if (!result.rowCount) return false;
 
   await query(
     `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by, notes)
@@ -396,13 +412,14 @@ const updateSubscriptionOrder = async ({
       notes || null,
     ],
   );
+  return true;
 };
 
 export const pauseSubscription = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id, subscription_status FROM orders WHERE id = ? AND is_subscription = 1",
+      "SELECT id, razorpay_subscription_id, subscription_status, contact_email, contact_name FROM orders WHERE id = ? AND is_subscription = 1",
       [id],
     );
 
@@ -429,11 +446,30 @@ export const pauseSubscription = async (req, res) => {
       },
     );
 
-    await updateSubscriptionOrder({
+    const stateChanged = await updateSubscriptionOrder({
       orderId: order.id,
       subscriptionStatus: response.status || "paused",
       notes: "Subscription paused",
+      expectedSubscriptionStatuses: ["active", "authenticated", "pending"],
     });
+
+    if (stateChanged) {
+      sendSubscriptionEmailOnce({
+        notificationKey: `subscription:${order.razorpay_subscription_id}:paused`,
+        send: () =>
+          sendSubscriptionPauseEmail({
+            to: order.contact_email,
+            name: order.contact_name,
+            orderId: order.id,
+            subscriptionId: order.razorpay_subscription_id,
+          }),
+      }).catch((error) =>
+        console.error("[ADMIN SUBSCRIPTIONS] Pause email failed", {
+          orderId: order.id,
+          message: error?.message || String(error),
+        }),
+      );
+    }
 
     res.json({ success: true, subscription_status: response.status });
   } catch (error) {
@@ -451,7 +487,7 @@ export const resumeSubscription = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id FROM orders WHERE id = ? AND is_subscription = 1",
+      "SELECT id, razorpay_subscription_id, contact_email, contact_name FROM orders WHERE id = ? AND is_subscription = 1",
       [id],
     );
 
@@ -468,11 +504,30 @@ export const resumeSubscription = async (req, res) => {
       },
     );
 
-    await updateSubscriptionOrder({
+    const stateChanged = await updateSubscriptionOrder({
       orderId: order.id,
       subscriptionStatus: response.status || "active",
       notes: "Subscription resumed",
+      expectedSubscriptionStatuses: ["paused"],
     });
+
+    if (stateChanged) {
+      sendSubscriptionEmailOnce({
+        notificationKey: `subscription:${order.razorpay_subscription_id}:resumed`,
+        send: () =>
+          sendSubscriptionResumeEmail({
+            to: order.contact_email,
+            name: order.contact_name,
+            orderId: order.id,
+            subscriptionId: order.razorpay_subscription_id,
+          }),
+      }).catch((error) =>
+        console.error("[ADMIN SUBSCRIPTIONS] Resume email failed", {
+          orderId: order.id,
+          message: error?.message || String(error),
+        }),
+      );
+    }
 
     res.json({ success: true, subscription_status: response.status });
   } catch (error) {
@@ -488,7 +543,7 @@ export const cancelSubscription = async (req, res) => {
     const admin = req.admin;
 
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id FROM orders WHERE id = ? AND is_subscription = 1",
+      "SELECT id, razorpay_subscription_id, contact_email, contact_name FROM orders WHERE id = ? AND is_subscription = 1",
       [id],
     );
 
@@ -512,7 +567,7 @@ export const cancelSubscription = async (req, res) => {
     // When Razorpay eventually fires the subscription.cancelled webhook (at
     // billing cycle end), subscription_status will be flipped to 'cancelled'
     // by the webhook handler — and order_status will still be untouched.
-    await updateSubscriptionOrder({
+    const stateChanged = await updateSubscriptionOrder({
       orderId: order.id,
       subscriptionStatus: "cancellation_requested",
       notes: "Subscription cancelled by admin",
@@ -521,7 +576,31 @@ export const cancelSubscription = async (req, res) => {
       cancelledAt: new Date().toLocaleString("sv-SE", {
         timeZone: "Asia/Kolkata",
       }),
+      expectedSubscriptionStatuses: [
+        "active",
+        "authenticated",
+        "pending",
+        "paused",
+      ],
     });
+
+    if (stateChanged) {
+      sendSubscriptionEmailOnce({
+        notificationKey: `subscription:${order.razorpay_subscription_id}:cancelled`,
+        send: () =>
+          sendSubscriptionCancellationEmail({
+            to: order.contact_email,
+            name: order.contact_name,
+            orderId: order.id,
+            subscriptionId: order.razorpay_subscription_id,
+          }),
+      }).catch((error) =>
+        console.error("[ADMIN SUBSCRIPTIONS] Cancellation email failed", {
+          orderId: order.id,
+          message: error?.message || String(error),
+        }),
+      );
+    }
 
     res.json({ success: true, subscription_status: response.status });
   } catch (error) {

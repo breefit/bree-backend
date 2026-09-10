@@ -11,7 +11,9 @@ import { appendStatusHistory } from "../src/models/Order.js";
 import {
   sendOutForDeliveryEmail,
   sendShipmentDeliveredEmail,
+  sendOrderStatusUpdateEmail,
 } from "../src/services/orderEmailService.js";
+import { sendOrderStatusUpdateWhatsApp } from "../src/services/whatsappNotificationService.js";
 import { activateReminderFromDelivery } from "../src/services/dailyReminderService.js";
 
 const TERMINAL_STATUSES = ["delivered", "cancelled", "returned"];
@@ -33,7 +35,8 @@ export const syncShippingTracking = async () => {
 
   const { rows: orders } = await query(
     `SELECT id, order_number, order_status, awb_number, tracking_status,
-            contact_name, contact_email, tracking_url, courier_name
+            contact_name, customer_name, email, contact_email,
+            mobile_number, contact_phone, tracking_url, courier_name
      FROM orders
      WHERE awb_number IS NOT NULL
        AND awb_number != ''
@@ -120,11 +123,27 @@ export const syncShippingTracking = async () => {
       }
 
       updateParams.push(order.id);
+      const updateWhere = shouldTransitionOrderStatus
+        ? "WHERE id = ? AND order_status = ?"
+        : "WHERE id = ?";
+      if (shouldTransitionOrderStatus) {
+        updateParams.push(order.order_status);
+      }
 
-      await query(
-        `UPDATE orders SET ${updateFields.join(", ")} WHERE id = ?`,
+      const updateResult = await query(
+        `UPDATE orders SET ${updateFields.join(", ")} ${updateWhere}`,
         updateParams,
       );
+
+      if (
+        shouldTransitionOrderStatus &&
+        !Number(updateResult.affectedRows ?? updateResult.rowCount)
+      ) {
+        console.warn(
+          `[SHIPPING_CRON] Skipping stale status transition for order ${order.id}; another update won the race`,
+        );
+        continue;
+      }
 
       if (shouldTransitionOrderStatus) {
         await appendStatusHistory({
@@ -143,37 +162,74 @@ export const syncShippingTracking = async () => {
       // "out for delivery"/"delivered" email for a transition that didn't
       // actually happen.
       if (shouldTransitionOrderStatus) {
-        if (normalizedTrackingStatus === "out for delivery") {
-          try {
-            await sendOutForDeliveryEmail({
-              to: order.contact_email,
-              name: order.contact_name,
-              orderId: order.id,
-              awbNumber: order.awb_number,
-              trackingUrl: order.tracking_url,
-              currentLocation: parsedTracking.currentLocation,
-              expectedDeliveryDate: parsedTracking.expectedDelivery,
-            });
-          } catch (emailError) {
-            console.error(
-              `[SHIPPING_CRON] Failed to send out-for-delivery email for order ${order.id}`,
-              emailError,
-            );
-          }
-        } else if (normalizedTrackingStatus === "delivered") {
-          try {
-            await sendShipmentDeliveredEmail({
-              to: order.contact_email,
-              name: order.contact_name,
-              orderId: order.id,
-            });
-          } catch (emailError) {
-            console.error(
-              `[SHIPPING_CRON] Failed to send delivered email for order ${order.id}`,
-              emailError,
-            );
-          }
+        const recipientEmail = order.contact_email || order.email;
+        const recipientName =
+          order.contact_name || order.customer_name || "Customer";
+        const recipientPhone = order.contact_phone || order.mobile_number;
 
+        if (recipientEmail) {
+          try {
+            if (normalizedTrackingStatus === "out for delivery") {
+              await sendOutForDeliveryEmail({
+                to: recipientEmail,
+                name: recipientName,
+                orderId: order.id,
+                orderNumber: order.order_number,
+                awbNumber: order.awb_number,
+                trackingUrl: order.tracking_url,
+                currentLocation: parsedTracking.currentLocation,
+                expectedDeliveryDate: parsedTracking.expectedDelivery,
+              });
+            } else if (normalizedTrackingStatus === "delivered") {
+              await sendShipmentDeliveredEmail({
+                to: recipientEmail,
+                name: recipientName,
+                orderId: order.id,
+                orderNumber: order.order_number,
+              });
+            } else if (mappedOrderStatus === "shipped") {
+              await sendOrderStatusUpdateEmail({
+                to: recipientEmail,
+                name: recipientName,
+                orderId: order.id,
+                orderNumber: order.order_number,
+                status: mappedOrderStatus,
+              });
+            }
+          } catch (emailError) {
+            console.error(
+              `[SHIPPING_CRON] Failed to send ${mappedOrderStatus} email for order ${order.id}`,
+              emailError,
+            );
+          }
+        } else {
+          console.error(
+            `[SHIPPING_CRON] Cannot send ${mappedOrderStatus} email for order ${order.id}: no customer email in contact_email or email`,
+          );
+        }
+
+        if (recipientPhone) {
+          try {
+            await sendOrderStatusUpdateWhatsApp({
+              customerName: recipientName,
+              mobile: recipientPhone,
+              orderNumber: order.order_number,
+              orderUuid: order.id,
+              status: mappedOrderStatus,
+            });
+          } catch (whatsappError) {
+            console.error(
+              `[SHIPPING_CRON] Failed to send ${mappedOrderStatus} WhatsApp for order ${order.id}`,
+              whatsappError,
+            );
+          }
+        } else {
+          console.error(
+            `[SHIPPING_CRON] Cannot send ${mappedOrderStatus} WhatsApp for order ${order.id}: no customer phone in contact_phone or mobile_number`,
+          );
+        }
+
+        if (normalizedTrackingStatus === "delivered") {
           // Activate daily reminders when order is delivered
           try {
             const { rows: reminders } = await query(

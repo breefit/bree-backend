@@ -173,7 +173,7 @@ CREATE TABLE IF NOT EXISTS orders (
   payment_status           VARCHAR(50)   NOT NULL DEFAULT 'pending',
 
   razorpay_order_id        VARCHAR(255)  DEFAULT NULL,
-  razorpay_payment_id      VARCHAR(255)  DEFAULT NULL,
+  razorpay_payment_id      VARCHAR(255)  DEFAULT NULL UNIQUE,
   order_confirmation_email_sent_at DATETIME NULL DEFAULT NULL,
   order_confirmation_whatsapp_sent_at DATETIME NULL DEFAULT NULL,
 
@@ -208,6 +208,21 @@ CREATE INDEX idx_orders_subscription        ON orders(razorpay_subscription_id);
 CREATE INDEX idx_orders_subscription_status ON orders(subscription_status);
 CREATE INDEX idx_orders_parent_order_id     ON orders(parent_order_id);
 CREATE INDEX idx_orders_is_renewal_order    ON orders(is_renewal_order);
+
+-- ---------------------------------------------------------------------------
+-- TABLE: subscription_email_notifications
+-- One durable claim per logical subscription email notification.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS subscription_email_notifications (
+  notification_key VARCHAR(255) PRIMARY KEY,
+  status           VARCHAR(20) NOT NULL DEFAULT 'pending',
+  attempts         INT NOT NULL DEFAULT 0,
+  last_attempt_at  DATETIME NULL,
+  sent_at          DATETIME NULL,
+  last_error       VARCHAR(1000) NULL,
+  created_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
 -- TABLE: order_items

@@ -716,7 +716,10 @@ export const updateBulkBooking = async (req, res) => {
       const effectiveDeliveryDate =
         delivery_date !== undefined ? delivery_date : existing.delivery_date;
 
-      if (!isValidPositiveNumber(effectiveQuotePrice) || !effectiveDeliveryDate) {
+      if (
+        !isValidPositiveNumber(effectiveQuotePrice) ||
+        !effectiveDeliveryDate
+      ) {
         return res.status(400).json({
           success: false,
           message:
@@ -947,19 +950,8 @@ export const updateBulkBooking = async (req, res) => {
     // a double-click, a network retry, or an unrelated admin_notes edit
     // resubmitted alongside status: "quoted"). Only a genuine first-time
     // quote, or a real change to price/delivery date, counts as "sharing".
-    const toDateOnlyString = (value) => {
-      if (!value) return null;
-      const d = value instanceof Date ? value : new Date(value);
-      return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
-    };
     const deliveryDateCandidate =
       delivery_date !== undefined ? delivery_date : existing.delivery_date;
-    const quoteValuesChanged =
-      existing.status !== "quoted" ||
-      Number(existing.quote_price) !== Number(quotePriceCandidate) ||
-      toDateOnlyString(existing.delivery_date) !==
-        toDateOnlyString(deliveryDateCandidate);
-    const shouldNotifyQuote = isSharingQuote && quoteValuesChanged;
 
     if (isSharingQuote) {
       updates.push("quote_shared_at = NOW()");
@@ -976,15 +968,53 @@ export const updateBulkBooking = async (req, res) => {
     updates.push("updated_at = NOW()");
     params.push(id);
 
+    let shouldNotifyQuote = false;
     try {
-      await query(
+      const quoteChangeWhere = `
+        id = ? AND (
+          status <> 'quoted' OR
+          quote_price IS NULL OR
+          quote_price <> ? OR
+          delivery_date IS NULL OR
+          DATE(delivery_date) <> ?
+        )`;
+
+      const updateParams = [...params];
+      const updateSql = isSharingQuote
+        ? `
+          UPDATE bulk_bookings
+          SET ${updates.join(", ")}
+          WHERE ${quoteChangeWhere}
         `
-        UPDATE bulk_bookings
-        SET ${updates.join(", ")}
-        WHERE id = ?
-      `,
-        params,
+        : `
+          UPDATE bulk_bookings
+          SET ${updates.join(", ")}
+          WHERE id = ?
+        `;
+
+      if (isSharingQuote) {
+        updateParams.push(quotePriceCandidate, deliveryDateCandidate);
+      }
+
+      const updateResult = await query(updateSql, updateParams);
+      const updateAffectedRows = Number(
+        updateResult.affectedRows ?? updateResult.rowCount ?? 0,
       );
+
+      if (isSharingQuote && updateAffectedRows === 0) {
+        // The quote values were already persisted by a concurrent/replayed
+        // request. Preserve any unrelated fields from this request, but do
+        // not claim the same quote notification a second time.
+        const regularUpdates = updates.filter(
+          (update) => update !== "quote_shared_at = NOW()",
+        );
+        await query(
+          `UPDATE bulk_bookings SET ${regularUpdates.join(", ")} WHERE id = ?`,
+          params,
+        );
+      } else {
+        shouldNotifyQuote = isSharingQuote;
+      }
     } catch (updateErr) {
       // If update fails due to missing columns (migration not applied)
       if (updateErr.message && updateErr.message.includes("Unknown column")) {
@@ -1010,9 +1040,10 @@ export const updateBulkBooking = async (req, res) => {
         // catches its own email/WhatsApp failures internally and never
         // rejects, but this .catch stays as a defensive backstop.
         notifyQuoteReady({
-          email: updated.email,
-          mobileNumber: updated.mobile_number,
-          contactPerson: updated.contact_person,
+          email: updated.contact_email || updated.email,
+          mobileNumber: updated.contact_phone || updated.mobile_number,
+          contactPerson:
+            updated.contact_person || updated.contact_name || "Customer",
           quotePrice: updated.quote_price,
           deliveryDate: updated.delivery_date,
           bookingId: id,
@@ -1342,7 +1373,6 @@ const ensureBulkRazorpayOrder = async (id) => {
   // trip blocks any other request touching this booking row for no reason.
   // The result is persisted in a short phase-2 transaction below.
   if (needsRazorpayOrder) {
-
     // Magic Checkout: line_items + line_items_total on the Razorpay Order
     // itself are what mark it as a Magic Checkout order (mirrors
     // paymentController.createOrder's isMagicCheckout branch). A bulk
@@ -1438,8 +1468,6 @@ const ensureBulkRazorpayOrder = async (id) => {
   return { ok: true, booking, razorpayOrderId, created };
 };
 
-
-
 // ==========================================================================
 // SEND CONFIRMATION (admin only)
 // ==========================================================================
@@ -1490,7 +1518,12 @@ export const sendBulkConfirmation = async (req, res) => {
       orderNumber,
       quotePrice: booking.quote_price,
     });
-    await logBulkCommunication(id, "confirmation", "Confirmation Sent", req.admin?.id);
+    await logBulkCommunication(
+      id,
+      "confirmation",
+      "Confirmation Sent",
+      req.admin?.id,
+    );
 
     const updated = await findBulkBookingWithHistory(id);
 
@@ -1550,7 +1583,12 @@ export const sendBulkDispatch = async (req, res) => {
       contactPerson: booking.contact_person,
       orderNumber,
     });
-    await logBulkCommunication(id, "dispatch", "Dispatch Details Sent", req.admin?.id);
+    await logBulkCommunication(
+      id,
+      "dispatch",
+      "Dispatch Details Sent",
+      req.admin?.id,
+    );
 
     const updated = await findBulkBookingWithHistory(id);
 
@@ -1632,9 +1670,7 @@ export const verifyBulkPayment = async (req, res) => {
         message: "Payment verified successfully",
         data: booking,
         orderId: booking.created_order_id || null,
-        order: booking.order_created
-          ? { id: booking.created_order_id }
-          : null,
+        order: booking.order_created ? { id: booking.created_order_id } : null,
       });
     }
 

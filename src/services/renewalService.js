@@ -50,7 +50,7 @@ import { getNextOrderNumber } from "../utils/orderNumber.js";
  * @param {object}  [subscriptionEntity] Optional Razorpay subscription entity
  *                                     from payload.subscription.entity — used
  *                                     to capture next_billing_date (charge_at).
- * @returns {{ renewalOrderId: string, renewalOrderNumber: string }}
+ * @returns {{ renewalOrderId: string, renewalOrderNumber: string, created: boolean }}
  */
 export const createRenewalOrder = async (
   rzpSubscriptionId,
@@ -83,6 +83,7 @@ export const createRenewalOrder = async (
       return {
         renewalOrderId: existing[0].id,
         renewalOrderNumber: existing[0].order_number,
+        created: false,
       };
     }
   }
@@ -313,9 +314,29 @@ export const createRenewalOrder = async (
       originNumber: origin.order_number,
     });
 
-    return { renewalOrderId, renewalOrderNumber };
+    return { renewalOrderId, renewalOrderNumber, created: true };
   } catch (err) {
     await client.query("ROLLBACK");
+
+    if (err?.code === "ER_DUP_ENTRY" && rzpPaymentId) {
+      const { rows: existing } = await query(
+        `SELECT id, order_number FROM orders
+         WHERE razorpay_payment_id = ?
+           AND is_subscription = 1
+           AND is_renewal_order = 1
+         LIMIT 1`,
+        [rzpPaymentId],
+      );
+
+      if (existing.length) {
+        return {
+          renewalOrderId: existing[0].id,
+          renewalOrderNumber: existing[0].order_number,
+          created: false,
+        };
+      }
+    }
+
     console.error("[RENEWAL] Transaction rolled back", {
       rzpSubscriptionId,
       rzpPaymentId,

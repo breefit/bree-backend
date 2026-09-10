@@ -561,7 +561,11 @@ export const updateOrderStatus = async (req, res) => {
     const recipientEmail = updated.contact_email || updated.email;
     const recipientName =
       updated.contact_name || updated.customer_name || "Customer";
-    if (status && status !== "pending_payment" && recipientEmail) {
+    const statusChanged = Boolean(
+      status &&
+      normalizeOrderStatus(order.order_status) !== normalizeOrderStatus(status),
+    );
+    if (statusChanged && status !== "pending_payment" && recipientEmail) {
       const emailPromise = (() => {
         if (status === "delivered") {
           return sendOrderDeliveredEmail({
@@ -593,7 +597,7 @@ export const updateOrderStatus = async (req, res) => {
       })();
 
       emailPromise.catch((error) => {
-        console.warn("Order status email failed", error?.message || error);
+        console.error("Order status email failed", error);
       });
     }
 
@@ -601,7 +605,7 @@ export const updateOrderStatus = async (req, res) => {
     // Fire-and-forget, same status gating as the email notification above.
     // Never awaited so a WhatsApp failure can never block the API response.
     const recipientPhone = updated.contact_phone || updated.mobile_number;
-    if (status && status !== "pending_payment" && recipientPhone) {
+    if (statusChanged && status !== "pending_payment" && recipientPhone) {
       sendOrderStatusUpdateWhatsApp({
         customerName: recipientName,
         mobile: recipientPhone,
@@ -609,7 +613,7 @@ export const updateOrderStatus = async (req, res) => {
         orderUuid: updated.id,
         status,
       }).catch((error) => {
-        console.warn("Order status WhatsApp failed", error?.message || error);
+        console.error("Order status WhatsApp failed", error);
       });
     }
     // ===== End Added =====
@@ -798,7 +802,10 @@ export const bulkUpdateStatus = async (req, res) => {
     );
 
     // Insert history records for all orders whose status actually changed
-    const changedOrders = foundFull.filter((o) => o.order_status !== status);
+    const changedOrders = foundFull.filter(
+      (o) =>
+        normalizeOrderStatus(o.order_status) !== normalizeOrderStatus(status),
+    );
     if (changedOrders.length) {
       const historyValues = changedOrders.map(() => "(?, ?, ?, ?)").join(", ");
       const historyParams = changedOrders.flatMap((o) => [
@@ -815,9 +822,17 @@ export const bulkUpdateStatus = async (req, res) => {
 
     await client.query("COMMIT");
 
+    const changedOrderIds = new Set(
+      changedOrders.map((orderItem) => String(orderItem.id)),
+    );
+
     // Send emails (fire-and-forget, never block the response)
     if (status !== "pending_payment") {
       const emailPromises = updated.map((orderItem) => {
+        if (!changedOrderIds.has(String(orderItem.id))) {
+          return Promise.resolve();
+        }
+
         const recipientEmail = orderItem.contact_email || orderItem.email;
         const recipientName =
           orderItem.contact_name || orderItem.customer_name || "Customer";
@@ -850,12 +865,22 @@ export const bulkUpdateStatus = async (req, res) => {
         });
       });
 
-      Promise.allSettled(emailPromises).catch(() => {});
+      Promise.allSettled(emailPromises).then((results) => {
+        results
+          .filter((result) => result.status === "rejected")
+          .forEach((result) => {
+            console.error("Bulk order status email failed", result.reason);
+          });
+      });
     }
 
     // ===== Added: WhatsApp order status notifications (bulk) =====
     // Fire-and-forget, mirrors the email notification block above.
     const whatsappPromises = updated.map((orderItem) => {
+      if (!changedOrderIds.has(String(orderItem.id))) {
+        return Promise.resolve();
+      }
+
       const recipientPhone = orderItem.contact_phone || orderItem.mobile_number;
       const recipientName =
         orderItem.contact_name || orderItem.customer_name || "Customer";
@@ -871,7 +896,13 @@ export const bulkUpdateStatus = async (req, res) => {
       });
     });
 
-    Promise.allSettled(whatsappPromises).catch(() => {});
+    Promise.allSettled(whatsappPromises).then((results) => {
+      results
+        .filter((result) => result.status === "rejected")
+        .forEach((result) => {
+          console.error("Bulk order status WhatsApp failed", result.reason);
+        });
+    });
     // ===== End Added =====
 
     // Emit socket events

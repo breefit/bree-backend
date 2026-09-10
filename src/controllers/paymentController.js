@@ -6,8 +6,18 @@ import {
 } from "../utils/razorpay.js";
 import { query, getClient } from "../config/database.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
-import { sendOrderConfirmationEmail } from "../services/orderEmailService.js";
+import {
+  sendOrderConfirmationEmail,
+  sendOrderStatusUpdateEmail,
+  sendSubscriptionActivationEmail,
+  sendSubscriptionCancellationEmail,
+  sendSubscriptionFailedEmail,
+  sendSubscriptionHaltedEmail,
+  sendSubscriptionPauseEmail,
+  sendSubscriptionResumeEmail,
+} from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
+import { sendSubscriptionEmailOnce } from "../services/subscriptionEmailNotificationService.js";
 import { createPackagePurchaseFromOrder } from "../services/packageFulfillmentService.js";
 import { createDailyReminder } from "../services/dailyReminderService.js";
 import delhiveryService from "../services/delhiveryService.js";
@@ -18,6 +28,7 @@ import {
 import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
+  sendOrderStatusUpdateWhatsApp,
   validateMobile,
 } from "../services/whatsappNotificationService.js";
 
@@ -1129,6 +1140,64 @@ const notifyInitialOrderConfirmation = async (orderId) => {
   }
 };
 
+const notifyPaidStatusUpdate = async (orderId) => {
+  try {
+    const { rows } = await query(
+      `SELECT id, order_number, customer_name, contact_name, email,
+              contact_email, mobile_number, contact_phone
+       FROM orders WHERE id = ? LIMIT 1`,
+      [orderId],
+    );
+    const order = rows[0];
+    if (!order) return;
+
+    const name = order.contact_name || order.customer_name || "Customer";
+    const email = order.contact_email || order.email;
+    const phone = order.contact_phone || order.mobile_number;
+
+    if (email) {
+      try {
+        await sendOrderStatusUpdateEmail({
+          to: email,
+          name,
+          orderId: order.id,
+          orderNumber: order.order_number,
+          status: "paid",
+        });
+      } catch (error) {
+        console.error("Paid order status email failed", { orderId, error });
+      }
+    } else {
+      console.error(
+        `[PAYMENT] Cannot send paid status email for order ${orderId}: no customer email`,
+      );
+    }
+
+    if (phone) {
+      try {
+        await sendOrderStatusUpdateWhatsApp({
+          customerName: name,
+          mobile: phone,
+          orderNumber: order.order_number,
+          orderUuid: order.id,
+          status: "paid",
+        });
+      } catch (error) {
+        console.error("Paid order status WhatsApp failed", { orderId, error });
+      }
+    } else {
+      console.error(
+        `[PAYMENT] Cannot send paid status WhatsApp for order ${orderId}: no customer phone`,
+      );
+    }
+  } catch (error) {
+    console.error("Paid order status notification lookup failed", {
+      orderId,
+      error,
+    });
+  }
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Normalise a Delhivery serviceability response into a boolean.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1620,7 +1689,10 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    if (shouldRecordPaymentHistory(lockedOrder.payment_status)) {
+    const paidStatusTransition = shouldRecordPaymentHistory(
+      lockedOrder.payment_status,
+    );
+    if (paidStatusTransition) {
       await client.query(
         `INSERT INTO order_status_history
            (order_id, previous_status, new_status, changed_by, notes)
@@ -1793,6 +1865,9 @@ export const verifyPayment = async (req, res) => {
   });
 
   await notifyInitialOrderConfirmation(order.id);
+  if (paidStatusTransition) {
+    await notifyPaidStatusUpdate(order.id);
+  }
 
   let nextBillingDate = null;
   if (isSubscriptionOrder && razorpay_subscription_id) {
@@ -2597,6 +2672,7 @@ export const handleWebhook = async (req, res) => {
 
   switch (event) {
     case "payment.captured": {
+      let paidStatusTransition = false;
       if (rzpSubscriptionId) {
         const order = await loadBySubscription();
         if (order) {
@@ -2755,7 +2831,10 @@ export const handleWebhook = async (req, res) => {
               [rzpPaymentId, rzpOrderId],
             );
 
-            if (shouldRecordPaymentHistory(lockedOrder.payment_status)) {
+            paidStatusTransition = shouldRecordPaymentHistory(
+              lockedOrder.payment_status,
+            );
+            if (paidStatusTransition) {
               await whClient.query(
                 `INSERT INTO order_status_history
                    (order_id, previous_status, new_status, changed_by, notes)
@@ -2778,6 +2857,9 @@ export const handleWebhook = async (req, res) => {
           }
 
           await notifyInitialOrderConfirmation(order.id);
+          if (paidStatusTransition) {
+            await notifyPaidStatusUpdate(order.id);
+          }
           emitUpdate(order.id, "paid");
 
           createPackagePurchaseFromOrder(order.id).catch((err) => {
@@ -2798,19 +2880,42 @@ export const handleWebhook = async (req, res) => {
       if (rzpSubscriptionId) {
         const order = await loadBySubscription();
         if (order) {
-          await query(
+          const failureUpdate = await query(
             `UPDATE orders SET
                payment_status = 'failed', subscription_status = 'past_due', updated_at = NOW()
-             WHERE id = ?`,
+             WHERE id = ? AND COALESCE(payment_status, '') <> 'failed'`,
             [order.id],
           );
-          await addHistory(
-            order.id,
-            order.order_status,
-            "past_due",
-            "Subscription payment failed",
-          );
-          emitUpdate(order.id, "past_due");
+          if (failureUpdate.rowCount) {
+            await addHistory(
+              order.id,
+              order.order_status,
+              "past_due",
+              "Subscription payment failed",
+            );
+            emitUpdate(order.id, "past_due");
+
+            sendSubscriptionEmailOnce({
+              notificationKey: `subscription:${rzpSubscriptionId}:payment:${rzpPaymentId || "unknown"}:payment.failed`,
+              send: () =>
+                sendSubscriptionFailedEmail({
+                  to: order.contact_email || order.email,
+                  name: order.contact_name || order.customer_name,
+                  orderId: order.id,
+                  subscriptionId: rzpSubscriptionId,
+                  notes:
+                    paymentEntity?.error_description ||
+                    paymentEntity?.error_reason ||
+                    paymentEntity?.error_code ||
+                    "Razorpay payment failed",
+                }),
+            }).catch((error) =>
+              console.error("[WEBHOOK] Subscription failure email failed", {
+                orderId: order.id,
+                message: error?.message || String(error),
+              }),
+            );
+          }
         }
       } else if (rzpOrderId) {
         const order = await loadByRazorpayOrder();
@@ -2840,22 +2945,41 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
-        await query(
+        const activationUpdate = await query(
           `UPDATE orders SET
              subscription_status = 'active',
              payment_status = 'paid',
              next_billing_date = COALESCE(?, next_billing_date),
              updated_at = NOW()
-           WHERE id = ?`,
+           WHERE id = ? AND COALESCE(subscription_status, '') <> 'active'`,
           [nextBilling, order.id],
         );
-        await addHistory(
-          order.id,
-          order.subscription_status,
-          "active",
-          "Subscription activated via webhook",
-        );
-        emitUpdate(order.id, order.order_status);
+        if (activationUpdate.rowCount) {
+          await addHistory(
+            order.id,
+            order.subscription_status,
+            "active",
+            "Subscription activated via webhook",
+          );
+          emitUpdate(order.id, order.order_status);
+
+          sendSubscriptionEmailOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:activated`,
+            send: () =>
+              sendSubscriptionActivationEmail({
+                to: order.contact_email || order.email,
+                name: order.contact_name || order.customer_name,
+                orderId: order.id,
+                amount: order.total ?? order.amount,
+                subscriptionId: rzpSubscriptionId,
+              }),
+          }).catch((error) =>
+            console.error("[WEBHOOK] Subscription activation email failed", {
+              orderId: order.id,
+              message: error?.message || String(error),
+            }),
+          );
+        }
       }
       break;
     }
@@ -2895,13 +3019,17 @@ export const handleWebhook = async (req, res) => {
         if (sendSubscriptionChargeReceiptEmail) {
           const originOrder = await loadBySubscription();
           if (originOrder) {
-            sendSubscriptionChargeReceiptEmail({
-              to: originOrder.contact_email || originOrder.email,
-              name: originOrder.contact_name || originOrder.customer_name,
-              orderId: renewalOrderId,
-              orderNumber: renewalOrderNumber,
-              subscriptionId: rzpSubscriptionId,
-              amount,
+            sendSubscriptionEmailOnce({
+              notificationKey: `subscription:${rzpSubscriptionId}:payment:${rzpPaymentId || "unknown"}:subscription.charged`,
+              send: () =>
+                sendSubscriptionChargeReceiptEmail({
+                  to: originOrder.contact_email || originOrder.email,
+                  name: originOrder.contact_name || originOrder.customer_name,
+                  orderId: renewalOrderId,
+                  orderNumber: renewalOrderNumber,
+                  subscriptionId: rzpSubscriptionId,
+                  amount,
+                }),
             }).catch((e) =>
               console.error("[WEBHOOK] Renewal charge receipt email failed", {
                 renewalOrderId,
@@ -2927,21 +3055,39 @@ export const handleWebhook = async (req, res) => {
     case "subscription.paused": {
       const order = await loadBySubscription();
       if (order) {
-        await query(
+        const pauseUpdate = await query(
           `UPDATE orders SET
              subscription_status = 'paused',
              next_billing_date = NULL,
              updated_at = NOW()
-           WHERE id = ?`,
+           WHERE id = ? AND COALESCE(subscription_status, '') <> 'paused'`,
           [order.id],
         );
-        await addHistory(
-          order.id,
-          order.subscription_status,
-          "paused",
-          "Subscription paused via webhook",
-        );
-        emitUpdate(order.id, "paused");
+        if (pauseUpdate.rowCount) {
+          await addHistory(
+            order.id,
+            order.subscription_status,
+            "paused",
+            "Subscription paused via webhook",
+          );
+          emitUpdate(order.id, "paused");
+
+          sendSubscriptionEmailOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:paused`,
+            send: () =>
+              sendSubscriptionPauseEmail({
+                to: order.contact_email || order.email,
+                name: order.contact_name || order.customer_name,
+                orderId: order.id,
+                subscriptionId: rzpSubscriptionId,
+              }),
+          }).catch((error) =>
+            console.error("[WEBHOOK] Subscription pause email failed", {
+              orderId: order.id,
+              message: error?.message || String(error),
+            }),
+          );
+        }
       }
       break;
     }
@@ -2955,21 +3101,39 @@ export const handleWebhook = async (req, res) => {
               timeZone: "Asia/Kolkata",
             })
           : null;
-        await query(
+        const resumeUpdate = await query(
           `UPDATE orders SET
              subscription_status = 'active',
              next_billing_date = COALESCE(?, next_billing_date),
              updated_at = NOW()
-           WHERE id = ?`,
+           WHERE id = ? AND COALESCE(subscription_status, '') <> 'active'`,
           [nextBilling, order.id],
         );
-        await addHistory(
-          order.id,
-          order.subscription_status,
-          "active",
-          "Subscription resumed via webhook",
-        );
-        emitUpdate(order.id, order.order_status);
+        if (resumeUpdate.rowCount) {
+          await addHistory(
+            order.id,
+            order.subscription_status,
+            "active",
+            "Subscription resumed via webhook",
+          );
+          emitUpdate(order.id, order.order_status);
+
+          sendSubscriptionEmailOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:resumed`,
+            send: () =>
+              sendSubscriptionResumeEmail({
+                to: order.contact_email || order.email,
+                name: order.contact_name || order.customer_name,
+                orderId: order.id,
+                subscriptionId: rzpSubscriptionId,
+              }),
+          }).catch((error) =>
+            console.error("[WEBHOOK] Subscription resume email failed", {
+              orderId: order.id,
+              message: error?.message || String(error),
+            }),
+          );
+        }
       }
       break;
     }
@@ -2977,21 +3141,40 @@ export const handleWebhook = async (req, res) => {
     case "subscription.halted": {
       const order = await loadBySubscription();
       if (order) {
-        await query(
+        const haltedUpdate = await query(
           `UPDATE orders SET
              subscription_status = 'halted',
              payment_status = 'failed',
              updated_at = NOW()
-           WHERE id = ?`,
+           WHERE id = ? AND COALESCE(subscription_status, '') <> 'halted'`,
           [order.id],
         );
-        await addHistory(
-          order.id,
-          order.subscription_status,
-          "halted",
-          "Subscription halted via webhook (payment failures)",
-        );
-        emitUpdate(order.id, "halted");
+        if (haltedUpdate.rowCount) {
+          await addHistory(
+            order.id,
+            order.subscription_status,
+            "halted",
+            "Subscription halted via webhook (payment failures)",
+          );
+          emitUpdate(order.id, "halted");
+
+          sendSubscriptionEmailOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:halted`,
+            send: () =>
+              sendSubscriptionHaltedEmail({
+                to: order.contact_email || order.email,
+                name: order.contact_name || order.customer_name,
+                orderId: order.id,
+                subscriptionId: rzpSubscriptionId,
+                notes: "Subscription halted after repeated payment failures",
+              }),
+          }).catch((error) =>
+            console.error("[WEBHOOK] Subscription halted email failed", {
+              orderId: order.id,
+              message: error?.message || String(error),
+            }),
+          );
+        }
       }
       break;
     }
@@ -2999,15 +3182,15 @@ export const handleWebhook = async (req, res) => {
     case "subscription.cancelled": {
       const order = await loadBySubscription();
       if (order) {
-        if (order.subscription_status !== "cancelled") {
-          await query(
-            `UPDATE orders SET
-               subscription_status = 'cancelled',
-               next_billing_date = NULL,
-               updated_at = NOW()
-             WHERE id = ?`,
-            [order.id],
-          );
+        const cancellationUpdate = await query(
+          `UPDATE orders SET
+             subscription_status = 'cancelled',
+             next_billing_date = NULL,
+             updated_at = NOW()
+           WHERE id = ? AND COALESCE(subscription_status, '') <> 'cancelled'`,
+          [order.id],
+        );
+        if (cancellationUpdate.rowCount) {
           await addHistory(
             order.id,
             order.subscription_status,
@@ -3015,6 +3198,27 @@ export const handleWebhook = async (req, res) => {
             "Subscription cancelled via webhook",
           );
           emitUpdate(order.id, order.order_status);
+
+          if (order.subscription_status !== "cancellation_requested") {
+            sendSubscriptionEmailOnce({
+              notificationKey: `subscription:${rzpSubscriptionId}:cancelled`,
+              send: () =>
+                sendSubscriptionCancellationEmail({
+                  to: order.contact_email || order.email,
+                  name: order.contact_name || order.customer_name,
+                  orderId: order.id,
+                  subscriptionId: rzpSubscriptionId,
+                }),
+            }).catch((error) =>
+              console.error(
+                "[WEBHOOK] Subscription cancellation email failed",
+                {
+                  orderId: order.id,
+                  message: error?.message || String(error),
+                },
+              ),
+            );
+          }
         }
       }
       break;

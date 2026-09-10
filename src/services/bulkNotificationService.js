@@ -13,9 +13,14 @@
 // env var for an individual status; extend the status copy in the relevant
 // notify* function below instead.
 //
-// EMAIL: unchanged from before — still one HTML email per notification via
-// the shared transporter from services/email.js. This file intentionally
-// does not touch the email infrastructure.
+// EMAIL: still one HTML email per notification via the shared transporter
+// from services/email.js — transport/infra is unchanged. The HTML template
+// has been redesigned to the same BREE branded shell (logo header, teal
+// accent, info cards, primary/secondary buttons, dark-teal footer) used in
+// orderemailservice.js, so bulk-order emails look consistent with the rest
+// of the customer-facing emails. This file still does not touch the email
+// infrastructure itself — only the markup returned by the local template
+// helpers below.
 //
 // Deliberately thin otherwise: every send goes through the *existing*
 // generic infrastructure (shared transporter, and sendCustomWhatsAppNotification
@@ -51,6 +56,8 @@ const getFromAddress = () =>
 const getFrontendUrl = () =>
   (process.env.FRONTEND_URL || "https://breefit.in").replace(/\/$/, "");
 
+const WEBSITE_URL = "https://www.breefit.in/";
+
 /** Minimal HTML-escaping for user-supplied strings interpolated into email templates. */
 const escapeHtml = (value) =>
   String(value ?? "").replace(
@@ -72,18 +79,201 @@ const greet = (contactPerson) => escapeHtml(contactPerson || "there");
 /** Sends an email via the shared transporter, silently skipping if `to` is missing. */
 const sendEmail = async ({ to, subject, html }) => {
   if (!to) {
-    console.log("[BULK_EMAIL] Skipping — missing recipient");
+    console.error(
+      "[BULK_EMAIL] Skipping quote notification — missing recipient",
+    );
     return;
   }
   await transporter.sendMail({ from: getFromAddress(), to, subject, html });
 };
 
-const emailShell = (title, bodyHtml) => `
-  <div style="font-family:Arial,Helvetica,sans-serif;max-width:600px;margin:0 auto;color:#111827;">
-    <h2 style="color:#047857;">${title}</h2>
-    ${bodyHtml}
-    <p style="color:#6b7280;font-size:13px;margin-top:28px;">— The BREE Wellness Team</p>
-  </div>
+// ==================================================
+// BREE brand palette — matches orderemailservice.js
+// ==================================================
+const COLORS = {
+  primary: "#004B52", // dark teal
+  text: "#222222", // dark text
+  muted: "#666666", // muted text
+  bg: "#F7F8F7", // light background
+  border: "#E5E5E5",
+  white: "#FFFFFF",
+};
+
+// ==================================================
+// Reusable branded email building blocks
+// ==================================================
+
+const buildHeader = () => {
+  const logoUrl = `https://www.breefit.in/images/logo.PNG`;
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">
+      <tr>
+        <td style="padding:32px 24px 20px 24px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+            <tr>
+              <td align="center" style="width:100%;">
+                <img src="${logoUrl}" alt="BREE Wellness" width="160" style="display:block;width:160px;max-width:160px;height:auto;margin:0 auto;" />
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  `;
+};
+
+const buildIntro = ({ heading, subtext }) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center" style="padding:8px 24px 24px 24px;">
+        <h1 style="margin:0 0 16px 0;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:24px;line-height:32px;font-weight:700;text-align:center;">
+          ${heading}
+        </h1>
+        <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:22px;text-align:center;">
+          ${subtext}
+        </p>
+      </td>
+    </tr>
+  </table>
+`;
+
+/** Light-teal info card of label/value rows — same shape as orderemailservice.js's buildInfoCard. */
+const buildInfoCard = (rows = []) => {
+  const filteredRows = rows.filter((row) => row && row.value);
+  if (!filteredRows.length) return "";
+
+  const rowsHtml = filteredRows
+    .map(
+      (row) => `
+        <tr>
+          <td style="padding:10px 20px;${row === filteredRows[0] ? "" : `border-top:1px solid ${COLORS.border};`}">
+            <p style="margin:0 0 4px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:13px;font-weight:700;">${row.label}</p>
+            <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;">${row.value}</p>
+          </td>
+        </tr>
+      `,
+    )
+    .join("");
+
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px 0;background:${COLORS.bg};border-radius:8px;">
+      ${rowsHtml}
+    </table>
+  `;
+};
+
+const buildPrimaryButton = (url, label) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 12px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:500px;">
+          <tr>
+            <td align="center" bgcolor="${COLORS.primary}" style="border-radius:6px;">
+              <a href="${url}" target="_blank" style="display:block;padding:16px 24px;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;text-decoration:none;text-align:center;letter-spacing:0.3px;">
+                ${label} &nbsp;&rarr;
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildSecondaryButton = (url, label) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 20px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;max-width:500px;">
+          <tr>
+            <td align="center" bgcolor="${COLORS.white}" style="border-radius:6px;border:2px solid ${COLORS.primary};">
+              <a href="${url}" target="_blank" style="display:block;padding:14px 24px;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:700;text-decoration:none;text-align:center;letter-spacing:0.3px;">
+                ${label} &nbsp;&#8599;
+              </a>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildSupportingText = (text) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center" style="padding:0 24px 24px 24px;">
+        <p style="margin:0;color:${COLORS.muted};font-family:Arial,Helvetica,sans-serif;font-size:13px;line-height:20px;text-align:center;">
+          ${text}
+        </p>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildSignOff = (message) => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td style="padding:0 24px;">
+        <hr style="border:none;border-top:1px solid ${COLORS.border};margin:0 0 24px 0;" />
+      </td>
+    </tr>
+    <tr>
+      <td align="center" style="padding:0 24px 32px 24px;">
+        <p style="margin:0 0 12px 0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;text-align:center;">${message}</p>
+        <p style="margin:0 0 6px 0;color:${COLORS.primary};font-family:Arial,Helvetica,sans-serif;font-size:18px;text-align:center;">&#9825;</p>
+        <p style="margin:0;color:${COLORS.text};font-family:Arial,Helvetica,sans-serif;font-size:14px;font-weight:700;text-align:center;">Team BREE</p>
+      </td>
+    </tr>
+  </table>
+`;
+
+const buildFooter = () => `
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.primary};">
+    <tr>
+      <td align="center" style="padding:32px 24px;">
+        <p style="margin:0 0 4px 0;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:20px;font-weight:700;letter-spacing:2px;">BREE</p>
+        <p style="margin:0 0 16px 0;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:11px;letter-spacing:2px;">WELLNESS</p>
+        <p style="margin:0;color:${COLORS.white};font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:18px;opacity:0.85;">
+          © ${new Date().getFullYear()} BREE Wellness.<br/>All rights reserved.
+        </p>
+      </td>
+    </tr>
+  </table>
+`;
+
+/**
+ * Wraps arbitrary body content in the shared BREE branded shell:
+ * white container, logo header, body content, footer. Mirrors
+ * buildBrandedEmail() in orderemailservice.js so bulk-order emails match
+ * the rest of the redesigned email suite.
+ */
+const buildBrandedEmail = ({ content, preheader }) => `
+  <!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>BREE Wellness</title>
+    </head>
+    <body style="margin:0;padding:0;background:${COLORS.bg};">
+      ${preheader ? `<div style="display:none;max-height:0;overflow:hidden;opacity:0;">${preheader}</div>` : ""}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.bg};padding:24px 0;">
+        <tr>
+          <td align="center">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:${COLORS.white};border-radius:10px;overflow:hidden;">
+              <tr>
+                <td>
+                  ${buildHeader()}
+                  ${content}
+                  ${buildFooter()}
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+  </html>
 `;
 
 /**
@@ -152,15 +342,30 @@ export const notifyBulkEnquirySubmitted = async ({
   companyName,
 }) => {
   try {
+    const content = `
+      ${buildIntro({
+        heading: `Hi ${greet(contactPerson)}, thanks for reaching out!`,
+        subtext: `We've received your bulk order enquiry${
+          companyName ? ` for <strong>${escapeHtml(companyName)}</strong>` : ""
+        }. Our team will review it and share a quotation shortly.`,
+      })}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td style="padding:0 24px;">
+            ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+          </td>
+        </tr>
+      </table>
+      ${buildSignOff("Thanks for considering BREE Wellness for your bulk order.")}
+    `;
+
     await sendEmail({
       to: email,
       subject: "We received your Bulk Order enquiry — BREE Wellness",
-      html: emailShell(
-        `Hi ${greet(contactPerson)}, thanks for reaching out!`,
-        `<p>We've received your bulk order enquiry${
-          companyName ? ` for <strong>${escapeHtml(companyName)}</strong>` : ""
-        }. Our team will review it and share a quotation shortly.</p>`,
-      ),
+      html: buildBrandedEmail({
+        content,
+        preheader: "We've received your BREE Wellness bulk order enquiry.",
+      }),
     });
   } catch (err) {
     console.error("[BULK_NOTIFY] enquiry-submitted email failed", err?.message);
@@ -212,15 +417,37 @@ export const notifyQuoteReady = async ({
   const quoteLink = `${getFrontendUrl()}/bulk-order/${bookingId}`;
 
   try {
+    const content = `
+      ${buildIntro({
+        heading: `Hi ${greet(contactPerson)}, your quote is ready!`,
+        subtext:
+          "Review the details below and approve your quote whenever you're ready.",
+      })}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td style="padding:0 24px;">
+            ${buildInfoCard([
+              { label: "Quote Amount", value: formatINR(quotePrice) },
+              { label: "Estimated Delivery", value: escapeHtml(deliveryDate) },
+            ])}
+            ${buildPrimaryButton(quoteLink, "REVIEW YOUR QUOTE")}
+            ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+            ${buildSupportingText(
+              "Approve your quote on the review page above — payment happens there via secure checkout.",
+            )}
+          </td>
+        </tr>
+      </table>
+      ${buildSignOff("Thanks for choosing BREE Wellness.")}
+    `;
+
     await sendEmail({
       to: email,
       subject: "Your Bulk Order quote is ready — BREE Wellness",
-      html: emailShell(
-        `Hi ${greet(contactPerson)}, your quote is ready!`,
-        `<p>Quote amount: <strong>${formatINR(quotePrice)}</strong></p>
-         <p>Estimated delivery: <strong>${escapeHtml(deliveryDate)}</strong></p>
-         <p>Review and approve your quote here: <a href="${quoteLink}">${quoteLink}</a></p>`,
-      ),
+      html: buildBrandedEmail({
+        content,
+        preheader: "Your BREE Wellness bulk order quote is ready to review.",
+      }),
     });
     console.log(`[BULK] Quote email SUCCESS | bookingId=${bookingId}`);
   } catch (err) {
@@ -261,15 +488,34 @@ export const notifyBulkOrderConfirmation = async ({
   quotePrice,
 }) => {
   try {
+    const content = `
+      ${buildIntro({
+        heading: `Hi ${greet(contactPerson)}, your bulk order is confirmed!`,
+        subtext: "Our team will begin processing your order shortly.",
+      })}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td style="padding:0 24px;">
+            ${buildInfoCard([
+              { label: "Order Number", value: escapeHtml(orderNumber || "-") },
+              quotePrice
+                ? { label: "Amount", value: formatINR(quotePrice) }
+                : null,
+            ])}
+            ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+          </td>
+        </tr>
+      </table>
+      ${buildSignOff("Thanks for choosing BREE Wellness.")}
+    `;
+
     await sendEmail({
       to: email,
       subject: "Your Bulk Order is confirmed — BREE Wellness",
-      html: emailShell(
-        `Hi ${greet(contactPerson)}, your bulk order is confirmed!`,
-        `<p>Order Number: <strong>${escapeHtml(orderNumber || "-")}</strong></p>
-         ${quotePrice ? `<p>Amount: <strong>${formatINR(quotePrice)}</strong></p>` : ""}
-         <p>Our team will begin processing your order shortly.</p>`,
-      ),
+      html: buildBrandedEmail({
+        content,
+        preheader: "Your BREE Wellness bulk order is confirmed.",
+      }),
     });
   } catch (err) {
     console.error(
@@ -302,14 +548,32 @@ export const notifyBulkDispatch = async ({
   orderNumber,
 }) => {
   try {
+    const content = `
+      ${buildIntro({
+        heading: `Hi ${greet(contactPerson)}, your order is on its way!`,
+        subtext:
+          "Your bulk order has been dispatched and is on its way to you.",
+      })}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td style="padding:0 24px;">
+            ${buildInfoCard([
+              { label: "Order Number", value: escapeHtml(orderNumber || "-") },
+            ])}
+            ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
+          </td>
+        </tr>
+      </table>
+      ${buildSignOff("Thanks for choosing BREE Wellness.")}
+    `;
+
     await sendEmail({
       to: email,
       subject: "Your Bulk Order has been dispatched — BREE Wellness",
-      html: emailShell(
-        `Hi ${greet(contactPerson)}, your order is on its way!`,
-        `<p>Order Number: <strong>${escapeHtml(orderNumber || "-")}</strong></p>
-         <p>Your bulk order has been dispatched and is on its way to you.</p>`,
-      ),
+      html: buildBrandedEmail({
+        content,
+        preheader: "Your BREE Wellness bulk order has been dispatched.",
+      }),
     });
   } catch (err) {
     console.error("[BULK_NOTIFY] dispatch email failed", err?.message);

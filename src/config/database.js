@@ -251,6 +251,69 @@ const ensureRenewalOrderColumns = async () => {
   }
 };
 
+const ensureSubscriptionEmailNotificationSchema = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS subscription_email_notifications (
+        notification_key VARCHAR(255) PRIMARY KEY,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        attempts INT NOT NULL DEFAULT 0,
+        last_attempt_at DATETIME NULL,
+        sent_at DATETIME NULL,
+        last_error VARCHAR(1000) NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) {
+      throw new Error(
+        "Cannot verify the orders database for payment uniqueness",
+      );
+    }
+
+    const [duplicatePayments] = await pool.query(
+      `SELECT razorpay_payment_id
+       FROM orders
+       WHERE razorpay_payment_id IS NOT NULL
+       GROUP BY razorpay_payment_id
+       HAVING COUNT(*) > 1
+       LIMIT 1`,
+    );
+
+    if (duplicatePayments.length) {
+      throw new Error(
+        "Duplicate non-null orders.razorpay_payment_id values exist; resolve legacy duplicates before starting with renewal idempotency enabled",
+      );
+    }
+
+    const [uniqueIndexes] = await pool.query(
+      `SELECT DISTINCT index_name
+       FROM information_schema.statistics
+       WHERE table_schema = ?
+         AND table_name = 'orders'
+         AND column_name = 'razorpay_payment_id'
+         AND non_unique = 0`,
+      [currentDb],
+    );
+
+    if (!uniqueIndexes.length) {
+      await pool.query(
+        `ALTER TABLE orders
+         ADD UNIQUE INDEX uq_orders_razorpay_payment_id (razorpay_payment_id)`,
+      );
+    }
+  } catch (err) {
+    console.error(
+      "CRITICAL: Could not ensure subscription email notification schema:",
+      err?.message || String(err),
+    );
+    throw err;
+  }
+};
+
 // FIX: ensure the orders table has the shipping / totals columns expected by
 // the checkout and order APIs. This keeps older databases functional without
 // requiring a manual SQL migration for each local environment.
@@ -1337,6 +1400,7 @@ const ensurePackageNumberSchema = async () => {
 // the remaining migrations still execute instead of the whole chain aborting.
 await ensureOrderNumberSchema().catch(console.error);
 await ensureRenewalOrderColumns().catch(console.error);
+await ensureSubscriptionEmailNotificationSchema();
 await ensureOrderShippingColumns().catch(console.error);
 await ensureDailyReminderPhoneColumns().catch(console.error);
 await ensureBulkBookingWorkflowColumns().catch(console.error);
