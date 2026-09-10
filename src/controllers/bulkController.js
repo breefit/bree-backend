@@ -13,6 +13,8 @@ import {
 import {
   notifyBulkEnquirySubmitted,
   notifyQuoteReady,
+  notifyBulkOrderInProgress,
+  isBulkOrderInProgressTransition,
   notifyBulkOrderConfirmation,
   notifyBulkDispatch,
 } from "../services/bulkNotificationService.js";
@@ -969,6 +971,10 @@ export const updateBulkBooking = async (req, res) => {
     params.push(id);
 
     let shouldNotifyQuote = false;
+    const shouldNotifyInProgress = isBulkOrderInProgressTransition(
+      existing.status,
+      status,
+    );
     try {
       const quoteChangeWhere = `
         id = ? AND (
@@ -1032,6 +1038,23 @@ export const updateBulkBooking = async (req, res) => {
 
     // Fetch updated booking
     const updated = await findBulkBookingWithHistory(id);
+
+    if (shouldNotifyInProgress) {
+      notifyBulkOrderInProgress({
+        email: updated.contact_email || updated.email,
+        mobileNumber: updated.contact_phone || updated.mobile_number,
+        contactPerson:
+          updated.contact_person || updated.contact_name || "Customer",
+        bookingId: id,
+        bookingNumber: updated.bulk_booking_number,
+        deliveryDate: updated.delivery_date,
+      }).catch((err) =>
+        console.error("[BULK] In Progress notification FAILED (unexpected)", {
+          bulkBookingId: id,
+          error: err?.message,
+        }),
+      );
+    }
 
     if (isSharingQuote) {
       if (shouldNotifyQuote) {

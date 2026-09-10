@@ -53,10 +53,13 @@ const getFromAddress = () =>
   process.env.SMTP_USER ||
   "BREE Wellness <no-reply@breewellness.com>";
 
-const getFrontendUrl = () =>
-  (process.env.FRONTEND_URL || "https://breefit.in").replace(/\/$/, "");
-
 const WEBSITE_URL = "https://www.breefit.in/";
+
+export const buildBulkOrderQuoteReviewUrl = (bulkOrderId) =>
+  `https://www.breefit.in/bulk-order/${bulkOrderId}/`;
+
+export const isBulkOrderInProgressTransition = (previousStatus, nextStatus) =>
+  previousStatus === "new" && nextStatus === "in_progress";
 
 /** Minimal HTML-escaping for user-supplied strings interpolated into email templates. */
 const escapeHtml = (value) =>
@@ -382,19 +385,77 @@ export const notifyBulkEnquirySubmitted = async ({
 };
 
 /**
- * IN_PROGRESS — "Under Review": sent when a booking moves from New to
- * In Progress, i.e. admin has started working the enquiry but no quote
- * exists yet. WhatsApp-only — there's no dedicated email for this
- * intermediate state.
+ * IN_PROGRESS — sent once when a booking moves from New to In Progress.
+ * The customer can use the same quote review URL when a quote is available.
  */
-export const notifyBulkInProgress = async ({ mobileNumber, contactPerson }) => {
-  await notifyBulkStatusUpdate({
+export const notifyBulkOrderInProgress = async ({
+  email,
+  mobileNumber,
+  contactPerson,
+  bookingId,
+  bookingNumber,
+  deliveryDate,
+}) => {
+  const bulkOrderReference = bookingNumber || bookingId;
+  const quoteReviewUrl = buildBulkOrderQuoteReviewUrl(bookingId);
+
+  try {
+    const content = `
+      ${buildIntro({
+        heading: `Hi ${greet(contactPerson)}, your bulk order is now in progress!`,
+        subtext:
+          "Our team has started reviewing your bulk order requirements and will prepare your quotation shortly.",
+      })}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td style="padding:0 24px;">
+            ${buildInfoCard([
+              {
+                label: "Bulk Order Reference",
+                value: escapeHtml(bulkOrderReference),
+              },
+              { label: "Status", value: "In Progress" },
+              deliveryDate
+                ? { label: "Delivery Date", value: escapeHtml(deliveryDate) }
+                : null,
+            ])}
+            ${buildPrimaryButton(quoteReviewUrl, "VIEW YOUR BULK ORDER")}
+          </td>
+        </tr>
+      </table>
+      ${buildSignOff("Thanks for choosing BREE Wellness.")}
+    `;
+
+    await sendEmail({
+      to: email,
+      subject: "Your Bulk Order is now in progress — BREE Wellness",
+      html: buildBrandedEmail({
+        content,
+        preheader: "Your BREE Wellness bulk order is now in progress.",
+      }),
+    });
+    console.log(`[BULK] In Progress email SUCCESS | bookingId=${bookingId}`);
+  } catch (err) {
+    console.error(
+      `[BULK] In Progress email FAILED | bookingId=${bookingId} | ${err?.message}`,
+    );
+  }
+
+  const whatsappResult = await notifyBulkStatusUpdate({
     mobileNumber,
     contactPerson,
-    status: "Under Review",
-    message:
-      "Our team is currently reviewing your bulk order requirements and preparing your quotation.",
+    status: "In Progress",
+    message: `Bulk order ${bulkOrderReference} is now In Progress${deliveryDate ? `. Delivery date: ${deliveryDate}.` : "."}`,
+    details: quoteReviewUrl,
   });
+
+  if (whatsappResult?.success) {
+    console.log(`[BULK] In Progress WhatsApp SUCCESS | bookingId=${bookingId}`);
+  } else {
+    console.error(
+      `[BULK] In Progress WhatsApp FAILED | bookingId=${bookingId} | ${whatsappResult?.error?.message || "unknown error"}`,
+    );
+  }
 };
 
 /**
@@ -414,7 +475,7 @@ export const notifyQuoteReady = async ({
 }) => {
   console.log(`[BULK] Quote notification START | bookingId=${bookingId}`);
 
-  const quoteLink = `${getFrontendUrl()}/bulk-order/${bookingId}`;
+  const quoteReviewUrl = buildBulkOrderQuoteReviewUrl(bookingId);
 
   try {
     const content = `
@@ -430,7 +491,7 @@ export const notifyQuoteReady = async ({
               { label: "Quote Amount", value: formatINR(quotePrice) },
               { label: "Estimated Delivery", value: escapeHtml(deliveryDate) },
             ])}
-            ${buildPrimaryButton(quoteLink, "REVIEW YOUR QUOTE")}
+            ${buildPrimaryButton(quoteReviewUrl, "REVIEW YOUR QUOTE")}
             ${buildSecondaryButton(WEBSITE_URL, "VISIT WEBSITE")}
             ${buildSupportingText(
               "Approve your quote on the review page above — payment happens there via secure checkout.",
@@ -461,7 +522,7 @@ export const notifyQuoteReady = async ({
     contactPerson,
     status: "Quote Ready",
     message: `Quote amount: ${formatINR(quotePrice)}. Estimated delivery: ${deliveryDate}.`,
-    details: quoteLink,
+    details: quoteReviewUrl,
   });
 
   if (whatsappResult?.success) {
