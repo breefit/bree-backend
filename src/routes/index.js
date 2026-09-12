@@ -10,6 +10,7 @@ import {
   getOrder,
   getOrderSuccess,
   getOrderTracking,
+  getOrderLiveTracking,
   getOrderHistory,
   createOrder as createOrderCheckout,
   updatePaymentStatus,
@@ -62,7 +63,23 @@ productRouter.get("/:id", getProduct);
 // ── Orders & Checkout (authenticated) ─────────────────────────────────────────
 export const orderRouter = Router();
 // Tracking and history endpoints must come before generic /:id route to avoid route conflicts
-orderRouter.get("/:id/tracking", auth, getOrderTracking);
+// FIX (public tracking): the customer tracking page (/order/:id/tracking) must
+// load for LOGGED-OUT users — the tracking link in shipping emails is opened
+// in incognito/new browsers where no session exists. The page previously
+// fired this request with `auth`, got a hard 401, and the axios 401 handler
+// classified it as session expiry → /api/auth/verify refresh → auth:expired
+// → 429 storms. Switched to optionalAuth, exactly like GET /:id below: the
+// SQL's `user_id = ? OR user_id IS NULL` clause is unchanged, so orders that
+// belong to a real user are still only visible WITH that user's valid
+// session — only guest orders (user_id IS NULL) and the requester's own
+// orders resolve. No auth bypass for private data.
+orderRouter.get("/:id/tracking", optionalAuth, getOrderTracking);
+// FIX (public tracking): lightweight DB-snapshot live-tracking poll endpoint.
+// Returns tracking_status/current_location/etc. straight from the orders row
+// (kept fresh by the Delhivery tracking cron) instead of the admin-only
+// /api/shipping/track/:awb (adminAuth) that the page used to poll every 30s —
+// for a logged-out customer that endpoint 401'd on every poll.
+orderRouter.get("/:id/live-tracking", optionalAuth, getOrderLiveTracking);
 orderRouter.get("/:id/history", auth, getOrderHistory);
 orderRouter.get("/", auth, getMyOrders);
 orderRouter.get("/:id/success", auth, getOrderSuccess);

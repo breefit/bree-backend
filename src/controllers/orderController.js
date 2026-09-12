@@ -1214,7 +1214,12 @@ export const updatePaymentStatus = async (req, res) => {
  */
 export const getOrderTracking = async (req, res) => {
   try {
-    const userId = req.user?.id;
+    // FIX (public tracking): route uses optionalAuth, so req.user is
+    // undefined for logged-out customers opening an emailed tracking link.
+    // Coerce to null — same pattern as getOrder above — so mysql2 accepts the
+    // bind param and the `user_id = ? OR user_id IS NULL` clause resolves
+    // guest orders for everyone and real-user orders only for their owner.
+    const userId = req.user?.id || null;
     const { id } = req.params;
 
     if (!validateOrderId(id)) {
@@ -1341,5 +1346,127 @@ export const getOrderTracking = async (req, res) => {
       error: error?.message,
     });
     sendError(res, 500, "Failed to fetch tracking info");
+  }
+};
+
+// ==========================================================================
+// GET ORDER LIVE TRACKING (public tracking page poll endpoint)
+// ==========================================================================
+
+/** Maps an order_status value onto the customer timeline steps used by the
+ * tracking page (OrderTracking.js CUSTOMER_TIMELINE). Anything outside the
+ * known lifecycle maps to null so the frontend falls back to its own
+ * history-derived status instead of inventing a fake position. */
+const ORDER_STATUS_TO_TIMELINE = {
+  pending_payment: "pending_payment",
+  pending: "pending_payment",
+  paid: "paid",
+  processing: "processing",
+  ready_to_ship: "ready_to_ship",
+  shipped: "shipped",
+  out_for_delivery: "out_for_delivery",
+  delivered: "delivered",
+  cancelled: "cancelled",
+  returned: "returned",
+  rto: "returned",
+};
+
+/**
+ * Lightweight live-tracking snapshot for the public tracking page.
+ *
+ * Reads the courier-synced fields straight from the `orders` row — the same
+ * columns the Delhivery tracking cron (shippingTrackingCron.js) and the
+ * admin trackShipment() endpoint keep updated every 30 minutes / on demand —
+ * so NO Delhivery API call and NO DB write happens here.
+ *
+ * This exists because the page previously polled the admin-only
+ * GET /api/shipping/track/:awb (adminAuth), which returned 401 for every
+ * logged-out customer on every poll.
+ *
+ * @route GET /api/orders/:id/live-tracking (optionalAuth)
+ * @returns {Promise<void>} JSON: { success, liveTracking }
+ */
+export const getOrderLiveTracking = async (req, res) => {
+  try {
+    const userId = req.user?.id || null;
+    const { id } = req.params;
+
+    if (!validateOrderId(id)) {
+      return sendError(res, 400, ERROR_MESSAGES.INVALID_ORDER_ID);
+    }
+
+    // current_location / expected_delivery have no corresponding columns in
+    // the current schema — shippingController.trackShipment() and the Delhivery
+    // tracking cron both gate those fields behind column introspection, and
+    // this endpoint must do the same or every poll would 500 with
+    // "Unknown column". courier_name / shipment_created_at ARE guaranteed
+    // (config/database.js ensureOrderShippingColumns adds them at boot).
+    const schemaInfo = await getOrderSchemaInfo();
+    const optionalColumns = [
+      schemaInfo.orders.has("current_location") ? "current_location" : null,
+      schemaInfo.orders.has("expected_delivery") ? "expected_delivery" : null,
+      schemaInfo.orders.has("expected_delivery_date")
+        ? "expected_delivery_date"
+        : null,
+    ].filter(Boolean);
+
+    const { rows } = await query(
+      `SELECT id, order_status, tracking_status, courier_name, awb_number,
+              tracking_url${optionalColumns.length ? `, ${optionalColumns.join(", ")}` : ""},
+              shipment_created_at, updated_at
+       FROM orders
+       WHERE id = ? AND (user_id = ? OR user_id IS NULL)
+       LIMIT 1`,
+      [id, userId],
+    );
+
+    // Same visibility contract as getOrderTracking: unknown/foreign orders
+    // are indistinguishable from missing ones.
+    if (!rows.length) {
+      return sendError(res, 404, ERROR_MESSAGES.ORDER_NOT_FOUND);
+    }
+
+    const order = rows[0];
+
+    // A poll is only useful while the parcel can still move; the frontend
+    // stops its polling timer for terminal statuses too, this is just the
+    // backend half of the same contract.
+    const normalizedStatus = String(order.order_status || "")
+      .trim()
+      .toLowerCase();
+    const terminalStatuses = [
+      "delivered",
+      "cancelled",
+      "returned",
+      "rto",
+      "damaged",
+      "lost",
+      "undelivered",
+    ];
+    const isTerminal = terminalStatuses.includes(normalizedStatus);
+
+    sendJson(res, 200, {
+      success: true,
+      liveTracking: {
+        orderStatus: order.order_status || null,
+        timelineStatus: ORDER_STATUS_TO_TIMELINE[normalizedStatus] || null,
+        trackingStatus: order.tracking_status || null,
+        currentLocation: order.current_location || null,
+        expectedDelivery:
+          order.expected_delivery || order.expected_delivery_date || null,
+        courierName: order.courier_name || "Delhivery",
+        awbNumber: order.awb_number || null,
+        trackingUrl: order.tracking_url || null,
+        shipmentCreatedAt: order.shipment_created_at || null,
+        lastUpdate: order.updated_at || null,
+        isTerminal,
+      },
+    });
+  } catch (error) {
+    log("error", "order.get_live_tracking_failed", {
+      orderId: req.params?.id,
+      error: error?.message,
+    });
+    sendError(res, 500, "Failed to fetch live tracking info");
   }
 };
