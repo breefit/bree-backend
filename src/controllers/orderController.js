@@ -1227,12 +1227,22 @@ export const updatePaymentStatus = async (req, res) => {
  */
 export const getOrderTracking = async (req, res) => {
   try {
-    // FIX (public tracking): route uses optionalAuth, so req.user is
-    // undefined for logged-out customers opening an emailed tracking link.
-    // Coerce to null — same pattern as getOrder above — so mysql2 accepts the
-    // bind param and the `user_id = ? OR user_id IS NULL` clause resolves
-    // guest orders for everyone and real-user orders only for their owner.
-    const userId = req.user?.id || null;
+    // FIX (genuinely public tracking): this page is meant to work from a
+    // WhatsApp/email link with no session at all — but the query used to
+    // additionally require the row's owner column to equal the caller's
+    // id, or else be null. For a logged-out visitor, the caller's id is
+    // null, so that clause only ever matched TRUE guest-checkout orders
+    // (owner column null). Any order
+    // placed while logged in — i.e. almost every real order — has a real
+    // user_id, so a logged-out visitor (including the account owner
+    // themselves, opening their own tracking link on a device where
+    // they're not signed in) got zero rows back and a false "Order not
+    // found". validateOrderId() below already requires a well-formed,
+    // unguessable UUID — same access model as any courier's public
+    // track-by-AWB page — so the id itself is the credential; no
+    // ownership check belongs here at all. getOrder() (the authenticated
+    // "My Orders" detail view) intentionally keeps its ownership check —
+    // only this public endpoint's query changes.
     const { id } = req.params;
 
     if (!validateOrderId(id)) {
@@ -1268,7 +1278,7 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN user_addresses ua ON ua.id = o.address_id AND ua.user_id = o.user_id
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
          LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
-         WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`
+         WHERE o.id = ?`
       : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
@@ -1294,9 +1304,9 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN user_addresses ua ON ua.id = o.address_id AND ua.user_id = o.user_id
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
          LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
-         WHERE o.id = ? AND (o.user_id = ? OR o.user_id IS NULL)`;
+         WHERE o.id = ?`;
 
-    const { rows: orderRows } = await query(orderQuery, [id, userId]);
+    const { rows: orderRows } = await query(orderQuery, [id]);
 
     if (!orderRows.length) {
       return sendError(res, 404, ERROR_MESSAGES.ORDER_NOT_FOUND);
@@ -1415,7 +1425,10 @@ const ORDER_STATUS_TO_TIMELINE = {
  */
 export const getOrderLiveTracking = async (req, res) => {
   try {
-    const userId = req.user?.id || null;
+    // Same fix as getOrderTracking() above — this poll endpoint must use
+    // the same visibility contract, otherwise a logged-out visitor would
+    // load the initial tracking view successfully and then have live
+    // status polling 404 a few seconds later.
     const { id } = req.params;
 
     if (!validateOrderId(id)) {
@@ -1442,9 +1455,9 @@ export const getOrderLiveTracking = async (req, res) => {
               tracking_url${optionalColumns.length ? `, ${optionalColumns.join(", ")}` : ""},
               shipment_created_at, updated_at
        FROM orders
-       WHERE id = ? AND (user_id = ? OR user_id IS NULL)
+       WHERE id = ?
        LIMIT 1`,
-      [id, userId],
+      [id],
     );
 
     // Same visibility contract as getOrderTracking: unknown/foreign orders
