@@ -84,12 +84,16 @@ const getEligibleReminders = async (today) => {
       dr.reminder_start_date,
       dr.reminder_end_date,
       dr.reminder_whatsapp_number,
-      u.name AS customer_name,
-      u.phone AS customer_phone,
+      COALESCE(u.name, o.contact_name, o.customer_name, 'BREE Customer') AS customer_name,
+      COALESCE(u.phone, o.contact_phone, o.mobile_number) AS customer_phone,
       drs.id AS send_record_id
     FROM daily_reminders dr
-    INNER JOIN users u ON dr.user_id = u.id
-    LEFT JOIN daily_reminder_sends drs ON dr.id = drs.reminder_id AND drs.send_date = ?
+    LEFT JOIN users u ON dr.user_id = u.id
+    INNER JOIN orders o ON dr.order_id = o.id
+    LEFT JOIN daily_reminder_sends drs
+      ON dr.id = drs.reminder_id
+      AND drs.send_date = ?
+      AND drs.status = 'success'
     WHERE
       dr.reminder_enabled = 1
       AND dr.status = 'active'
@@ -124,6 +128,11 @@ const recordReminderSend = async (
       INSERT INTO daily_reminder_sends
       (id, reminder_id, send_date, status, waplify_message_id)
       VALUES (?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE
+        status = VALUES(status),
+        waplify_message_id = VALUES(waplify_message_id),
+        error_message = NULL,
+        sent_at = CURRENT_TIMESTAMP
       `,
       [recordId, reminderId, sendDate, status, waplifyMessageId],
     );
@@ -209,9 +218,24 @@ export const runDailyReminderScheduler = async () => {
 
       const sendMobile = reminder_whatsapp_number || customer_phone;
 
+      if (!sendMobile) {
+        skipped++;
+        console.warn(
+          `[Reminder Scheduler] Skipping reminder ${reminderId} for order ${reminder.order_id}: no WhatsApp number`,
+        );
+        continue;
+      }
+
+      console.info(
+        `[Reminder Scheduler] Eligible reminder ${reminderId} for order ${reminder.order_id} | enabled=${Boolean(reminder.reminder_enabled)} | window=${reminder_start_date}..${reminder_end_date} | scheduled=${reminder_time} | current=${currentTime}`,
+      );
+
       // Check if current time is within tolerance of scheduled time
       if (!isWithinReminderTimeWindow(reminder_time, currentTime)) {
         skipped++;
+        console.info(
+          `[Reminder Scheduler] Skipping reminder ${reminderId} for order ${reminder.order_id}: outside time window`,
+        );
         continue;
       }
 

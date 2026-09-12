@@ -407,7 +407,8 @@ export const getOrder = async (req, res) => {
 
   // Fetch daily reminders if they exist for this order
   const { rows: reminderRows } = await query(
-    `SELECT id, product_id, reminder_time, reminder_enabled, status, reminder_start_date, reminder_end_date
+    `SELECT id, product_id, reminder_time, reminder_enabled, status,
+            reminder_price_paid, reminder_start_date, reminder_end_date
      FROM daily_reminders
      WHERE order_id = ?
      ORDER BY created_at ASC`,
