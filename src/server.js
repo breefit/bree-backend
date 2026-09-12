@@ -9,6 +9,7 @@ import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
 import { runDailyReminderScheduler } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 import { getSafeRazorpayConfig } from "./config/razorpay.js";
+import { validateWhatsAppConfiguration } from "./services/whatsappNotificationService.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,6 +36,27 @@ console.info("[RAZORPAY] runtime configuration", {
   dotenvLoaded: Boolean(dotenvResult.parsed),
   ...getSafeRazorpayConfig(),
 });
+
+// FIX (Shipped/OFD/Delivered WhatsApp investigation): validateWhatsAppConfiguration()
+// already existed (checks WAPLIFY_BASE_URL, WAPLIFY_API_KEY, and every
+// WAPLIFY_TEMPLATE_* env var, including WAPLIFY_TEMPLATE_ORDER_STATUS — the
+// exact template order-status WhatsApp notifications use) but was never
+// called anywhere. A missing/misconfigured template previously failed
+// silently at the first real send attempt, deep inside a try/catch, with
+// no way to tell "misconfigured" apart from "provider outage" from the
+// logs alone. Non-fatal by design — a WhatsApp config problem must never
+// stop the API/payment/tracking server from starting.
+try {
+  validateWhatsAppConfiguration();
+  console.info("[WAPLIFY] runtime configuration OK", {
+    nodeEnv: process.env.NODE_ENV || "development",
+  });
+} catch (waplifyConfigError) {
+  console.error(
+    "[WAPLIFY] runtime configuration INVALID — WhatsApp sends will fail until this is fixed:",
+    waplifyConfigError?.message || waplifyConfigError,
+  );
+}
 
 // console.log("STEP 1 - Server file loaded");
 // console.log("STEP 4 - Environment variables loaded");

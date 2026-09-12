@@ -36,9 +36,25 @@ const getFrontendUrl = () => {
 };
 
 const sendEmail = async ({ to, subject, html }) => {
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS || !to) {
-    console.log("[EMAIL] Skipping — SMTP not configured or missing recipient");
+  // No recipient on file is a data condition, not a system failure — every
+  // caller of the higher-level senders (sendOutForDeliveryEmail etc.)
+  // already skips calling this at all when there's no email, so this is
+  // just a defensive no-op, same as before.
+  if (!to) {
+    console.log("[EMAIL] Skipping — no recipient address");
     return;
+  }
+
+  // FIX (notification marked "sent" before the provider actually
+  // succeeded): missing SMTP credentials used to hit this same silent
+  // `return` as "no recipient" above — every caller (including
+  // sendOrderStatusNotificationOnce, which resolves its `send` callback
+  // normally and marks the row 'sent') then treated the email as
+  // successfully delivered when nothing was ever sent. This is a genuine
+  // system misconfiguration, not a data condition, so it must throw and
+  // be recorded as 'failed' like any other provider error.
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    throw new Error("SMTP_USER/SMTP_PASS not configured");
   }
 
   await createTransporter().sendMail({

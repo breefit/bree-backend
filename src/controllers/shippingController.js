@@ -11,6 +11,11 @@ import { buildDelhiveryShipmentPayload } from "../utils/delhiveryPayload.js";
 import { appendStatusHistory } from "../models/Order.js";
 import { ORDER_STATUSES } from "../constants/orderStatus.js";
 import { sendOrderStatusUpdateWhatsApp } from "../services/whatsappNotificationService.js";
+import {
+  sendOrderStatusNotificationOnce,
+  buildOrderStatusNotificationKey,
+  logNotification,
+} from "../services/orderStatusNotificationService.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Get warehouse configuration from environment variables
@@ -1148,7 +1153,8 @@ export const createShipment = async (req, res) => {
     const { rows: updatedOrderRows } = await client.query(
       `SELECT id, order_number, order_status, tracking_status,
               awb_number, tracking_number, tracking_url,
-              contact_name, contact_email
+              contact_name, contact_email, customer_name, email,
+              contact_phone, mobile_number
        FROM orders
        WHERE id = ?
        LIMIT 1`,
@@ -1161,20 +1167,89 @@ export const createShipment = async (req, res) => {
 
     const updatedOrder = updatedOrderRows[0];
 
-    try {
-      await sendShipmentCreatedEmail({
-        to: updatedOrder?.contact_email,
-        name: updatedOrder?.contact_name,
+    // FIX (missing Shipped notification): this is the ONLY place order_status
+    // ever becomes "shipped" — it's set directly above (step 8), not detected
+    // via a transition diff — so neither the tracking cron nor trackShipment()
+    // can ever "discover" this change later and fire the standard shipped
+    // notification themselves (mappedOrderStatus will already equal
+    // order.order_status by the time either one polls). Previously this sent
+    // only the shipment-created email and no WhatsApp at all for "shipped".
+    // Shares the same order_status_notifications dedupe keyspace as the cron/
+    // trackShipment() so a retried create-shipment call can never double-send.
+    const recipientEmail = updatedOrder?.contact_email || updatedOrder?.email;
+    const recipientName =
+      updatedOrder?.contact_name || updatedOrder?.customer_name || "Customer";
+    const recipientPhone =
+      updatedOrder?.contact_phone || updatedOrder?.mobile_number;
+
+    if (recipientEmail) {
+      try {
+        await sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: updatedOrder.id,
+            status: "shipped",
+            channel: "email",
+          }),
+          orderId: updatedOrder.id,
+          status: "shipped",
+          channel: "email",
+          send: () =>
+            sendShipmentCreatedEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: updatedOrder.id,
+              awbNumber,
+              trackingUrl: updatedOrder?.tracking_url || trackingUrl,
+              courier: "Delhivery",
+            }),
+        });
+      } catch {
+        // Already logged (action:"failed") and recorded in
+        // order_status_notifications by sendOrderStatusNotificationOnce.
+      }
+    } else {
+      logNotification({
         orderId: updatedOrder?.id,
-        awbNumber,
-        trackingUrl: updatedOrder?.tracking_url || trackingUrl,
-        courier: "Delhivery",
+        status: "shipped",
+        channel: "email",
+        action: "failed",
+        result: "failure",
+        error: "no customer email",
       });
-    } catch (emailError) {
-      console.error(
-        "[CREATE_SHIPMENT] Failed to send shipment created email",
-        emailError,
-      );
+    }
+
+    if (recipientPhone) {
+      try {
+        await sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: updatedOrder.id,
+            status: "shipped",
+            channel: "whatsapp",
+          }),
+          orderId: updatedOrder.id,
+          status: "shipped",
+          channel: "whatsapp",
+          send: () =>
+            sendOrderStatusUpdateWhatsApp({
+              customerName: recipientName,
+              mobile: recipientPhone,
+              orderNumber: updatedOrder.order_number,
+              orderUuid: updatedOrder.id,
+              status: "shipped",
+            }),
+        });
+      } catch {
+        // Already logged and recorded — see comment above.
+      }
+    } else {
+      logNotification({
+        orderId: updatedOrder?.id,
+        status: "shipped",
+        channel: "whatsapp",
+        action: "failed",
+        result: "failure",
+        error: "no customer phone",
+      });
     }
 
     // ── 11. Return success response ──────────────────────────────────────────
@@ -1812,66 +1887,99 @@ export const trackShipment = async (req, res) => {
         order.contact_name || order.customer_name || "Customer";
       const recipientPhone = order.contact_phone || order.mobile_number;
 
+      // Same notification_key namespace as the cron (cron/shippingTrackingCron.js)
+      // — whichever of the two observes a given (order, status) transition
+      // first wins the send; the other is a no-op duplicate.
+      // sendOrderStatusNotificationOnce() logs every attempt/sent/
+      // duplicate_skipped/failed outcome itself.
       if (recipientEmail) {
         try {
-          if (normalizeTrackingStatus(trackingStatus) === "out for delivery") {
-            await sendOutForDeliveryEmail({
-              to: recipientEmail,
-              name: recipientName,
+          await sendOrderStatusNotificationOnce({
+            notificationKey: buildOrderStatusNotificationKey({
               orderId: order.id,
-              orderNumber: order.order_number,
-              awbNumber: order.awb_number,
-              trackingUrl: order.tracking_url,
-              currentLocation,
-              expectedDeliveryDate: expectedDelivery,
-            });
-          } else if (normalizeTrackingStatus(trackingStatus) === "delivered") {
-            await sendShipmentDeliveredEmail({
-              to: recipientEmail,
-              name: recipientName,
-              orderId: order.id,
-              orderNumber: order.order_number,
-            });
-          } else if (mappedOrderStatus === "shipped") {
-            await sendOrderStatusUpdateEmail({
-              to: recipientEmail,
-              name: recipientName,
-              orderId: order.id,
-              orderNumber: order.order_number,
               status: mappedOrderStatus,
-            });
-          }
-        } catch (emailError) {
-          console.error(
-            `[TRACK_SHIPMENT] Failed to send ${mappedOrderStatus} email for order ${order.id}`,
-            emailError,
-          );
+              channel: "email",
+            }),
+            orderId: order.id,
+            status: mappedOrderStatus,
+            channel: "email",
+            send: async () => {
+              if (normalizeTrackingStatus(trackingStatus) === "out for delivery") {
+                await sendOutForDeliveryEmail({
+                  to: recipientEmail,
+                  name: recipientName,
+                  orderId: order.id,
+                  orderNumber: order.order_number,
+                  awbNumber: order.awb_number,
+                  trackingUrl: order.tracking_url,
+                  currentLocation,
+                  expectedDeliveryDate: expectedDelivery,
+                });
+              } else if (normalizeTrackingStatus(trackingStatus) === "delivered") {
+                await sendShipmentDeliveredEmail({
+                  to: recipientEmail,
+                  name: recipientName,
+                  orderId: order.id,
+                  orderNumber: order.order_number,
+                });
+              } else if (mappedOrderStatus === "shipped") {
+                await sendOrderStatusUpdateEmail({
+                  to: recipientEmail,
+                  name: recipientName,
+                  orderId: order.id,
+                  orderNumber: order.order_number,
+                  status: mappedOrderStatus,
+                });
+              }
+            },
+          });
+        } catch {
+          // Already logged (action:"failed") and recorded in
+          // order_status_notifications by sendOrderStatusNotificationOnce.
         }
       } else {
-        console.error(
-          `[TRACK_SHIPMENT] Cannot send ${mappedOrderStatus} email for order ${order.id}: no customer email`,
-        );
+        logNotification({
+          orderId: order.id,
+          status: mappedOrderStatus,
+          channel: "email",
+          action: "failed",
+          result: "failure",
+          error: "no customer email",
+        });
       }
 
       if (recipientPhone) {
         try {
-          await sendOrderStatusUpdateWhatsApp({
-            customerName: recipientName,
-            mobile: recipientPhone,
-            orderNumber: order.order_number,
-            orderUuid: order.id,
+          await sendOrderStatusNotificationOnce({
+            notificationKey: buildOrderStatusNotificationKey({
+              orderId: order.id,
+              status: mappedOrderStatus,
+              channel: "whatsapp",
+            }),
+            orderId: order.id,
             status: mappedOrderStatus,
+            channel: "whatsapp",
+            send: () =>
+              sendOrderStatusUpdateWhatsApp({
+                customerName: recipientName,
+                mobile: recipientPhone,
+                orderNumber: order.order_number,
+                orderUuid: order.id,
+                status: mappedOrderStatus,
+              }),
           });
-        } catch (whatsappError) {
-          console.error(
-            `[TRACK_SHIPMENT] Failed to send ${mappedOrderStatus} WhatsApp for order ${order.id}`,
-            whatsappError,
-          );
+        } catch {
+          // Already logged and recorded — see comment above.
         }
       } else {
-        console.error(
-          `[TRACK_SHIPMENT] Cannot send ${mappedOrderStatus} WhatsApp for order ${order.id}: no customer phone`,
-        );
+        logNotification({
+          orderId: order.id,
+          status: mappedOrderStatus,
+          channel: "whatsapp",
+          action: "failed",
+          result: "failure",
+          error: "no customer phone",
+        });
       }
     }
 

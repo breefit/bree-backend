@@ -12,6 +12,7 @@ import {
   sendOrderCancelledEmail,
 } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
+import { activateReminderFromDelivery } from "../../services/dailyReminderService.js";
 
 const VALID_SORTS = [
   "created_at",
@@ -619,6 +620,39 @@ export const updateOrderStatus = async (req, res) => {
     }
     // ===== End Added =====
 
+    // ===== Added: WhatsApp Reminder activation on manual delivery =====
+    // shippingTrackingCron.js activates daily_reminders when Delhivery
+    // reports a shipment as delivered. Orders without an AWB (e.g. COD,
+    // manually fulfilled) never go through that cron, so they need the
+    // same activation here when an admin manually marks them delivered —
+    // otherwise reminder_start_date/reminder_end_date stay NULL forever
+    // and the reminder scheduler never picks the order up.
+    if (statusChanged && status === "delivered") {
+      try {
+        const { rows: reminders } = await query(
+          `SELECT id FROM daily_reminders WHERE order_id = ? AND reminder_enabled = 1`,
+          [updated.id],
+        );
+
+        for (const reminder of reminders) {
+          await activateReminderFromDelivery({
+            reminderId: reminder.id,
+            deliveryDate: new Date().toISOString().split("T")[0],
+          });
+          console.info(
+            `[ADMIN_ORDER] Reminder activated for order ${updated.id} reminder ${reminder.id}`,
+          );
+        }
+      } catch (reminderError) {
+        console.error(
+          `[ADMIN_ORDER] Failed to activate reminders for order ${updated.id}`,
+          reminderError.message || reminderError,
+        );
+        // Don't fail the status update — order delivery already committed.
+      }
+    }
+    // ===== End Added =====
+
     try {
       const io = req.app?.locals?.io;
       if (io) io.emit("order:updated", updated);
@@ -904,6 +938,46 @@ export const bulkUpdateStatus = async (req, res) => {
           console.error("Bulk order status WhatsApp failed", result.reason);
         });
     });
+    // ===== End Added =====
+
+    // ===== Added: WhatsApp Reminder activation on manual delivery (bulk) =====
+    // Same gap as updateOrderStatus(): orders without a Delhivery AWB never
+    // pass through shippingTrackingCron.js's activation, so a bulk manual
+    // "delivered" transition must activate any daily_reminders itself,
+    // otherwise reminder_start_date/reminder_end_date stay NULL and the
+    // reminder scheduler never finds these orders.
+    if (status === "delivered" && changedOrderIds.size) {
+      try {
+        const deliveredIds = updated
+          .filter((orderItem) => changedOrderIds.has(String(orderItem.id)))
+          .map((orderItem) => orderItem.id);
+
+        if (deliveredIds.length) {
+          const reminderPlaceholders = deliveredIds.map(() => "?").join(",");
+          const { rows: reminders } = await query(
+            `SELECT id, order_id FROM daily_reminders
+             WHERE order_id IN (${reminderPlaceholders}) AND reminder_enabled = 1`,
+            deliveredIds,
+          );
+
+          for (const reminder of reminders) {
+            await activateReminderFromDelivery({
+              reminderId: reminder.id,
+              deliveryDate: new Date().toISOString().split("T")[0],
+            });
+            console.info(
+              `[ADMIN_ORDER] Reminder activated for order ${reminder.order_id} reminder ${reminder.id} (bulk)`,
+            );
+          }
+        }
+      } catch (reminderError) {
+        console.error(
+          "[ADMIN_ORDER] Failed to activate reminders (bulk)",
+          reminderError.message || reminderError,
+        );
+        // Don't fail the response — order delivery already committed.
+      }
+    }
     // ===== End Added =====
 
     // Emit socket events

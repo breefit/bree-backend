@@ -1029,8 +1029,21 @@ export const getOrderSuccess = async (req, res) => {
       status: canonicalOrder.paymentStatus,
     };
 
+    // Same daily_reminders lookup as getOrder()/getOrderTracking() — the
+    // checkout success page's summary needs this to confirm the WhatsApp
+    // Reminder add-on that was just purchased.
+    const { rows: reminderRows } = await query(
+      `SELECT id, product_id, reminder_time, reminder_enabled, status,
+              reminder_price_paid, reminder_start_date, reminder_end_date,
+              reminder_whatsapp_number, reminder_phone_source
+       FROM daily_reminders
+       WHERE order_id = ? AND reminder_enabled = 1
+       ORDER BY created_at ASC`,
+      [id],
+    );
+
     return sendJson(res, 200, {
-      order: canonicalOrder,
+      order: { ...canonicalOrder, reminders: reminderRows },
       items: itemRows,
       paymentDetails,
     });
@@ -1291,21 +1304,34 @@ export const getOrderTracking = async (req, res) => {
 
     const order = orderRows[0];
 
-    const [{ rows: orderItems }, { rows: historyRows }] = await Promise.all([
-      query(
-        `SELECT id, product_name, product_image, product_price, quantity, subtotal
-         FROM order_items
-         WHERE order_id = ?`,
-        [order.id],
-      ),
-      query(
-        `SELECT id, previous_status, new_status, changed_by, notes, created_at
-         FROM order_status_history
-         WHERE order_id = ?
-         ORDER BY created_at ASC`,
-        [order.id],
-      ),
-    ]);
+    const [{ rows: orderItems }, { rows: historyRows }, { rows: reminderRows }] =
+      await Promise.all([
+        query(
+          `SELECT id, product_name, product_image, product_price, quantity, subtotal
+           FROM order_items
+           WHERE order_id = ?`,
+          [order.id],
+        ),
+        query(
+          `SELECT id, previous_status, new_status, changed_by, notes, created_at
+           FROM order_status_history
+           WHERE order_id = ?
+           ORDER BY created_at ASC`,
+          [order.id],
+        ),
+        // Same daily_reminders lookup as getOrder() — the customer tracking
+        // page's Order Summary needs this to show the WhatsApp Reminder
+        // line, and previously this endpoint never fetched it at all.
+        query(
+          `SELECT id, product_id, reminder_time, reminder_enabled, status,
+                  reminder_price_paid, reminder_start_date, reminder_end_date,
+                  reminder_whatsapp_number, reminder_phone_source
+           FROM daily_reminders
+           WHERE order_id = ? AND reminder_enabled = 1
+           ORDER BY created_at ASC`,
+          [order.id],
+        ),
+      ]);
 
     const resolvedShippingAddress =
       order.shipping_address ||
@@ -1332,6 +1358,7 @@ export const getOrderTracking = async (req, res) => {
       ...order,
       shipping_address: resolvedShippingAddress,
       items: orderItems,
+      reminders: reminderRows,
     };
 
     sendJson(res, 200, {

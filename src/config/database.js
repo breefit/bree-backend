@@ -314,6 +314,37 @@ const ensureSubscriptionEmailNotificationSchema = async () => {
   }
 };
 
+// FIX (Shipped/Out-for-Delivery/Delivered notifications): shipment status
+// sync has two entry points that can observe the same transition — the
+// 30-min cron (cron/shippingTrackingCron.js) and the admin-triggered manual
+// refresh (GET /api/shipping/track/:awb, shippingController.trackShipment)
+// — plus webhook-style retries from either. Same idempotency shape as
+// ensureSubscriptionEmailNotificationSchema() above: one row per
+// (order, status, channel), claimed atomically before sending, so no
+// duplicate WhatsApp/email ever goes out no matter how many times the same
+// status is observed. See services/orderStatusNotificationService.js.
+const ensureOrderStatusNotificationSchema = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS order_status_notifications (
+        notification_key VARCHAR(255) PRIMARY KEY,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        attempts INT NOT NULL DEFAULT 0,
+        last_attempt_at DATETIME NULL,
+        sent_at DATETIME NULL,
+        last_error VARCHAR(1000) NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+  } catch (err) {
+    console.error(
+      "Could not ensure order_status_notifications schema:",
+      err?.message || err,
+    );
+  }
+};
+
 // FIX: ensure the orders table has the shipping / totals columns expected by
 // the checkout and order APIs. This keeps older databases functional without
 // requiring a manual SQL migration for each local environment.
@@ -1401,6 +1432,7 @@ const ensurePackageNumberSchema = async () => {
 await ensureOrderNumberSchema().catch(console.error);
 await ensureRenewalOrderColumns().catch(console.error);
 await ensureSubscriptionEmailNotificationSchema();
+await ensureOrderStatusNotificationSchema();
 await ensureOrderShippingColumns().catch(console.error);
 await ensureDailyReminderPhoneColumns().catch(console.error);
 await ensureBulkBookingWorkflowColumns().catch(console.error);

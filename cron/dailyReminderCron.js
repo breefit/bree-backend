@@ -17,6 +17,7 @@ import {
   sendDailyWellnessReminder,
   safelySendWhatsApp,
 } from "../src/services/whatsappNotificationService.js";
+import { activateReminderFromDelivery } from "../src/services/dailyReminderService.js";
 
 const TIMEZONE = "Asia/Kolkata";
 const TOLERANCE_MINUTES = 5; // Send within 5 minutes of scheduled time
@@ -177,6 +178,115 @@ const recordReminderFailure = async (reminderId, sendDate, errorMessage) => {
 };
 
 /**
+ * Self-heals reminders stuck without an activation window.
+ *
+ * activateReminderFromDelivery() is normally called the moment an order's
+ * delivery is detected (shippingTrackingCron.js for Delhivery-tracked
+ * shipments, or the admin manual-delivery path). If that call was ever
+ * missed — e.g. an order was marked "delivered" before the activation
+ * hook existed, or a one-off failure — the reminder's start/end dates stay
+ * NULL forever and getEligibleReminders() can never select it, even though
+ * the order genuinely is delivered. Catch that here using the order's own
+ * delivered_at as the source of truth, so a previously-stuck reminder
+ * starts on the next scheduler tick instead of needing a manual DB fix.
+ */
+const activateStuckReminders = async () => {
+  try {
+    const { rows } = await query(
+      `
+      SELECT dr.id, dr.order_id, o.delivered_at
+      FROM daily_reminders dr
+      INNER JOIN orders o ON dr.order_id = o.id
+      WHERE dr.reminder_enabled = 1
+        AND dr.status = 'active'
+        AND dr.reminder_start_date IS NULL
+        AND o.order_status = 'delivered'
+        AND o.delivered_at IS NOT NULL
+      `,
+    );
+
+    for (const row of rows) {
+      const deliveryDate = new Date(row.delivered_at)
+        .toISOString()
+        .split("T")[0];
+
+      const result = await activateReminderFromDelivery({
+        reminderId: row.id,
+        deliveryDate,
+      });
+
+      if (result.success) {
+        console.info(
+          `[Reminder Scheduler] Self-healed reminder ${row.id} for order ${row.order_id} | delivered=${deliveryDate} | start=${result.startDate} end=${result.endDate}`,
+        );
+      } else {
+        console.error(
+          `[Reminder Scheduler] Failed to self-heal reminder ${row.id} for order ${row.order_id}: ${result.error}`,
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[Reminder Scheduler] Self-heal query failed:",
+      error.message,
+    );
+  }
+};
+
+/**
+ * Logs why enabled+active reminders were excluded from today's eligible
+ * batch (no PII beyond order id — no phone numbers, no names). This exists
+ * so "[Reminder Scheduler] No eligible reminders found" can be diagnosed
+ * from logs alone instead of guessing — e.g. a reminder purchased on an
+ * order that was manually marked delivered without the activation step
+ * running shows up here as "not yet activated" (start/end date NULL).
+ */
+const logSkippedReminders = async (today) => {
+  try {
+    const { rows } = await query(
+      `
+      SELECT
+        dr.id,
+        dr.order_id,
+        dr.reminder_enabled,
+        dr.status,
+        dr.reminder_start_date,
+        dr.reminder_end_date,
+        drs.id AS send_record_id
+      FROM daily_reminders dr
+      LEFT JOIN daily_reminder_sends drs
+        ON dr.id = drs.reminder_id
+        AND drs.send_date = ?
+        AND drs.status = 'success'
+      WHERE dr.reminder_enabled = 1 AND dr.status = 'active'
+      `,
+      [today],
+    );
+
+    for (const r of rows) {
+      let reason = null;
+      if (!r.reminder_start_date || !r.reminder_end_date) {
+        reason = "not_yet_activated (delivery activation never ran)";
+      } else if (today < r.reminder_start_date) {
+        reason = `before_start_date (starts ${r.reminder_start_date})`;
+      } else if (today > r.reminder_end_date) {
+        reason = `after_end_date (ended ${r.reminder_end_date})`;
+      } else if (r.send_record_id) {
+        reason = "already_sent_today";
+      }
+
+      if (reason) {
+        console.info(
+          `[Reminder Scheduler] Order ${r.order_id} reminder ${r.id} skipped | enabled=true | reason=${reason}`,
+        );
+      }
+    }
+  } catch (error) {
+    console.error("[Reminder Scheduler] Diagnostic logging failed:", error.message);
+  }
+};
+
+/**
  * Main scheduler function - runs periodically (e.g., every minute)
  * Checks if current time matches any reminder's scheduled time,
  * and sends reminders if eligible
@@ -188,7 +298,17 @@ export const runDailyReminderScheduler = async () => {
   console.log(`[Reminder Scheduler] Running at ${currentTime} IST (${today})`);
 
   try {
+    // Heal any reminder stuck on a delivered order before evaluating
+    // eligibility, so a reminder that just got healed can be picked up in
+    // this same run if it's already within its window.
+    await activateStuckReminders();
+
     const reminders = await getEligibleReminders(today);
+
+    // Runs regardless of whether any reminders were found eligible — an
+    // active reminder stuck at "not_yet_activated" is invisible to
+    // getEligibleReminders() itself, so it needs its own diagnostic pass.
+    await logSkippedReminders(today);
 
     if (!reminders.length) {
       console.log(
@@ -241,7 +361,11 @@ export const runDailyReminderScheduler = async () => {
 
       try {
         // Send the WhatsApp reminder
-        const { success, result } = await safelySendWhatsApp(
+        // NOTE: safelySendWhatsApp resolves { success: true, result } on
+        // success but { success: false, error } (not `result`) on failure —
+        // destructure both so a real provider error isn't lost as
+        // "Unknown error" below.
+        const { success, result, error: sendError } = await safelySendWhatsApp(
           `daily-reminder-${reminderId}`,
           () =>
             sendDailyWellnessReminder({
@@ -274,14 +398,11 @@ export const runDailyReminderScheduler = async () => {
         } else {
           // Send failed
           failed++;
-          await recordReminderFailure(
-            reminderId,
-            today,
-            result?.error || "Unknown error",
-          );
+          const errorMessage = sendError?.message || String(sendError || "Unknown error");
+          await recordReminderFailure(reminderId, today, errorMessage);
 
           console.error(
-            `[Reminder] Failed to send reminder ${reminderId} to ${sendMobile}: ${result?.error}`,
+            `[Reminder] Failed to send reminder ${reminderId} to ${sendMobile}: ${errorMessage}`,
           );
         }
       } catch (error) {
