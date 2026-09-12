@@ -62,8 +62,15 @@ const defaultDevOrigins = [
   "http://127.0.0.1:3001",
 ];
 
+const breefitOrigins = [
+  "https://www.breefit.in",
+  "https://breefit.in",
+  "http://www.breefit.in",
+  "http://breefit.in",
+];
+
 const allowedOrigins = [
-  ...new Set([...frontendUrls, ...defaultDevOrigins]),
+  ...new Set([...frontendUrls, ...defaultDevOrigins, ...breefitOrigins]),
 ].map((origin) => origin.replace(/\/$/, ""));
 
 // debug log for CORS allowed origins ------------------------------------------
@@ -80,10 +87,16 @@ const isAllowedRazorpayOrigin = (origin) => {
   return /(^|\.)razorpay\.(com|in)$/i.test(normalized);
 };
 
-const corsOptions = {
+const createCorsOptions = ({ allowNullOrigin = false } = {}) => ({
   origin: (origin, callback) => {
     // Allow server-to-server requests (no Origin header)
     if (!origin) {
+      return callback(null, true);
+    }
+
+    // An opaque origin is only accepted for the public OTP request. It is
+    // never part of the general allow-list used by authenticated endpoints.
+    if (origin === "null" && allowNullOrigin) {
       return callback(null, true);
     }
 
@@ -98,18 +111,30 @@ const corsOptions = {
     if (process.env.NODE_ENV !== "production") {
       console.warn(`🚫 CORS blocked origin: ${origin}`);
     }
-    return callback(
-      new Error(`CORS policy: Origin not allowed - ${origin}`),
-      false,
-    );
+    const corsError = new Error(`CORS policy: Origin not allowed - ${origin}`);
+    corsError.status = 403;
+    return callback(corsError, false);
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   optionsSuccessStatus: 204,
-};
+});
 
-app.use(cors(corsOptions));
+const standardCors = cors(createCorsOptions());
+const publicOtpCors = cors(createCorsOptions({ allowNullOrigin: true }));
+const publicOtpPaths = new Set([
+  "/api/auth/send-otp",
+  "/api/auth/verify-otp",
+  "/api/auth/resend-otp",
+]);
+
+app.use((req, res, next) => {
+  const isPublicOtpRequest =
+    publicOtpPaths.has(req.path) && ["POST", "OPTIONS"].includes(req.method);
+
+  return (isPublicOtpRequest ? publicOtpCors : standardCors)(req, res, next);
+});
 
 // ── Logging ───────────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== "test") {
