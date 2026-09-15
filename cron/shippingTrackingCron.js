@@ -6,6 +6,7 @@ import {
   normalizeTrackingStatus,
   mapTrackingStatusToOrderStatus,
   isForwardOrderStatusTransition,
+  shouldSendBreeStatusWhatsApp,
 } from "../src/controllers/shippingController.js";
 import { appendStatusHistory } from "../src/models/Order.js";
 import {
@@ -235,7 +236,21 @@ export const syncShippingTracking = async () => {
           });
         }
 
-        if (recipientPhone) {
+        // FIX (duplicate shipping notifications): Delhivery already
+        // sends its own WhatsApp for "shipped"/"out for delivery" — see
+        // shouldSendBreeStatusWhatsApp() in shippingController.js.
+        // Deliberately no order_status_notifications claim for those two.
+        // Same guard as trackShipment()'s manual refresh, sharing this
+        // status's notification_key namespace.
+        if (!shouldSendBreeStatusWhatsApp(mappedOrderStatus)) {
+          logNotification({
+            orderId: order.id,
+            status: mappedOrderStatus,
+            channel: "whatsapp",
+            action: "skipped_delhivery_duplicate",
+            result: "success",
+          });
+        } else if (recipientPhone) {
           try {
             await sendOrderStatusNotificationOnce({
               notificationKey: buildOrderStatusNotificationKey({

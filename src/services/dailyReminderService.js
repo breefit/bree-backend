@@ -6,7 +6,7 @@
 
 import { query } from "../config/database.js";
 import { randomUUID } from "crypto";
-import { validateMobile } from "./whatsappNotificationService.js";
+import { validateMobile, maskMobile } from "./whatsappNotificationService.js";
 
 /**
  * Creates a daily reminder record after successful payment
@@ -91,7 +91,7 @@ export const createDailyReminder = async ({
     );
 
     console.log(
-      `[Reminder] Created reminder ${reminderId} for order ${orderId} | Time: ${reminderTime} | Phone: ${normalizedWhatsappNumber || "fallback-user-phone"} | Source: ${safePhoneSource}`,
+      `[DAILY_REMINDER] CREATED | reminderId=${reminderId} | orderId=${orderId} | productId=${productId} | time=${reminderTime} | phone=${normalizedWhatsappNumber ? maskMobile(normalizedWhatsappNumber) : "fallback-user-phone"} | phoneSource=${safePhoneSource}`,
     );
 
     return { success: true, reminderId };

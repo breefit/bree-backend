@@ -386,7 +386,13 @@ export const notifyBulkEnquirySubmitted = async ({
 
 /**
  * IN_PROGRESS — sent once when a booking moves from New to In Progress.
- * The customer can use the same quote review URL when a quote is available.
+ *
+ * FIX: no quote exists yet at this point (that's the very next stage of
+ * the workflow, via notifyQuoteReady), so the quote review URL must NOT
+ * be included here — previously this reused the same quoteReviewUrl in
+ * both the email button and the WhatsApp `details` param, which sent
+ * customers a link before there was anything to review at it. The URL is
+ * added back only when the quote actually goes out (notifyQuoteReady).
  */
 export const notifyBulkOrderInProgress = async ({
   email,
@@ -397,7 +403,6 @@ export const notifyBulkOrderInProgress = async ({
   deliveryDate,
 }) => {
   const bulkOrderReference = bookingNumber || bookingId;
-  const quoteReviewUrl = buildBulkOrderQuoteReviewUrl(bookingId);
 
   try {
     const content = `
@@ -419,7 +424,6 @@ export const notifyBulkOrderInProgress = async ({
                 ? { label: "Delivery Date", value: escapeHtml(deliveryDate) }
                 : null,
             ])}
-            ${buildPrimaryButton(quoteReviewUrl, "VIEW YOUR BULK ORDER")}
           </td>
         </tr>
       </table>
@@ -446,7 +450,7 @@ export const notifyBulkOrderInProgress = async ({
     contactPerson,
     status: "In Progress",
     message: `Bulk order ${bulkOrderReference} is now In Progress${deliveryDate ? `. Delivery date: ${deliveryDate}.` : "."}`,
-    details: quoteReviewUrl,
+    details: "",
   });
 
   if (whatsappResult?.success) {

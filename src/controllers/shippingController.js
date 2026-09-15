@@ -488,6 +488,28 @@ export const isForwardOrderStatusTransition = (currentStatus, nextStatus) => {
   return nextIndex > currentIndex;
 };
 
+// FIX (duplicate shipping notifications): Delhivery already sends the
+// customer their own WhatsApp notification the moment a shipment is
+// marked "shipped" or reaches "out for delivery" — that's their courier
+// SMS/WhatsApp integration, entirely outside BREE's control and firing
+// regardless of anything here. BREE's own generic order-status WhatsApp
+// for those same two transitions was a genuine duplicate message, not a
+// second, distinct one. This is the single shared guard every trigger
+// path (createShipment, trackShipment, cron/shippingTrackingCron.js)
+// checks before attempting a BREE WhatsApp send for a shipping-related
+// status — so a status can never gain a new send path later without also
+// picking up this rule. Every other channel (email) and every other
+// status (paid, processing, ready_to_ship, delivered, cancelled,
+// returned, return/refund events) is unaffected — Delhivery has no
+// equivalent for any of those.
+const DELHIVERY_ALREADY_NOTIFIES_STATUSES = new Set([
+  "shipped",
+  "out_for_delivery",
+]);
+
+export const shouldSendBreeStatusWhatsApp = (status) =>
+  !DELHIVERY_ALREADY_NOTIFIES_STATUSES.has(status);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Robust Delhivery tracking-response parser.
 // Supports ShipmentData[0].Shipment, Shipment, data.ShipmentData,
@@ -1179,8 +1201,6 @@ export const createShipment = async (req, res) => {
     const recipientEmail = updatedOrder?.contact_email || updatedOrder?.email;
     const recipientName =
       updatedOrder?.contact_name || updatedOrder?.customer_name || "Customer";
-    const recipientPhone =
-      updatedOrder?.contact_phone || updatedOrder?.mobile_number;
 
     if (recipientEmail) {
       try {
@@ -1218,39 +1238,14 @@ export const createShipment = async (req, res) => {
       });
     }
 
-    if (recipientPhone) {
-      try {
-        await sendOrderStatusNotificationOnce({
-          notificationKey: buildOrderStatusNotificationKey({
-            orderId: updatedOrder.id,
-            status: "shipped",
-            channel: "whatsapp",
-          }),
-          orderId: updatedOrder.id,
-          status: "shipped",
-          channel: "whatsapp",
-          send: () =>
-            sendOrderStatusUpdateWhatsApp({
-              customerName: recipientName,
-              mobile: recipientPhone,
-              orderNumber: updatedOrder.order_number,
-              orderUuid: updatedOrder.id,
-              status: "shipped",
-            }),
-        });
-      } catch {
-        // Already logged and recorded — see comment above.
-      }
-    } else {
-      logNotification({
-        orderId: updatedOrder?.id,
-        status: "shipped",
-        channel: "whatsapp",
-        action: "failed",
-        result: "failure",
-        error: "no customer phone",
-      });
-    }
+    // FIX (duplicate shipping notifications): Delhivery already sends the
+    // customer their own WhatsApp the moment a shipment is created/marked
+    // shipped with them — a second, BREE-branded "shipped" WhatsApp here
+    // was a genuine duplicate, not a distinct notification. Deliberately
+    // no WhatsApp send (and no order_status_notifications claim) for this
+    // status/channel at all — see shouldSendBreeStatusWhatsApp(). The
+    // email above is unaffected; only this channel/status combination is
+    // suppressed.
 
     // ── 11. Return success response ──────────────────────────────────────────
     res.status(200).json({
@@ -1948,7 +1943,22 @@ export const trackShipment = async (req, res) => {
         });
       }
 
-      if (recipientPhone) {
+      // FIX (duplicate shipping notifications): Delhivery already sends
+      // its own WhatsApp for "shipped"/"out for delivery" — see
+      // shouldSendBreeStatusWhatsApp() in this file. Deliberately no
+      // order_status_notifications claim for those two, so a later
+      // change can't accidentally "resume" sending by relying on a
+      // pre-existing claimed row. "delivered" (and anything else that
+      // could reach here, e.g. "cancelled") is unaffected.
+      if (!shouldSendBreeStatusWhatsApp(mappedOrderStatus)) {
+        logNotification({
+          orderId: order.id,
+          status: mappedOrderStatus,
+          channel: "whatsapp",
+          action: "skipped_delhivery_duplicate",
+          result: "success",
+        });
+      } else if (recipientPhone) {
         try {
           await sendOrderStatusNotificationOnce({
             notificationKey: buildOrderStatusNotificationKey({

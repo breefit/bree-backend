@@ -7,13 +7,17 @@ import {
   mapTrackingStatusToOrderStatus,
   isForwardOrderStatusTransition,
   normalizeTrackingStatus,
+  shouldSendBreeStatusWhatsApp,
 } from "../src/controllers/shippingController.js";
 import {
   buildOrderStatusNotificationKey,
   sendOrderStatusNotificationOnce,
 } from "../src/services/orderStatusNotificationService.js";
 import { sendOrderStatusUpdateEmail } from "../src/services/orderEmailService.js";
-import { validateWhatsAppConfiguration } from "../src/services/whatsappNotificationService.js";
+import {
+  validateWhatsAppConfiguration,
+  buildOrderDeliveredThankYouMessage,
+} from "../src/services/whatsappNotificationService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (p) => fs.readFileSync(path.join(__dirname, p), "utf8");
@@ -25,6 +29,9 @@ const shippingCronSource = read("../cron/shippingTrackingCron.js");
 const databaseSource = read("../src/config/database.js");
 const notificationServiceSource = read(
   "../src/services/orderStatusNotificationService.js",
+);
+const whatsappServiceSource = read(
+  "../src/services/whatsappNotificationService.js",
 );
 
 test("Delhivery shipment statuses map to the tracking-timeline order statuses", () => {
@@ -110,19 +117,22 @@ test("notification keys are unique per order+status+channel and stable across ca
   assert.notEqual(a, differentOrder);
 });
 
-test("createShipment sends the Shipped WhatsApp notification (previously missing)", () => {
-  // FIX: createShipment sets order_status = "shipped" directly, so it is the
-  // only place that transition can ever be observed — neither the cron nor
-  // trackShipment() can detect it afterwards (order_status already matches).
-  // Before the fix, only sendShipmentCreatedEmail was called and no WhatsApp
-  // was ever sent for "shipped".
+test("REGRESSION FIX: createShipment does NOT send a BREE WhatsApp for 'shipped' — Delhivery already notifies the customer — but the Shipped email is unchanged", () => {
+  // Previously this called sendOrderStatusUpdateWhatsApp(status:"shipped")
+  // directly here (createShipment is the ONLY place order_status ever
+  // becomes "shipped", set directly rather than detected via a transition
+  // diff, so neither the cron nor trackShipment() could ever have sent it
+  // instead). Delhivery already sends its own shipping WhatsApp the
+  // moment the shipment is created with them, so this was a genuine
+  // duplicate customer-facing message, not a second useful one.
   const createShipmentSource = shippingControllerSource.slice(
     shippingControllerSource.indexOf("export const createShipment"),
     shippingControllerSource.indexOf("export const reconcileShipment"),
   );
-  assert.match(createShipmentSource, /sendOrderStatusUpdateWhatsApp\(/);
-  assert.match(createShipmentSource, /status:\s*"shipped"/);
+  assert.doesNotMatch(createShipmentSource, /sendOrderStatusUpdateWhatsApp\(/);
+  // The Shipped email must be completely unaffected by this change.
   assert.match(createShipmentSource, /sendShipmentCreatedEmail\(/);
+  assert.match(createShipmentSource, /channel:\s*"email"/);
 });
 
 test("shipment notifications are deduped through order_status_notifications, in both the cron and the manual track endpoint", () => {
@@ -181,17 +191,58 @@ test("a claim stuck in 'sending' (e.g. a crash mid-send) is reclaimable, not a p
   assert.match(notificationServiceSource, /STALE_CLAIM_MINUTES/);
 });
 
-test("Out for Delivery transitions send both sendOutForDeliveryEmail and sendOrderStatusUpdateWhatsApp with status out_for_delivery", () => {
+test("Out for Delivery transitions still send sendOutForDeliveryEmail (email unchanged)", () => {
   for (const source of [shippingCronSource, shippingControllerSource]) {
     assert.match(source, /out for delivery["']?\s*\)\s*\{[\s\S]*?sendOutForDeliveryEmail\(/);
-    assert.match(source, /status:\s*mappedOrderStatus,\s*\n\s*channel:\s*"whatsapp"/);
   }
 });
 
-test("Delivered transitions send both sendShipmentDeliveredEmail and sendOrderStatusUpdateWhatsApp", () => {
+test("REGRESSION FIX: Out for Delivery does NOT send a BREE WhatsApp — Delhivery already notifies the customer", () => {
+  for (const source of [shippingCronSource, shippingControllerSource]) {
+    assert.match(source, /shouldSendBreeStatusWhatsApp\(mappedOrderStatus\)/);
+  }
+  // shouldSendBreeStatusWhatsApp itself is the single source of truth —
+  // verified directly against shippingController.js's own definition.
+  assert.match(
+    shippingControllerSource,
+    /DELHIVERY_ALREADY_NOTIFIES_STATUSES = new Set\(\[\s*"shipped",\s*"out_for_delivery",\s*\]\)/,
+  );
+  assert.equal(shouldSendBreeStatusWhatsApp("out_for_delivery"), false);
+  assert.equal(shouldSendBreeStatusWhatsApp("shipped"), false);
+});
+
+test("Delivered transitions still send sendShipmentDeliveredEmail (email unchanged) and now send the BREE thank-you WhatsApp instead of the generic status message", () => {
   for (const source of [shippingCronSource, shippingControllerSource]) {
     assert.match(source, /delivered["']?\s*\)\s*\{[\s\S]*?sendShipmentDeliveredEmail\(/);
+    assert.match(source, /sendOrderStatusUpdateWhatsApp\(/);
   }
+  assert.equal(shouldSendBreeStatusWhatsApp("delivered"), true);
+});
+
+test("REGRESSION FIX: 'delivered' status routes to the dedicated thank-you message, not the generic order-status line, inside sendOrderStatusUpdateWhatsApp itself", () => {
+  const fnSource = whatsappServiceSource.slice(
+    whatsappServiceSource.indexOf("export const sendOrderStatusUpdateWhatsApp"),
+  );
+  assert.match(fnSource, /status === "delivered"/);
+  assert.match(fnSource, /buildOrderDeliveredThankYouMessage\(customerName\)/);
+});
+
+test("the delivered thank-you message matches the exact requested content", () => {
+  const message = buildOrderDeliveredThankYouMessage("Asha");
+  assert.match(message, /^BREE Wellness 💚/);
+  assert.match(message, /Hi Asha 👋/);
+  assert.match(message, /Your order has been successfully delivered\./);
+  assert.match(
+    message,
+    /Thank you for choosing BREE Wellness! We hope you enjoy your order\. 🌿/,
+  );
+  assert.match(message, /We appreciate your trust in BREE\. 💚$/);
+});
+
+test("the delivered thank-you message falls back gracefully when customerName is missing (never crashes, never says 'Hi undefined')", () => {
+  const message = buildOrderDeliveredThankYouMessage(undefined);
+  assert.doesNotMatch(message, /undefined/);
+  assert.match(message, /Hi there 👋/);
 });
 
 test("createShipment sends the Shipped Email notification via the existing sendShipmentCreatedEmail template", () => {
@@ -333,6 +384,107 @@ test("sendOrderStatusNotificationOnce: concurrent callers on the same key never 
   assert.equal(sentCount, 1, "exactly one of the two concurrent callers must win the claim");
   assert.equal(duplicateCount, 1);
   assert.equal(sendCalls, 1);
+});
+
+// ── Delivered thank-you WhatsApp: idempotency across every real trigger
+//    path (cron tick, manual trackShipment refresh, and a retried call to
+//    either) — all share this exact notification key ────────────────────
+
+test("REGRESSION: Delivered thank-you WhatsApp — cron and manual tracking refresh racing on the same order send exactly once, not twice", async () => {
+  const { queryExecutor } = createFakeNotificationsTable();
+  const key = buildOrderStatusNotificationKey({
+    orderId: "order-delivered-1",
+    status: "delivered",
+    channel: "whatsapp",
+  });
+  let sendCalls = 0;
+  // Simulates what the real send() callback does: build the thank-you
+  // message and hand it to the (mocked) WhatsApp provider.
+  const send = async () => {
+    sendCalls += 1;
+    return buildOrderDeliveredThankYouMessage("Customer");
+  };
+
+  // cron/shippingTrackingCron.js and shippingController.js's
+  // trackShipment() both observe the same "delivered" transition at
+  // roughly the same time — e.g. an admin manually refreshes tracking
+  // moments before the cron's own poll would have caught it.
+  const [cronResult, manualResult] = await Promise.all([
+    sendOrderStatusNotificationOnce({ notificationKey: key, send, queryExecutor }),
+    sendOrderStatusNotificationOnce({ notificationKey: key, send, queryExecutor }),
+  ]);
+
+  const sentCount = [cronResult, manualResult].filter((r) => r.sent).length;
+  assert.equal(sentCount, 1, "only one of cron/manual may actually send the thank-you message");
+  assert.equal(sendCalls, 1);
+});
+
+test("REGRESSION: Delivered thank-you WhatsApp — a retried call for an order already marked delivered sends 0 additional messages", async () => {
+  const { queryExecutor } = createFakeNotificationsTable();
+  const key = buildOrderStatusNotificationKey({
+    orderId: "order-delivered-2",
+    status: "delivered",
+    channel: "whatsapp",
+  });
+  let sendCalls = 0;
+  const send = async () => {
+    sendCalls += 1;
+  };
+
+  const first = await sendOrderStatusNotificationOnce({ notificationKey: key, send, queryExecutor });
+  assert.equal(first.sent, true);
+
+  // Repeated "delivered" status observations (another cron tick, a
+  // retried webhook-style redelivery, an admin re-refreshing tracking on
+  // an already-delivered order) must never re-send.
+  for (let i = 0; i < 3; i++) {
+    const retry = await sendOrderStatusNotificationOnce({ notificationKey: key, send, queryExecutor });
+    assert.equal(retry.sent, false);
+    assert.equal(retry.duplicate, true);
+  }
+  assert.equal(sendCalls, 1, "exactly one thank-you message total, no matter how many repeated observations follow");
+});
+
+test("REGRESSION: simulated end-to-end trigger-path decision — shipped/out_for_delivery send 0 WhatsApp, delivered sends exactly 1 thank-you message", async () => {
+  // Simulates the exact `if (!shouldSendBreeStatusWhatsApp(status)) skip
+  // else send` decision every real trigger path (createShipment,
+  // trackShipment, the cron) now makes, end to end through the real
+  // idempotency mechanism — not just a regex match against the source.
+  const runTriggerPath = async (status, queryExecutor) => {
+    let sendAttempted = false;
+    if (!shouldSendBreeStatusWhatsApp(status)) {
+      return { sendAttempted, action: "skipped_delhivery_duplicate" };
+    }
+    const key = buildOrderStatusNotificationKey({
+      orderId: "order-e2e",
+      status,
+      channel: "whatsapp",
+    });
+    const result = await sendOrderStatusNotificationOnce({
+      notificationKey: key,
+      send: async () => {
+        sendAttempted = true;
+      },
+      queryExecutor,
+    });
+    return { sendAttempted, ...result };
+  };
+
+  for (const status of ["shipped", "out_for_delivery"]) {
+    const { queryExecutor } = createFakeNotificationsTable();
+    const outcome = await runTriggerPath(status, queryExecutor);
+    assert.equal(
+      outcome.sendAttempted,
+      false,
+      `${status} must never attempt a WhatsApp provider call`,
+    );
+    assert.equal(outcome.action, "skipped_delhivery_duplicate");
+  }
+
+  const { queryExecutor } = createFakeNotificationsTable();
+  const delivered = await runTriggerPath("delivered", queryExecutor);
+  assert.equal(delivered.sendAttempted, true);
+  assert.equal(delivered.sent, true);
 });
 
 test("sendOrderStatusNotificationOnce: a failed send is recorded as failed, not silently marked sent, and blocks a non-retry re-attempt", async () => {
@@ -562,4 +714,123 @@ test("WhatsApp config validation (base URL, API key, every WAPLIFY_TEMPLATE_* in
       assert.match(error.message, /WAPLIFY|Missing/);
     }
   });
+});
+
+// ── Trigger-path audit: admin/orderController.js's generic order-status
+//    endpoints (single + bulk) are a SEPARATE path from the Delhivery-
+//    driven createShipment/trackShipment/cron flow, and can just as
+//    easily set status to "shipped"/"out_for_delivery"/"delivered" (e.g.
+//    correcting a status, or a manual/COD order with no real Delhivery
+//    shipment). Found via a full-repo grep for every
+//    sendOrderStatusUpdateWhatsApp call site — this task's requirement 7
+//    ("check ALL trigger paths... any other order-status notification
+//    caller") is not satisfied by only fixing the shipping-specific
+//    files. These previously had NO suppression AND no idempotency of
+//    any kind (a bare fire-and-forget .catch(), not
+//    sendOrderStatusNotificationOnce) — both are fixed here. ───────────
+
+const adminOrderControllerSource = read(
+  "../src/controllers/admin/orderController.js",
+);
+
+test("REGRESSION FIX: admin updateOrderStatus (single order) suppresses BREE WhatsApp for shipped/out_for_delivery and is now idempotent", () => {
+  const fnSource = adminOrderControllerSource.slice(
+    adminOrderControllerSource.indexOf("export const updateOrderStatus"),
+    adminOrderControllerSource.indexOf("export const bulkUpdateStatus"),
+  );
+  assert.match(fnSource, /shouldSendBreeStatusWhatsApp\(status\)/);
+  assert.match(fnSource, /sendOrderStatusNotificationOnce\(/);
+  assert.match(fnSource, /buildOrderStatusNotificationKey\(/);
+  // Must share the exact same key shape as every other trigger path, so
+  // an order reaching "delivered" here can't be double-notified if
+  // Delhivery's own tracking sync already sent the thank-you (or the
+  // reverse order).
+  assert.match(
+    fnSource,
+    /buildOrderStatusNotificationKey\(\{\s*orderId:\s*updated\.id,\s*status,\s*channel:\s*"whatsapp",/,
+  );
+  // Email behavior must be completely untouched by this fix.
+  assert.match(fnSource, /sendOrderDeliveredEmail\(/);
+  assert.match(fnSource, /sendOrderCancelledEmail\(/);
+  assert.match(fnSource, /sendOrderStatusUpdateEmail\(/);
+});
+
+test("REGRESSION FIX: admin bulkUpdateStatus suppresses BREE WhatsApp for shipped/out_for_delivery (per order) and is now idempotent", () => {
+  const fnSource = adminOrderControllerSource.slice(
+    adminOrderControllerSource.indexOf("export const bulkUpdateStatus"),
+  );
+  assert.match(fnSource, /shouldSendBreeStatusWhatsApp\(status\)/);
+  assert.match(fnSource, /sendOrderStatusNotificationOnce\(/);
+  assert.match(fnSource, /buildOrderStatusNotificationKey\(/);
+});
+
+test("no remaining bare/unguarded sendOrderStatusUpdateWhatsApp call exists anywhere in admin/orderController.js", () => {
+  // Every call site must go through sendOrderStatusNotificationOnce now —
+  // a bare `sendOrderStatusUpdateWhatsApp({` not preceded by `send: () =>`
+  // would mean an unguarded, non-idempotent, unsuppressed call slipped
+  // back in.
+  const bareCalls = adminOrderControllerSource.match(
+    /(?<!send:\s*\(\)\s*=>\s*\n?\s*)sendOrderStatusUpdateWhatsApp\(\{/g,
+  );
+  // The only acceptable "bare-looking" match is the one immediately
+  // preceded by `send: () =>` on the line above, which the negative
+  // lookbehind already excludes — so nothing should remain.
+  assert.equal(bareCalls, null);
+});
+
+test("a full-repo audit of every sendOrderStatusUpdateWhatsApp call site accounts for each one: 4 guarded (createShipment removed, trackShipment/cron/admin-single/admin-bulk guarded), 2 correctly unaffected (paid, return/refund labels)", () => {
+  const paymentControllerSource = read("../src/controllers/paymentController.js");
+  const returnControllerSource = read("../src/controllers/admin/returnController.js");
+  const createShipmentSource = shippingControllerSource.slice(
+    shippingControllerSource.indexOf("export const createShipment"),
+    shippingControllerSource.indexOf("export const reconcileShipment"),
+  );
+
+  // Removed entirely from createShipment.
+  assert.doesNotMatch(createShipmentSource, /sendOrderStatusUpdateWhatsApp\(/);
+  // Guarded in trackShipment/cron/admin (single + bulk).
+  for (const source of [shippingControllerSource, shippingCronSource, adminOrderControllerSource]) {
+    assert.match(source, /shouldSendBreeStatusWhatsApp/);
+  }
+  // Unaffected: paymentController's "paid" status notification.
+  assert.match(paymentControllerSource, /status:\s*"paid",/);
+  assert.match(paymentControllerSource, /sendOrderStatusUpdateWhatsApp\(/);
+  // Unaffected: returnController's return/refund event labels (never
+  // literally "shipped"/"out_for_delivery"/"delivered").
+  assert.match(returnControllerSource, /sendOrderStatusUpdateWhatsApp\(/);
+  assert.doesNotMatch(returnControllerSource, /status:\s*"shipped"/);
+  assert.doesNotMatch(returnControllerSource, /status:\s*"out_for_delivery"/);
+});
+
+// ── Consolidated checks the task explicitly asked for ──────────────────
+
+test("email behavior is completely unchanged: every email sender/template call site is untouched by this change", () => {
+  // The exact same email functions, called the exact same way, for the
+  // exact same statuses as before — only the WhatsApp side changed.
+  assert.match(shippingControllerSource, /sendShipmentCreatedEmail\(/);
+  assert.match(shippingControllerSource, /sendOutForDeliveryEmail\(/);
+  assert.match(shippingControllerSource, /sendShipmentDeliveredEmail\(/);
+  assert.match(shippingCronSource, /sendOutForDeliveryEmail\(/);
+  assert.match(shippingCronSource, /sendShipmentDeliveredEmail\(/);
+});
+
+test("UI-facing order statuses, order_status_history recording, and the Delhivery tracking-status mapping are all untouched", () => {
+  // The 7 UI statuses and their mapping from raw Delhivery statuses are
+  // unchanged — this task only touches which channel/message a status
+  // transition notifies through, never the statuses or history
+  // themselves.
+  assert.deepEqual(mapTrackingStatusToOrderStatus("delivered"), "delivered");
+  assert.deepEqual(mapTrackingStatusToOrderStatus("out for delivery"), "out_for_delivery");
+  assert.deepEqual(mapTrackingStatusToOrderStatus("dispatched"), "shipped");
+  assert.match(shippingControllerSource, /appendStatusHistory\(/);
+  assert.match(shippingCronSource, /appendStatusHistory\(/);
+  // Delhivery integration itself (shipment creation, tracking fetch) is
+  // untouched — this task never modifies delhiveryService.js.
+  assert.doesNotMatch(
+    fs.readFileSync(
+      path.join(__dirname, "../src/services/delhiveryService.js"),
+      "utf8",
+    ),
+    /shouldSendBreeStatusWhatsApp|buildOrderDeliveredThankYouMessage/,
+  );
 });

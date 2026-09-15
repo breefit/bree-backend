@@ -5,7 +5,72 @@ import {
   sendSubscriptionPauseEmail,
   sendSubscriptionResumeEmail,
 } from "../../services/orderEmailService.js";
-import { sendSubscriptionEmailOnce } from "../../services/subscriptionEmailNotificationService.js";
+import {
+  sendSubscriptionEmailOnce,
+  sendSubscriptionNotificationOnce,
+} from "../../services/subscriptionEmailNotificationService.js";
+import {
+  sendSubscriptionStatusWhatsApp,
+  maskMobile,
+} from "../../services/whatsappNotificationService.js";
+
+// FIX (admin actions must not bypass customer notification logic): the
+// customer-facing pause/resume/cancel in subscriptionController.js already
+// send both email and WhatsApp. This admin controller only ever sent
+// email — an admin pausing/resuming/cancelling a subscription on a
+// customer's behalf produced no WhatsApp notification at all, silently
+// diverging from the customer-initiated path for the exact same state
+// transition.
+//
+// FIX (idempotency): wraps the WhatsApp send in the same claim/send/
+// resolve mechanism the customer-facing controller uses
+// (sendSubscriptionNotificationOnce), keyed identically
+// (`subscription:{id}:{event}:whatsapp`) — so an admin action and the
+// customer-facing action for the same event, or the confirming webhook,
+// can never each independently send the same WhatsApp message twice.
+// Fire-and-forget: never awaited before the response, failures logged
+// only, never blocks or rolls back the underlying admin action.
+const sendWhatsAppOnce = ({ subscriptionId, orderId, event, mobile, customerName, planName }) => {
+  const notificationKey = `subscription:${subscriptionId}:${event}:whatsapp`;
+  sendSubscriptionNotificationOnce({
+    notificationKey,
+    send: () =>
+      sendSubscriptionStatusWhatsApp({
+        customerName,
+        mobile,
+        planName,
+        subscriptionUuid: subscriptionId,
+        status: event,
+      }),
+  })
+    .then((result) => {
+      console.info("[SUBSCRIPTION_NOTIFICATION]", {
+        subscriptionId,
+        orderId,
+        event,
+        channel: "whatsapp",
+        actor: "admin",
+        action: result.sent
+          ? "sent"
+          : result.duplicate
+            ? "duplicate_skipped"
+            : "skipped",
+        recipient: maskMobile(mobile),
+      });
+    })
+    .catch((err) => {
+      console.error("[SUBSCRIPTION_NOTIFICATION]", {
+        subscriptionId,
+        orderId,
+        event,
+        channel: "whatsapp",
+        actor: "admin",
+        action: "failed",
+        recipient: maskMobile(mobile),
+        error: err?.message || String(err),
+      });
+    });
+};
 
 const formatDate = (dateValue) => {
   if (!dateValue) return null;
@@ -419,7 +484,13 @@ export const pauseSubscription = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id, subscription_status, contact_email, contact_name FROM orders WHERE id = ? AND is_subscription = 1",
+      `SELECT o.id, o.razorpay_subscription_id, o.subscription_status,
+              o.contact_email, o.contact_name, o.contact_phone,
+              p.name AS product_name
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.id = ? AND o.is_subscription = 1`,
       [id],
     );
 
@@ -469,6 +540,15 @@ export const pauseSubscription = async (req, res) => {
           message: error?.message || String(error),
         }),
       );
+
+      sendWhatsAppOnce({
+        subscriptionId: order.razorpay_subscription_id,
+        orderId: order.id,
+        event: "paused",
+        mobile: order.contact_phone,
+        customerName: order.contact_name,
+        planName: order.product_name,
+      });
     }
 
     res.json({ success: true, subscription_status: response.status });
@@ -487,7 +567,13 @@ export const resumeSubscription = async (req, res) => {
   try {
     const { id } = req.params;
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id, contact_email, contact_name FROM orders WHERE id = ? AND is_subscription = 1",
+      `SELECT o.id, o.razorpay_subscription_id,
+              o.contact_email, o.contact_name, o.contact_phone,
+              p.name AS product_name
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.id = ? AND o.is_subscription = 1`,
       [id],
     );
 
@@ -527,6 +613,19 @@ export const resumeSubscription = async (req, res) => {
           message: error?.message || String(error),
         }),
       );
+
+      // Literal event name "resumed" — not response.status, which is
+      // Razorpay's raw billing status ("active") and not a key in
+      // whatsappNotificationService.js's message maps. See the identical
+      // fix in the customer-facing resumeSubscription.
+      sendWhatsAppOnce({
+        subscriptionId: order.razorpay_subscription_id,
+        orderId: order.id,
+        event: "resumed",
+        mobile: order.contact_phone,
+        customerName: order.contact_name,
+        planName: order.product_name,
+      });
     }
 
     res.json({ success: true, subscription_status: response.status });
@@ -543,7 +642,12 @@ export const cancelSubscription = async (req, res) => {
     const admin = req.admin;
 
     const { rows } = await query(
-      "SELECT id, razorpay_subscription_id, contact_email, contact_name FROM orders WHERE id = ? AND is_subscription = 1",
+      `SELECT o.id, o.razorpay_subscription_id, o.contact_email, o.contact_name,
+              o.contact_phone, p.name AS product_name
+       FROM orders o
+       JOIN order_items oi ON oi.order_id = o.id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.id = ? AND o.is_subscription = 1`,
       [id],
     );
 
@@ -600,6 +704,20 @@ export const cancelSubscription = async (req, res) => {
           message: error?.message || String(error),
         }),
       );
+
+      // Same literal "cancelled" event label the customer-facing cancel
+      // path uses — the WhatsApp copy communicates the action just taken,
+      // while the stored subscription_status stays the more precise
+      // "cancellation_requested" until the subscription.cancelled webhook
+      // confirms the cycle has actually ended (see the comment above).
+      sendWhatsAppOnce({
+        subscriptionId: order.razorpay_subscription_id,
+        orderId: order.id,
+        event: "cancelled",
+        mobile: order.contact_phone,
+        customerName: order.contact_name,
+        planName: order.product_name,
+      });
     }
 
     res.json({ success: true, subscription_status: response.status });

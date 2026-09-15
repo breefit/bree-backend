@@ -992,3 +992,46 @@ export const sendSubscriptionHaltedEmail = async ({
     }),
   });
 };
+
+// FIX (no "Expired" handling existed anywhere): once a subscription
+// reaches its Razorpay-side total_count of billing cycles, Razorpay stops
+// billing it permanently — a genuine terminal state distinct from
+// cancel/pause/halt, and one of the statuses this system is required to
+// notify on. There was previously no email (or WhatsApp copy, or DB
+// write) for it at all.
+export const sendSubscriptionExpiredEmail = async ({
+  to,
+  name,
+  orderId,
+  subscriptionId,
+}) => {
+  const frontendUrl = getFrontendUrl();
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${name || "there"},`,
+      subtext: `Your subscription for order <strong>#${formatOrderRef(orderId)}</strong> has completed its billing cycles and is no longer active.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId })}
+          ${buildInfoCard([{ label: "Subscription ID", value: subscriptionId }])}
+          ${buildSecondaryButton(WEBSITE_URL, "SUBSCRIBE AGAIN")}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thank you for being a BREE Wellness subscriber. You can start a new subscription anytime.")}
+  `;
+
+  await sendEmail({
+    to,
+    subject: `Subscription Expired — BREE #${formatOrderRef(orderId)}`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: "Your BREE Wellness subscription has expired.",
+    }),
+  });
+};

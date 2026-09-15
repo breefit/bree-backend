@@ -15,9 +15,13 @@ import {
   sendSubscriptionStatusWhatsApp,
   sendPaymentStatusWhatsApp,
   validateMobile,
+  maskMobile,
 } from "../services/whatsappNotificationService.js";
 import { createDailyReminder } from "../services/dailyReminderService.js";
-import { sendSubscriptionEmailOnce } from "../services/subscriptionEmailNotificationService.js";
+import {
+  sendSubscriptionEmailOnce,
+  sendSubscriptionNotificationOnce,
+} from "../services/subscriptionEmailNotificationService.js";
 
 // ── Shared logger ────────────────────────────────────────────────────────────
 // NOTE: No shared logging utility was found/confirmed in this codebase during
@@ -76,18 +80,63 @@ const toMySQLDateTime = (date) => {
 };
 
 // ── WhatsApp notification helper ────────────────────────────────────────────
-// Fire-and-forget wrapper: never awaited by callers before a response is
-// sent, and swallows/logs its own errors so a WhatsApp failure can never
-// fail an API response or trigger a DB rollback.
-const sendWhatsAppSafe = async (fn, payload, label) => {
-  try {
-    await fn(payload);
-  } catch (err) {
-    logger.error(`[WHATSAPP] ${label} notification failed`, {
-      message: err?.message || String(err),
-      stack: err?.stack,
+// FIX (subscription WhatsApp sends had zero idempotency — see
+// sendSubscriptionNotificationOnce's own comment for the full rationale):
+// wraps a sendSubscriptionStatusWhatsApp call in the shared claim/send/
+// resolve mechanism, keyed identically to this event's email notification
+// plus a `:whatsapp` suffix — so a customer action, the mirrored admin
+// action, and the confirming webhook for the exact same lifecycle event
+// can never each independently send the customer the same WhatsApp
+// message. Fire-and-forget: never awaited before the response, its own
+// errors are caught and logged only, never able to fail the request or
+// roll back a DB change. Structured [SUBSCRIPTION_NOTIFICATION] logs
+// carry the subscription id, event, and masked recipient — never a raw
+// phone number, template name, API key, or token.
+const sendSubscriptionStatusWhatsAppOnce = ({
+  subscriptionId,
+  orderId,
+  event,
+  mobile,
+  customerName,
+  planName,
+}) => {
+  const notificationKey = `subscription:${subscriptionId}:${event}:whatsapp`;
+  sendSubscriptionNotificationOnce({
+    notificationKey,
+    send: () =>
+      sendSubscriptionStatusWhatsApp({
+        customerName,
+        mobile,
+        planName,
+        subscriptionUuid: subscriptionId,
+        status: event,
+      }),
+  })
+    .then((result) => {
+      logger.info("[SUBSCRIPTION_NOTIFICATION]", {
+        subscriptionId,
+        orderId,
+        event,
+        channel: "whatsapp",
+        action: result.sent
+          ? "sent"
+          : result.duplicate
+            ? "duplicate_skipped"
+            : "skipped",
+        recipient: maskMobile(mobile),
+      });
+    })
+    .catch((err) => {
+      logger.error("[SUBSCRIPTION_NOTIFICATION]", {
+        subscriptionId,
+        orderId,
+        event,
+        channel: "whatsapp",
+        action: "failed",
+        recipient: maskMobile(mobile),
+        error: err?.message || String(err),
+      });
     });
-  }
 };
 
 // ── Validation helpers ───────────────────────────────────────────────────────
@@ -672,26 +721,18 @@ export const createSubscription = async (req, res) => {
       logger.warn("[SUBSCRIPTION] Socket emit failed", e);
     }
 
-    // WhatsApp: Subscription Created — fired after commit, never awaited
-    // before the response, failure is logged only.
-    sendWhatsAppSafe(
-      (payload) =>
-        sendSubscriptionStatusWhatsApp({
-          customerName: payload.name,
-          mobile: payload.to,
-          planName: payload.planName,
-          subscriptionUuid: payload.subscriptionId,
-          status: payload.status,
-        }),
-      {
-        to: mobileNumber,
-        name: customerName,
-        planName: validatedItems[0].name,
-        subscriptionId: subscription.id,
-        status: "created",
-      },
-      "Subscription Created",
-    );
+    // FIX (premature "activated" notification): this used to fire a
+    // WhatsApp here, immediately after the pending order row is
+    // committed — i.e. BEFORE the customer has even opened the Razorpay
+    // checkout popup, let alone paid. Its message copy ("Your
+    // subscription has been activated successfully.") is simply false at
+    // this point: the order is `pending`, no charge has happened, and the
+    // payment might fail or be abandoned entirely. The correct,
+    // consistently-triggered "activated" notification (email + WhatsApp,
+    // exactly once regardless of which of the three possible confirmation
+    // paths reaches it first) is now sent from the point the subscription
+    // genuinely becomes active — see paymentController.js's verifyPayment
+    // and the subscription.activated/payment.captured webhook cases.
 
     return res.json({
       success: true,
@@ -980,25 +1021,17 @@ export const cancelSubscription = async (req, res) => {
 
       if (stateChanged) {
         // WhatsApp: Subscription Cancelled — only fired once the DB update
-        // above has succeeded.
-        sendWhatsAppSafe(
-          (payload) =>
-            sendSubscriptionStatusWhatsApp({
-              customerName: payload.name,
-              mobile: payload.to,
-              planName: payload.planName,
-              subscriptionUuid: payload.subscriptionId,
-              status: payload.status,
-            }),
-          {
-            to: order.contact_phone,
-            name: order.contact_name,
-            planName: order.product_name,
-            subscriptionId: order.razorpay_subscription_id,
-            status: "cancelled",
-          },
-          "Subscription Cancelled",
-        );
+        // above has succeeded. Idempotent: shares its key with the admin
+        // cancel path and the subscription.cancelled webhook confirmation,
+        // so whichever fires first is the only one that actually sends.
+        sendSubscriptionStatusWhatsAppOnce({
+          subscriptionId: order.razorpay_subscription_id,
+          orderId: order.id,
+          event: "cancelled",
+          mobile: order.contact_phone,
+          customerName: order.contact_name,
+          planName: order.product_name,
+        });
       }
     } catch (dbErr) {
       logger.error("[CANCEL] DB update failed after Razorpay cancel", {
@@ -1101,25 +1134,16 @@ export const pauseSubscription = async (req, res) => {
 
       if (stateChanged) {
         // WhatsApp: Subscription Paused — only fired once the DB update
-        // above has succeeded.
-        sendWhatsAppSafe(
-          (payload) =>
-            sendSubscriptionStatusWhatsApp({
-              customerName: payload.name,
-              mobile: payload.to,
-              planName: payload.planName,
-              subscriptionUuid: payload.subscriptionId,
-              status: payload.status,
-            }),
-          {
-            to: order.contact_phone,
-            name: order.contact_name,
-            planName: order.product_name,
-            subscriptionId: order.razorpay_subscription_id,
-            status: "paused",
-          },
-          "Subscription Paused",
-        );
+        // above has succeeded. Idempotent: shares its key with the admin
+        // pause path and the subscription.paused webhook confirmation.
+        sendSubscriptionStatusWhatsAppOnce({
+          subscriptionId: order.razorpay_subscription_id,
+          orderId: order.id,
+          event: "paused",
+          mobile: order.contact_phone,
+          customerName: order.contact_name,
+          planName: order.product_name,
+        });
 
         sendSubscriptionEmailOnce({
           notificationKey: `subscription:${order.razorpay_subscription_id}:paused`,
@@ -1226,25 +1250,29 @@ export const resumeSubscription = async (req, res) => {
 
       if (stateChanged) {
         // WhatsApp: Subscription Resumed — only fired once the DB update
-        // above has succeeded.
-        sendWhatsAppSafe(
-          (payload) =>
-            sendSubscriptionStatusWhatsApp({
-              customerName: payload.name,
-              mobile: payload.to,
-              planName: payload.planName,
-              subscriptionUuid: payload.subscriptionId,
-              status: payload.status,
-            }),
-          {
-            to: order.contact_phone,
-            name: order.contact_name,
-            planName: order.product_name,
-            subscriptionId: order.razorpay_subscription_id,
-            status: response.status || SUBSCRIPTION_STATUS.ACTIVE,
-          },
-          "Subscription Resumed",
-        );
+        // above has succeeded. Idempotent: shares its key with the admin
+        // resume path and the subscription.resumed webhook confirmation.
+        //
+        // FIX: event must be the literal "resumed" (matching every other
+        // call site's literal "created"/"paused"/"cancelled"), not
+        // Razorpay's raw billing status. Razorpay's resume response.status
+        // is typically the literal string "active", which is not a key in
+        // either getReadableSubscriptionStatus/buildSubscriptionStatusMessage's
+        // lookup maps in whatsappNotificationService.js — so the customer
+        // was silently getting the generic fallback text ("Your
+        // subscription status has been updated.") instead of the
+        // dedicated "Your subscription has been resumed successfully."
+        // copy. The DB write above correctly keeps using response.status
+        // (the actual billing status); only the notification's event
+        // label changes here.
+        sendSubscriptionStatusWhatsAppOnce({
+          subscriptionId: order.razorpay_subscription_id,
+          orderId: order.id,
+          event: "resumed",
+          mobile: order.contact_phone,
+          customerName: order.contact_name,
+          planName: order.product_name,
+        });
       }
     } catch (dbErr) {
       logger.error("[RESUME] DB update failed after Razorpay resume", {

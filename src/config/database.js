@@ -442,6 +442,59 @@ const ensureDailyReminderPhoneColumns = async () => {
   }
 };
 
+// FIX (Daily Reminder purchase → persistence gap): daily_reminders is
+// designed as one row per (order, product) — createOrder and
+// createSubscription both create it at most once per (order_id,
+// product_id), and verifyPayment's fallback only creates one when that
+// exact pair doesn't already exist. This adds a DB-level guarantee of that
+// invariant (defense-in-depth against a future code path accidentally
+// double-inserting), the same idempotent information_schema pattern as
+// every other ensure*() helper in this file. Best-effort / non-fatal: if
+// historical duplicate rows already exist, this logs and skips rather than
+// crashing startup — cleaning those up, if ever needed, is a separate,
+// deliberate action, not something this should do automatically.
+const ensureDailyReminderOrderProductUnique = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [uniqueIndexes] = await pool.query(
+      `SELECT DISTINCT index_name
+       FROM information_schema.statistics
+       WHERE table_schema = ?
+         AND table_name = 'daily_reminders'
+         AND index_name = 'uq_daily_reminders_order_product'`,
+      [currentDb],
+    );
+    if (uniqueIndexes.length) return;
+
+    const [duplicates] = await pool.query(
+      `SELECT order_id, product_id
+       FROM daily_reminders
+       GROUP BY order_id, product_id
+       HAVING COUNT(*) > 1
+       LIMIT 1`,
+    );
+    if (duplicates.length) {
+      console.warn(
+        "⚠️ daily_reminders has existing duplicate (order_id, product_id) rows — skipping unique index. Investigate before adding it manually.",
+      );
+      return;
+    }
+
+    await pool.query(
+      `ALTER TABLE daily_reminders
+       ADD UNIQUE INDEX uq_daily_reminders_order_product (order_id, product_id)`,
+    );
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure daily_reminders (order_id, product_id) unique index:",
+      err?.message || err,
+    );
+  }
+};
+
 // ── Bulk Order workflow columns ─────────────────────────────────────────────
 // bulk_bookings gains payment tracking (Razorpay), quote-approval tracking,
 // and an order-creation guard (order_created / created_order_id) so the
@@ -1435,6 +1488,7 @@ await ensureSubscriptionEmailNotificationSchema();
 await ensureOrderStatusNotificationSchema();
 await ensureOrderShippingColumns().catch(console.error);
 await ensureDailyReminderPhoneColumns().catch(console.error);
+await ensureDailyReminderOrderProductUnique().catch(console.error);
 await ensureBulkBookingWorkflowColumns().catch(console.error);
 await ensureBulkBookingUserIdIndexAndBackfill().catch(console.error);
 await ensureBulkBookingNumberSchema().catch(console.error);

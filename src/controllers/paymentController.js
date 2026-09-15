@@ -11,13 +11,17 @@ import {
   sendOrderStatusUpdateEmail,
   sendSubscriptionActivationEmail,
   sendSubscriptionCancellationEmail,
+  sendSubscriptionExpiredEmail,
   sendSubscriptionFailedEmail,
   sendSubscriptionHaltedEmail,
   sendSubscriptionPauseEmail,
   sendSubscriptionResumeEmail,
 } from "../services/orderEmailService.js";
 import { createRenewalOrder } from "../services/renewalService.js";
-import { sendSubscriptionEmailOnce } from "../services/subscriptionEmailNotificationService.js";
+import {
+  sendSubscriptionEmailOnce,
+  sendSubscriptionNotificationOnce,
+} from "../services/subscriptionEmailNotificationService.js";
 import { createPackagePurchaseFromOrder } from "../services/packageFulfillmentService.js";
 import { createDailyReminder } from "../services/dailyReminderService.js";
 import delhiveryService from "../services/delhiveryService.js";
@@ -29,7 +33,9 @@ import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
   sendOrderStatusUpdateWhatsApp,
+  sendSubscriptionStatusWhatsApp,
   validateMobile,
+  maskMobile,
 } from "../services/whatsappNotificationService.js";
 
 let productShippingColumnsAvailable = null;
@@ -77,6 +83,106 @@ export const describeRazorpayError = (err) => {
     reason: toErrorText(details?.reason),
     details: toErrorText(details?.details),
   };
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subscription WhatsApp notifications, shared across verifyPayment and every
+// handleWebhook case that can transition a subscription's customer-visible
+// status. `orders` rows carry no product name directly (that's on
+// order_items/products), so it's resolved once per call here instead of at
+// every call site.
+// ─────────────────────────────────────────────────────────────────────────────
+const getSubscriptionPlanName = async (orderId) => {
+  try {
+    const { rows } = await query(
+      `SELECT p.name AS product_name
+       FROM order_items oi
+       JOIN products p ON p.id = oi.product_id
+       WHERE oi.order_id = ? LIMIT 1`,
+      [orderId],
+    );
+    return rows[0]?.product_name || "your subscription";
+  } catch {
+    return "your subscription";
+  }
+};
+
+// FIX (webhook-driven subscription events sent email but never WhatsApp —
+// see the individual case comments below for which events this closes):
+// every one of these events is a customer-visible subscription status
+// change, and every customer/admin-initiated equivalent already sends
+// both channels — there is no stated business reason for the webhook-only
+// path (activation, renewal receipt, halt, payment failure, and the
+// webhook's own confirmation of pause/resume/cancel) to be email-only.
+//
+// Idempotent via sendSubscriptionNotificationOnce, keyed identically to
+// this event's email notification plus a `:whatsapp` suffix (event-scoped
+// keys are shared with the customer/admin-triggered WhatsApp send for the
+// same transition, so whichever path reaches it first is the only one
+// that actually sends — see subscriptionController.js/
+// subscriptionAdminController.js's matching helpers). Never awaited by
+// callers, never able to fail or roll back the surrounding transaction/
+// response. Structured [SUBSCRIPTION_NOTIFICATION] logs carry the
+// subscription id, order id, event, and masked recipient only — never a
+// raw phone number, template name, API key, or token.
+const sendSubscriptionWhatsAppOnce = async ({
+  notificationKey,
+  subscriptionId,
+  orderId,
+  event,
+  mobile,
+  customerName,
+}) => {
+  if (!mobile) {
+    console.warn("[SUBSCRIPTION_NOTIFICATION]", {
+      subscriptionId,
+      orderId,
+      event,
+      channel: "whatsapp",
+      action: "skipped",
+      reason: "no_phone_number",
+    });
+    return;
+  }
+
+  const planName = await getSubscriptionPlanName(orderId);
+
+  sendSubscriptionNotificationOnce({
+    notificationKey,
+    send: () =>
+      sendSubscriptionStatusWhatsApp({
+        customerName: customerName || "Customer",
+        mobile,
+        planName,
+        subscriptionUuid: subscriptionId,
+        status: event,
+      }),
+  })
+    .then((result) => {
+      console.info("[SUBSCRIPTION_NOTIFICATION]", {
+        subscriptionId,
+        orderId,
+        event,
+        channel: "whatsapp",
+        action: result.sent
+          ? "sent"
+          : result.duplicate
+            ? "duplicate_skipped"
+            : "skipped",
+        recipient: maskMobile(mobile),
+      });
+    })
+    .catch((err) => {
+      console.error("[SUBSCRIPTION_NOTIFICATION]", {
+        subscriptionId,
+        orderId,
+        event,
+        channel: "whatsapp",
+        action: "failed",
+        recipient: maskMobile(mobile),
+        error: err?.message || String(err),
+      });
+    });
 };
 
 export const classifyPaymentState = ({
@@ -305,7 +411,9 @@ export const createOrder = async (req, res) => {
 
       // Validate that product exists and has reminder enabled
       const { rows: productRows } = await query(
-        `SELECT id, daily_reminder_enabled, daily_reminder_price
+        `SELECT id, daily_reminder_enabled, daily_reminder_price,
+                daily_reminder_original_price, is_recurring_package,
+                package_duration_months, package_fulfillment_interval_days
          FROM products
          WHERE id = ? AND is_active = 1`,
         [reminderProductId],
@@ -348,6 +456,13 @@ export const createOrder = async (req, res) => {
         });
       }
 
+      const packageDurationDays =
+        Number(reminderProduct.is_recurring_package) === 1 &&
+        Number(reminderProduct.package_duration_months) > 0
+          ? Number(reminderProduct.package_duration_months) *
+            Number(reminderProduct.package_fulfillment_interval_days || 30)
+          : null;
+
       validatedReminders.push({
         product_id: reminderProductId,
         time: reminderTime,
@@ -356,6 +471,13 @@ export const createOrder = async (req, res) => {
         reminder_whatsapp_number: reminderWhatsappNumber
           ? validateMobile(reminderWhatsappNumber)
           : null,
+        // Carried forward so the reminder can be created right here in
+        // createOrder (see the daily_reminders insert after order_items
+        // below) instead of re-deriving product config a second time.
+        reminder_original_price:
+          Number(reminderProduct.daily_reminder_original_price) ||
+          expectedReminderCharge,
+        package_duration_days: packageDurationDays,
       });
 
       reminderCharges += expectedReminderCharge;
@@ -606,6 +728,69 @@ export const createOrder = async (req, res) => {
           item.price * item.quantity,
         ],
       );
+    }
+
+    // FIX (Daily Reminder purchase → persistence gap): daily_reminders used
+    // to be created only in verifyPayment, reconstructed from whatever
+    // `reminders` array the client happened to resend in the payment-verify
+    // callback. That's fragile — a page reload/app-switch during the
+    // Razorpay Magic Checkout flow (common on mobile, and in the WhatsApp
+    // in-app browser) can wipe that client-side state, and verifyPayment had
+    // no fallback: the order still finalized as paid, but daily_reminders
+    // silently ended up empty even though the reminder charge was already
+    // included in the amount the customer paid. subscriptionController.js's
+    // createSubscription already gets this right — it creates the reminder
+    // here, transactionally with order_items, before any payment happens —
+    // so this mirrors that same, already-proven pattern instead of the
+    // fragile verify-time reconstruction. verifyPayment now only acts as a
+    // fallback for orders created before this fix (see below).
+    for (const reminder of validatedReminders) {
+      const { rows: itemRows } = await client.query(
+        `SELECT id FROM order_items WHERE order_id = ? AND product_id = ? LIMIT 1`,
+        [orderId, reminder.product_id],
+      );
+
+      if (!itemRows.length) {
+        console.error("[DAILY_REMINDER] Order item not found for reminder", {
+          orderId,
+          productId: reminder.product_id,
+        });
+        continue;
+      }
+
+      const reminderResult = await createDailyReminder({
+        userId: req.user?.id || null,
+        orderId,
+        orderItemId: itemRows[0].id,
+        productId: reminder.product_id,
+        reminderTime: reminder.time,
+        reminderPricePaid: reminder.price,
+        reminderOriginalPrice: reminder.reminder_original_price,
+        packageDurationDays: reminder.package_duration_days,
+        reminderWhatsappNumber: reminder.reminder_whatsapp_number,
+        reminderPhoneSource: reminder.reminder_phone_source,
+        queryExecutor: client.query.bind(client),
+      });
+
+      if (!reminderResult?.success) {
+        // The customer hasn't paid yet at this point in createOrder — safe
+        // to fail the whole request rather than let a paid-for reminder
+        // silently disappear later.
+        console.error("[DAILY_REMINDER] CREATE_FAILED", {
+          orderId,
+          productId: reminder.product_id,
+          error: reminderResult?.error,
+        });
+        throw new Error(
+          reminderResult?.error || "Daily reminder creation failed",
+        );
+      }
+
+      console.info("[DAILY_REMINDER] CREATED", {
+        orderId,
+        productId: reminder.product_id,
+        reminderTime: reminder.time,
+      });
     }
 
     await client.query(
@@ -1480,6 +1665,33 @@ export const verifyPayment = async (req, res) => {
   let resolvedPhone;
   let resolvedAddress;
   let resolvedAddressId;
+  // FIX (severe, unrelated pre-existing bug — confirmed by direct
+  // reproduction, not just static reading): this was declared with
+  // `const` INSIDE the transaction's try block below but read again
+  // AFTER that block's try/catch/finally closes. That is a genuine
+  // out-of-scope reference — `const`/`let` are block-scoped, not
+  // hoisted — so every successful, non-duplicate /api/payment/verify
+  // call (subscription AND normal orders alike) threw
+  // `ReferenceError: paidStatusTransition is not defined` immediately
+  // after the DB transaction had already committed. The order/payment
+  // was correctly saved as paid, but the endpoint then crashed instead
+  // of returning {success:true}, and notifyPaidStatusUpdate (the "order
+  // is now paid" email/WhatsApp) never ran for any order taking this
+  // path. Introduced 2026-09-10 (git blame), unrelated to the
+  // subscription work in this session, but directly in the way of it —
+  // any subscription-activation notification placed after this point
+  // would never have survived to run either.
+  let paidStatusTransition = false;
+  // Set below, inside the transaction, from lockedOrder.subscription_status
+  // (captured under FOR UPDATE before this call's own UPDATE runs) — true
+  // only when THIS verifyPayment call is the one that actually flips a
+  // subscription from not-yet-active to active. Drives the shared,
+  // idempotent activation notification (email + WhatsApp) fired after
+  // commit, below — see the matching guards in handleWebhook's
+  // subscription.activated and payment.captured cases, all three of which
+  // share the same notification key so only whichever of the three wins
+  // this race actually sends.
+  let subscriptionJustActivated = false;
 
   const client = await getClient();
   try {
@@ -1657,6 +1869,19 @@ export const verifyPayment = async (req, res) => {
       ],
     );
 
+    // lockedOrder.subscription_status reflects the row's state BEFORE the
+    // UPDATE just above — the duplicate-payment short-circuit earlier in
+    // this function (paymentState === "already_paid") already guarantees
+    // this specific razorpay_payment_id hasn't been processed before, so
+    // reaching here with a not-yet-'active' prior status means this call
+    // is genuinely the one performing the subscription's first activation.
+    if (
+      isSubscriptionOrder &&
+      lockedOrder.subscription_status !== "active"
+    ) {
+      subscriptionJustActivated = true;
+    }
+
     const paymentUpdate = await client.query(
       `UPDATE payments SET
         razorpay_payment_id = ?,
@@ -1689,7 +1914,7 @@ export const verifyPayment = async (req, res) => {
       );
     }
 
-    const paidStatusTransition = shouldRecordPaymentHistory(
+    paidStatusTransition = shouldRecordPaymentHistory(
       lockedOrder.payment_status,
     );
     if (paidStatusTransition) {
@@ -1726,12 +1951,35 @@ export const verifyPayment = async (req, res) => {
           const reminderWhatsappNumber =
             reminder.reminder_whatsapp_number || reminder.custom_phone || null;
 
+          // FIX (Daily Reminder purchase → persistence gap): createOrder now
+          // creates daily_reminders transactionally, before payment, instead
+          // of relying on this endpoint reconstructing it from whatever the
+          // client resent in the verify-payment callback (see createOrder
+          // for the full explanation). For every order created after this
+          // fix, the row already exists by the time verifyPayment runs — so
+          // skip it here rather than attempting a second INSERT. This block
+          // now only serves as a fallback for orders whose createOrder call
+          // ran before this fix was deployed (no row exists yet).
+          const { rows: existingReminderRows } = await client.query(
+            `SELECT id FROM daily_reminders WHERE order_id = ? AND product_id = ? LIMIT 1`,
+            [order.id, productId],
+          );
+          if (existingReminderRows.length) {
+            console.info("[DAILY_REMINDER] SKIPPED", {
+              orderId: order.id,
+              productId,
+              reason: "already created at order creation",
+            });
+            continue;
+          }
+
           // Validate reminder time (prevent fraud)
           if (!ALLOWED_REMINDER_TIMES.includes(reminderTime)) {
-            console.warn(
-              "[VERIFY_PAYMENT] Skipping reminder with invalid time",
-              { orderId: order.id, productId, reminderTime },
-            );
+            console.warn("[DAILY_REMINDER] SKIPPED", {
+              orderId: order.id,
+              productId,
+              reason: "invalid reminder time",
+            });
             continue;
           }
 
@@ -1746,10 +1994,11 @@ export const verifyPayment = async (req, res) => {
           );
 
           if (!prodRows.length || !prodRows[0].daily_reminder_enabled) {
-            console.warn(
-              "[VERIFY_PAYMENT] Skipping reminder for unavailable product",
-              { orderId: order.id, productId },
-            );
+            console.warn("[DAILY_REMINDER] SKIPPED", {
+              orderId: order.id,
+              productId,
+              reason: "product unavailable or reminder not enabled",
+            });
             continue;
           }
 
@@ -1770,16 +2019,26 @@ export const verifyPayment = async (req, res) => {
           );
 
           if (!oiRows.length) {
-            console.warn("[VERIFY_PAYMENT] Order item not found for reminder", {
+            console.warn("[DAILY_REMINDER] SKIPPED", {
               orderId: order.id,
               productId,
+              reason: "order item not found",
             });
             continue;
           }
 
           const orderItemId = oiRows[0].id;
 
-          // Create daily reminder
+          // Create daily reminder. FIX (Section 6 — payment already
+          // captured by the time verifyPayment runs): a reminder failure
+          // here must not roll back an already-paid order. Log loudly and
+          // keep going instead of throwing, unlike createOrder's version of
+          // this same call (which runs before payment and is safe to fail).
+          console.info("[DAILY_REMINDER] ATTEMPT", {
+            orderId: order.id,
+            productId,
+            reminderTime,
+          });
           try {
             const reminderResult = await createDailyReminder({
               userId: order.user_id,
@@ -1802,26 +2061,27 @@ export const verifyPayment = async (req, res) => {
               );
             }
 
-            console.info("[VERIFY_PAYMENT] Daily reminder created", {
+            console.info("[DAILY_REMINDER] CREATED", {
               orderId: order.id,
               productId,
               reminderTime,
             });
           } catch (reminderErr) {
-            console.error("[VERIFY_PAYMENT] Failed to create daily reminder", {
+            console.error("[DAILY_REMINDER] CREATE_FAILED", {
               orderId: order.id,
               productId,
               error: reminderErr.message,
             });
-            throw reminderErr;
+            // Intentionally not rethrown — see comment above.
           }
         }
       } catch (remindersErr) {
-        console.error("[VERIFY_PAYMENT] Error processing reminders", {
+        console.error("[DAILY_REMINDER] Unexpected error processing reminders", {
           orderId: order.id,
           error: remindersErr.message,
         });
-        throw remindersErr;
+        // Also intentionally not rethrown, for the same reason: the
+        // customer's payment already succeeded by this point.
       }
     }
 
@@ -1867,6 +2127,50 @@ export const verifyPayment = async (req, res) => {
   await notifyInitialOrderConfirmation(order.id);
   if (paidStatusTransition) {
     await notifyPaidStatusUpdate(order.id);
+  }
+
+  // FIX (subscription activation notification was missing from the
+  // primary/common confirmation path): verifyPayment is the
+  // frontend-invoked path that runs immediately after a successful
+  // Razorpay checkout, and is typically the FIRST of three possible
+  // triggers to reach the subscription's first activation (the other two
+  // are handleWebhook's subscription.activated and payment.captured
+  // cases). Previously, nothing in verifyPayment sent the dedicated
+  // subscription-activated email or WhatsApp at all — only the webhook's
+  // subscription.activated case did, guarded by a `<> 'active'` check
+  // that this call, having usually already won the race, caused to be a
+  // silent no-op. In the common case, the customer got only the generic
+  // order-confirmation notification above (notifyInitialOrderConfirmation)
+  // — never the dedicated "Your subscription has been activated
+  // successfully." copy. Shares its notification key with the two webhook
+  // cases so exactly one of the three ever actually sends, regardless of
+  // which wins the race.
+  if (subscriptionJustActivated) {
+    const activationKey = `subscription:${razorpay_subscription_id}:activated`;
+    sendSubscriptionEmailOnce({
+      notificationKey: activationKey,
+      send: () =>
+        sendSubscriptionActivationEmail({
+          to: resolvedEmail,
+          name: resolvedName,
+          orderId: order.id,
+          amount: order.total ?? order.amount,
+          subscriptionId: razorpay_subscription_id,
+        }),
+    }).catch((error) =>
+      console.error("[VERIFY_PAYMENT] Subscription activation email failed", {
+        orderId: order.id,
+        message: error?.message || String(error),
+      }),
+    );
+    sendSubscriptionWhatsAppOnce({
+      notificationKey: `${activationKey}:whatsapp`,
+      subscriptionId: razorpay_subscription_id,
+      orderId: order.id,
+      event: "created",
+      mobile: resolvedPhone,
+      customerName: resolvedName,
+    });
   }
 
   let nextBillingDate = null;
@@ -2676,20 +2980,64 @@ export const handleWebhook = async (req, res) => {
       if (rzpSubscriptionId) {
         const order = await loadBySubscription();
         if (order) {
-          await query(
+          // FIX (unconditional UPDATE + unconditional addHistory — a real
+          // duplicate-history bug, not just a missing notification): this
+          // had no transition guard at all, unlike every other webhook
+          // case in this switch. A Razorpay webhook redelivery (their
+          // documented retry behavior on anything but a fast 2xx), or
+          // this event racing with verifyPayment/subscription.activated
+          // for the same first payment, re-ran this UPDATE and
+          // unconditionally inserted another "Subscription payment
+          // captured" order_status_history row every single time — and,
+          // since nothing here ever sent a notification, that was the
+          // only symptom visible in the DB, easy to miss. Guarding on
+          // `<> 'active'` (same pattern as subscription.activated below)
+          // makes this genuinely once-only and gives it a real place to
+          // hang the activation notification for the case where this
+          // event is the one that wins the three-way race between
+          // verifyPayment, subscription.activated, and payment.captured.
+          const captureActivation = await query(
             `UPDATE orders SET
                payment_status = 'paid',
                subscription_status = 'active',
                updated_at = NOW()
-             WHERE id = ?`,
+             WHERE id = ? AND COALESCE(subscription_status, '') <> 'active'`,
             [order.id],
           );
-          await addHistory(
-            order.id,
-            order.subscription_status,
-            "active",
-            "Subscription payment captured",
-          );
+          if (captureActivation.rowCount) {
+            await addHistory(
+              order.id,
+              order.subscription_status,
+              "active",
+              "Subscription payment captured",
+            );
+
+            const activationKey = `subscription:${rzpSubscriptionId}:activated`;
+            sendSubscriptionEmailOnce({
+              notificationKey: activationKey,
+              send: () =>
+                sendSubscriptionActivationEmail({
+                  to: order.contact_email || order.email,
+                  name: order.contact_name || order.customer_name,
+                  orderId: order.id,
+                  amount: order.total ?? order.amount,
+                  subscriptionId: rzpSubscriptionId,
+                }),
+            }).catch((error) =>
+              console.error("[WEBHOOK] Subscription activation email failed", {
+                orderId: order.id,
+                message: error?.message || String(error),
+              }),
+            );
+            sendSubscriptionWhatsAppOnce({
+              notificationKey: `${activationKey}:whatsapp`,
+              subscriptionId: rzpSubscriptionId,
+              orderId: order.id,
+              event: "created",
+              mobile: order.contact_phone || order.mobile_number,
+              customerName: order.contact_name || order.customer_name,
+            });
+          }
           emitUpdate(order.id, order.order_status);
         }
       } else if (rzpOrderId) {
@@ -2915,6 +3263,18 @@ export const handleWebhook = async (req, res) => {
                 message: error?.message || String(error),
               }),
             );
+
+            // FIX: subscription payment failure previously sent email
+            // only. Keyed per payment id (like the email above) — each
+            // distinct failed charge attempt notifies once.
+            sendSubscriptionWhatsAppOnce({
+              notificationKey: `subscription:${rzpSubscriptionId}:payment:${rzpPaymentId || "unknown"}:payment.failed:whatsapp`,
+              subscriptionId: rzpSubscriptionId,
+              orderId: order.id,
+              event: "payment_failed",
+              mobile: order.contact_phone || order.mobile_number,
+              customerName: order.contact_name || order.customer_name,
+            });
           }
         }
       } else if (rzpOrderId) {
@@ -2979,6 +3339,19 @@ export const handleWebhook = async (req, res) => {
               message: error?.message || String(error),
             }),
           );
+
+          // FIX: this event previously sent email only. Shares its key
+          // with the payment.captured branch's activation WhatsApp above
+          // and verifyPayment's (below) — only whichever of the three
+          // paths actually wins the `<> 'active'` transition guard sends.
+          sendSubscriptionWhatsAppOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:activated:whatsapp`,
+            subscriptionId: rzpSubscriptionId,
+            orderId: order.id,
+            event: "created",
+            mobile: order.contact_phone || order.mobile_number,
+            customerName: order.contact_name || order.customer_name,
+          });
         }
       }
       break;
@@ -3036,6 +3409,18 @@ export const handleWebhook = async (req, res) => {
                 message: e?.message || String(e),
               }),
             );
+
+            // FIX: renewal previously sent email only — no WhatsApp for
+            // any successful recurring charge. Keyed per payment id
+            // (like the email above), so each new renewal notifies once.
+            sendSubscriptionWhatsAppOnce({
+              notificationKey: `subscription:${rzpSubscriptionId}:payment:${rzpPaymentId || "unknown"}:subscription.charged:whatsapp`,
+              subscriptionId: rzpSubscriptionId,
+              orderId: renewalOrderId,
+              event: "renewed",
+              mobile: originOrder.contact_phone || originOrder.mobile_number,
+              customerName: originOrder.contact_name || originOrder.customer_name,
+            });
           }
         }
       } catch (err) {
@@ -3087,6 +3472,20 @@ export const handleWebhook = async (req, res) => {
               message: error?.message || String(error),
             }),
           );
+
+          // FIX: shares its key with the customer/admin pause WhatsApp —
+          // only the first of the three to actually send. This closes the
+          // gap for a subscription paused directly via Razorpay (e.g. the
+          // Razorpay Dashboard) rather than through BREE's own API, which
+          // previously produced no WhatsApp at all.
+          sendSubscriptionWhatsAppOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:paused:whatsapp`,
+            subscriptionId: rzpSubscriptionId,
+            orderId: order.id,
+            event: "paused",
+            mobile: order.contact_phone || order.mobile_number,
+            customerName: order.contact_name || order.customer_name,
+          });
         }
       }
       break;
@@ -3133,6 +3532,18 @@ export const handleWebhook = async (req, res) => {
               message: error?.message || String(error),
             }),
           );
+
+          // FIX: shares its key with the customer/admin resume WhatsApp.
+          // Literal "resumed" event (not response.status) — same fix as
+          // the customer/admin resume paths.
+          sendSubscriptionWhatsAppOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:resumed:whatsapp`,
+            subscriptionId: rzpSubscriptionId,
+            orderId: order.id,
+            event: "resumed",
+            mobile: order.contact_phone || order.mobile_number,
+            customerName: order.contact_name || order.customer_name,
+          });
         }
       }
       break;
@@ -3174,6 +3585,22 @@ export const handleWebhook = async (req, res) => {
               message: error?.message || String(error),
             }),
           );
+
+          // FIX: halted previously had no notification of any kind on
+          // any channel — the customer had no way to learn their
+          // subscription stopped billing except by checking "My
+          // Subscriptions" themselves. Also added a dedicated "halted"
+          // message-map entry (whatsappNotificationService.js) — it
+          // previously had none and would have fallen through to the
+          // generic "status has been updated" copy.
+          sendSubscriptionWhatsAppOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:halted:whatsapp`,
+            subscriptionId: rzpSubscriptionId,
+            orderId: order.id,
+            event: "halted",
+            mobile: order.contact_phone || order.mobile_number,
+            customerName: order.contact_name || order.customer_name,
+          });
         }
       }
       break;
@@ -3218,7 +3645,91 @@ export const handleWebhook = async (req, res) => {
                 },
               ),
             );
+
+            // FIX: shares its key with the customer/admin cancel
+            // WhatsApp. Same `!== "cancellation_requested"` guard as the
+            // email immediately above it — a customer/admin-initiated
+            // cancellation already sent this notification at request
+            // time; this only fires standalone when Razorpay reports a
+            // cancellation BREE didn't initiate itself (e.g. the Razorpay
+            // Dashboard).
+            sendSubscriptionWhatsAppOnce({
+              notificationKey: `subscription:${rzpSubscriptionId}:cancelled:whatsapp`,
+              subscriptionId: rzpSubscriptionId,
+              orderId: order.id,
+              event: "cancelled",
+              mobile: order.contact_phone || order.mobile_number,
+              customerName: order.contact_name || order.customer_name,
+            });
           }
+        }
+      }
+      break;
+    }
+
+    // FIX (no "Expired" handling existed anywhere in this codebase): once
+    // a subscription completes all of its Razorpay-side billing cycles
+    // (total_count, currently hard-coded to 12 — see
+    // subscriptionController.js), Razorpay stops billing it permanently.
+    // This is Razorpay's documented terminal lifecycle event for that —
+    // distinct from cancel/pause/halt — and BREE had no case for it at
+    // all: no DB write, no notification, nothing. The admin UI's
+    // subscription-status filter dropdown has offered an "Expired" option
+    // for a long time that has never once produced a result, because
+    // nothing has ever written subscription_status = 'expired'.
+    //
+    // NOTE FOR PRODUCTION DEPLOYMENT: the exact event name Razorpay sends
+    // for "all billing cycles completed" should be confirmed against a
+    // real Razorpay test-mode subscription (create one with
+    // total_count=1, let it complete, and inspect the actual webhook
+    // payload/event name delivered) before relying on this in production
+    // — this was implemented from Razorpay's documented Subscriptions
+    // event catalog, not from a live webhook payload this session could
+    // capture.
+    case "subscription.completed": {
+      const order = await loadBySubscription();
+      if (order) {
+        const expiredUpdate = await query(
+          `UPDATE orders SET
+             subscription_status = 'expired',
+             next_billing_date = NULL,
+             updated_at = NOW()
+           WHERE id = ? AND COALESCE(subscription_status, '') <> 'expired'`,
+          [order.id],
+        );
+        if (expiredUpdate.rowCount) {
+          await addHistory(
+            order.id,
+            order.subscription_status,
+            "expired",
+            "Subscription completed its billing cycles via webhook",
+          );
+          emitUpdate(order.id, order.order_status);
+
+          sendSubscriptionEmailOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:expired`,
+            send: () =>
+              sendSubscriptionExpiredEmail({
+                to: order.contact_email || order.email,
+                name: order.contact_name || order.customer_name,
+                orderId: order.id,
+                subscriptionId: rzpSubscriptionId,
+              }),
+          }).catch((error) =>
+            console.error("[WEBHOOK] Subscription expired email failed", {
+              orderId: order.id,
+              message: error?.message || String(error),
+            }),
+          );
+
+          sendSubscriptionWhatsAppOnce({
+            notificationKey: `subscription:${rzpSubscriptionId}:expired:whatsapp`,
+            subscriptionId: rzpSubscriptionId,
+            orderId: order.id,
+            event: "expired",
+            mobile: order.contact_phone || order.mobile_number,
+            customerName: order.contact_name || order.customer_name,
+          });
         }
       }
       break;

@@ -13,6 +13,12 @@ import {
 } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 import { activateReminderFromDelivery } from "../../services/dailyReminderService.js";
+import { shouldSendBreeStatusWhatsApp } from "../shippingController.js";
+import {
+  sendOrderStatusNotificationOnce,
+  buildOrderStatusNotificationKey,
+  logNotification,
+} from "../../services/orderStatusNotificationService.js";
 
 const VALID_SORTS = [
   "created_at",
@@ -606,17 +612,67 @@ export const updateOrderStatus = async (req, res) => {
     // ===== Added: WhatsApp order status notification =====
     // Fire-and-forget, same status gating as the email notification above.
     // Never awaited so a WhatsApp failure can never block the API response.
+    //
+    // FIX (duplicate shipping notifications): this is a generic "set
+    // order status to anything" admin action, entirely separate from the
+    // Delhivery-driven createShipment/trackShipment/cron flow — but it
+    // can just as easily be used to set status to "shipped" or
+    // "out_for_delivery" (e.g. correcting a status, or a manual/COD order
+    // with no real Delhivery shipment). Delhivery's own customer
+    // notification is tied to the courier shipment itself, not to
+    // whatever BREE's internal order_status happens to say, so the same
+    // suppression rule applies here too — see
+    // shouldSendBreeStatusWhatsApp() in shippingController.js, the single
+    // shared source of truth every trigger path checks.
+    //
+    // FIX (idempotency gap): this previously had NO dedupe of any kind —
+    // a retried request could double-send. Now shares the exact same
+    // order_status_notifications key/mechanism as the Delhivery-driven
+    // paths, so an order reaching "delivered" via this admin action gets
+    // the same once-only thank-you WhatsApp, and can't be double-notified
+    // if Delhivery's own tracking sync already sent it (or vice versa).
     const recipientPhone = updated.contact_phone || updated.mobile_number;
-    if (statusChanged && status !== "pending_payment" && recipientPhone) {
-      sendOrderStatusUpdateWhatsApp({
-        customerName: recipientName,
-        mobile: recipientPhone,
-        orderNumber: updated.order_number,
-        orderUuid: updated.id,
-        status,
-      }).catch((error) => {
-        console.error("Order status WhatsApp failed", error);
-      });
+    if (statusChanged && status !== "pending_payment") {
+      if (!shouldSendBreeStatusWhatsApp(status)) {
+        logNotification({
+          orderId: updated.id,
+          status,
+          channel: "whatsapp",
+          action: "skipped_delhivery_duplicate",
+          result: "success",
+        });
+      } else if (recipientPhone) {
+        sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: updated.id,
+            status,
+            channel: "whatsapp",
+          }),
+          orderId: updated.id,
+          status,
+          channel: "whatsapp",
+          send: () =>
+            sendOrderStatusUpdateWhatsApp({
+              customerName: recipientName,
+              mobile: recipientPhone,
+              orderNumber: updated.order_number,
+              orderUuid: updated.id,
+              status,
+            }),
+        }).catch(() => {
+          // Already logged (action:"failed") and recorded in
+          // order_status_notifications by sendOrderStatusNotificationOnce.
+        });
+      } else {
+        logNotification({
+          orderId: updated.id,
+          status,
+          channel: "whatsapp",
+          action: "failed",
+          result: "failure",
+          error: "no customer phone",
+        });
+      }
     }
     // ===== End Added =====
 
@@ -911,8 +967,25 @@ export const bulkUpdateStatus = async (req, res) => {
 
     // ===== Added: WhatsApp order status notifications (bulk) =====
     // Fire-and-forget, mirrors the email notification block above.
+    //
+    // FIX (duplicate shipping notifications + idempotency gap): same
+    // rationale as the single-order updateOrderStatus() above — this
+    // bulk action sets one target `status` across many orders and
+    // previously had no suppression for shipped/out_for_delivery and no
+    // dedupe at all. Both are fixed the same way here.
     const whatsappPromises = updated.map((orderItem) => {
       if (!changedOrderIds.has(String(orderItem.id))) {
+        return Promise.resolve();
+      }
+
+      if (!shouldSendBreeStatusWhatsApp(status)) {
+        logNotification({
+          orderId: orderItem.id,
+          status,
+          channel: "whatsapp",
+          action: "skipped_delhivery_duplicate",
+          result: "success",
+        });
         return Promise.resolve();
       }
 
@@ -920,14 +993,33 @@ export const bulkUpdateStatus = async (req, res) => {
       const recipientName =
         orderItem.contact_name || orderItem.customer_name || "Customer";
       if (!recipientPhone) {
+        logNotification({
+          orderId: orderItem.id,
+          status,
+          channel: "whatsapp",
+          action: "failed",
+          result: "failure",
+          error: "no customer phone",
+        });
         return Promise.resolve();
       }
-      return sendOrderStatusUpdateWhatsApp({
-        customerName: recipientName,
-        mobile: recipientPhone,
-        orderNumber: orderItem.order_number,
-        orderUuid: orderItem.id,
+      return sendOrderStatusNotificationOnce({
+        notificationKey: buildOrderStatusNotificationKey({
+          orderId: orderItem.id,
+          status,
+          channel: "whatsapp",
+        }),
+        orderId: orderItem.id,
         status,
+        channel: "whatsapp",
+        send: () =>
+          sendOrderStatusUpdateWhatsApp({
+            customerName: recipientName,
+            mobile: recipientPhone,
+            orderNumber: orderItem.order_number,
+            orderUuid: orderItem.id,
+            status,
+          }),
       });
     });
 

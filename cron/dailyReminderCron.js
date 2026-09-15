@@ -16,6 +16,7 @@ import { query } from "../src/config/database.js";
 import {
   sendDailyWellnessReminder,
   safelySendWhatsApp,
+  maskMobile,
 } from "../src/services/whatsappNotificationService.js";
 import { activateReminderFromDelivery } from "../src/services/dailyReminderService.js";
 
@@ -48,7 +49,7 @@ const getCurrentTimeIST = () => {
 /**
  * Checks if current time is within tolerance of the scheduled reminder time
  */
-const isWithinReminderTimeWindow = (
+export const isWithinReminderTimeWindow = (
   scheduledTime,
   currentTime,
   toleranceMinutes = TOLERANCE_MINUTES,
@@ -110,71 +111,90 @@ const getEligibleReminders = async (today) => {
   return rows;
 };
 
-/**
- * Marks a reminder as successfully sent for a given date
- * Uses UNIQUE constraint on (reminder_id, send_date) to prevent duplicates
- */
-const recordReminderSend = async (
+// FIX (concurrent cron/worker duplicate-send race): the previous design
+// called the WhatsApp API FIRST and only tried to record a
+// daily_reminder_sends row afterwards, using `INSERT ... ON DUPLICATE KEY
+// UPDATE` — which never throws, so the ER_DUP_ENTRY handling below it could
+// never actually run. Two ticks racing (a second PM2/cluster instance
+// running the same cron, or a manual retry overlapping a scheduled run)
+// could both pass eligibility, both call the WhatsApp provider for the
+// same reminder+day, and both then silently overwrite the same row — two
+// real messages sent, one row, no error anywhere.
+//
+// Same claim-before-send shape as services/orderStatusNotificationService.js
+// (already proven for order-status notifications this session): INSERT
+// IGNORE creates a 'pending' row, then an atomic UPDATE ... WHERE
+// status='pending' is the actual claim — only the caller whose UPDATE
+// affects a row may call the provider. A 'sending' row older than the
+// staleness window is reclaimable (crashed process), same rationale as the
+// order-status service. A same-day 'failed' row is always reclaimable, so
+// the very next minute's tick naturally retries within today's tolerance
+// window — no separate retry job needed.
+const STALE_CLAIM_MINUTES = 5;
+
+// queryExecutor defaults to the real pool — same injection pattern as
+// dailyReminderService.createDailyReminder and
+// orderStatusNotificationService.sendOrderStatusNotificationOnce, so this
+// claim/send/resolve state machine can be exercised against an in-memory
+// fake in tests without touching the production database.
+export const claimReminderSendSlot = async (
   reminderId,
   sendDate,
-  waplifyMessageId = null,
-  status = "success",
+  queryExecutor = query,
 ) => {
   const { randomUUID } = await import("crypto");
   const recordId = randomUUID();
 
-  try {
-    await query(
-      `
-      INSERT INTO daily_reminder_sends
-      (id, reminder_id, send_date, status, waplify_message_id)
-      VALUES (?, ?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE
-        status = VALUES(status),
-        waplify_message_id = VALUES(waplify_message_id),
-        error_message = NULL,
-        sent_at = CURRENT_TIMESTAMP
-      `,
-      [recordId, reminderId, sendDate, status, waplifyMessageId],
-    );
-    return { success: true, recordId };
-  } catch (error) {
-    // If UNIQUE constraint violation, another instance already recorded this send
-    if (error.code === "ER_DUP_ENTRY" || error.message.includes("UNIQUE")) {
-      console.log(
-        `[Reminder] Duplicate send prevented for reminder ${reminderId} on ${sendDate}`,
-      );
-      return { success: false, reason: "duplicate" };
-    }
-    throw error;
-  }
+  await queryExecutor(
+    `INSERT IGNORE INTO daily_reminder_sends (id, reminder_id, send_date, status)
+     VALUES (?, ?, ?, 'pending')`,
+    [recordId, reminderId, sendDate],
+  );
+
+  const claimResult = await queryExecutor(
+    `UPDATE daily_reminder_sends
+     SET status = 'sending', sent_at = CURRENT_TIMESTAMP
+     WHERE reminder_id = ? AND send_date = ?
+       AND (
+         status = 'pending'
+         OR status = 'failed'
+         OR (status = 'sending' AND sent_at < NOW() - INTERVAL ? MINUTE)
+       )`,
+    [reminderId, sendDate, STALE_CLAIM_MINUTES],
+  );
+
+  return { claimed: Boolean(claimResult.rowCount) };
 };
 
-/**
- * Records a failed reminder send attempt
- */
-const recordReminderFailure = async (reminderId, sendDate, errorMessage) => {
-  const { randomUUID } = await import("crypto");
-  const recordId = randomUUID();
+/** Resolves a claimed send slot as successfully sent. */
+export const resolveReminderSendSuccess = async (
+  reminderId,
+  sendDate,
+  waplifyMessageId,
+  queryExecutor = query,
+) => {
+  await queryExecutor(
+    `UPDATE daily_reminder_sends
+     SET status = 'success', waplify_message_id = ?, error_message = NULL,
+         sent_at = CURRENT_TIMESTAMP
+     WHERE reminder_id = ? AND send_date = ? AND status = 'sending'`,
+    [waplifyMessageId, reminderId, sendDate],
+  );
+};
 
-  try {
-    await query(
-      `
-      INSERT INTO daily_reminder_sends
-      (id, reminder_id, send_date, status, error_message)
-      VALUES (?, ?, ?, ?, ?)
-      `,
-      [recordId, reminderId, sendDate, "failed", errorMessage],
-    );
-  } catch (error) {
-    if (error.code === "ER_DUP_ENTRY" || error.message.includes("UNIQUE")) {
-      console.log(
-        `[Reminder] Duplicate failure record prevented for reminder ${reminderId} on ${sendDate}`,
-      );
-      return;
-    }
-    throw error;
-  }
+/** Resolves a claimed send slot as failed — reclaimable by the next tick. */
+export const resolveReminderSendFailure = async (
+  reminderId,
+  sendDate,
+  errorMessage,
+  queryExecutor = query,
+) => {
+  await queryExecutor(
+    `UPDATE daily_reminder_sends
+     SET status = 'failed', error_message = ?
+     WHERE reminder_id = ? AND send_date = ? AND status = 'sending'`,
+    [String(errorMessage || "Unknown error").slice(0, 1000), reminderId, sendDate],
+  );
 };
 
 /**
@@ -361,10 +381,26 @@ export const runDailyReminderScheduler = async () => {
 
       try {
         // Send the WhatsApp reminder
+        // Claim the send slot BEFORE calling the provider — this is what
+        // actually prevents a concurrent tick/worker from double-sending
+        // (see claimReminderSendSlot's comment above). Nothing calls the
+        // WhatsApp API unless this succeeds.
+        const { claimed } = await claimReminderSendSlot(reminderId, today);
+        if (!claimed) {
+          skipped++;
+          console.info(
+            `[DAILY_REMINDER] DUPLICATE_SKIPPED | reminderId=${reminderId} | orderId=${reminder.order_id} | channel=whatsapp`,
+          );
+          continue;
+        }
+
         // NOTE: safelySendWhatsApp resolves { success: true, result } on
         // success but { success: false, error } (not `result`) on failure —
         // destructure both so a real provider error isn't lost as
         // "Unknown error" below.
+        console.info(
+          `[DAILY_REMINDER] ATTEMPT | reminderId=${reminderId} | orderId=${reminder.order_id} | channel=whatsapp | phone=${maskMobile(sendMobile)}`,
+        );
         const { success, result, error: sendError } = await safelySendWhatsApp(
           `daily-reminder-${reminderId}`,
           () =>
@@ -374,43 +410,29 @@ export const runDailyReminderScheduler = async () => {
             }),
         );
 
-        if (success && result?.data?.message_id) {
-          // Record successful send
-          await recordReminderSend(
-            reminderId,
-            today,
-            result.data.message_id,
-            "success",
-          );
+        if (success) {
+          const messageId = result?.data?.message_id || null;
+          await resolveReminderSendSuccess(reminderId, today, messageId);
           sent++;
 
           console.log(
-            `[Reminder] Sent reminder ${reminderId} to ${sendMobile} (${customer_name}) | Message ID: ${result.data.message_id}`,
-          );
-        } else if (success) {
-          // Sent but no message ID in response
-          await recordReminderSend(reminderId, today, null, "success");
-          sent++;
-
-          console.log(
-            `[Reminder] Sent reminder ${reminderId} to ${customer_phone} (${customer_name})`,
+            `[DAILY_REMINDER] SUCCESS | reminderId=${reminderId} | orderId=${reminder.order_id} | phone=${maskMobile(sendMobile)} | providerMessageId=${messageId || "none"}`,
           );
         } else {
-          // Send failed
           failed++;
           const errorMessage = sendError?.message || String(sendError || "Unknown error");
-          await recordReminderFailure(reminderId, today, errorMessage);
+          await resolveReminderSendFailure(reminderId, today, errorMessage);
 
           console.error(
-            `[Reminder] Failed to send reminder ${reminderId} to ${sendMobile}: ${errorMessage}`,
+            `[DAILY_REMINDER] FAILED | reminderId=${reminderId} | orderId=${reminder.order_id} | phone=${maskMobile(sendMobile)} | error=${errorMessage}`,
           );
         }
       } catch (error) {
         failed++;
-        await recordReminderFailure(reminderId, today, error.message);
+        await resolveReminderSendFailure(reminderId, today, error.message);
 
         console.error(
-          `[Reminder] Exception while sending reminder ${reminderId}: ${error.message}`,
+          `[DAILY_REMINDER] FAILED | reminderId=${reminderId} | orderId=${reminder.order_id} | error=${error.message}`,
         );
       }
     }

@@ -253,7 +253,7 @@ export const normalizeMobile = validateMobile;
  * @example
  * maskMobile("916281241187"); // -> "91******1187"
  */
-const maskMobile = (mobile) => {
+export const maskMobile = (mobile) => {
   if (!mobile) {
     return "";
   }
@@ -705,9 +705,26 @@ const RETURN_STATUS_MESSAGES = {
     "Your returned item has passed our quality check and is approved for a refund.",
   "Return Rejected":
     "Your return request could not be approved. Please contact BREE Support for details.",
+  // FIX (return flow audit): rejectInspection previously reused this exact
+  // "Return Rejected" label — a customer whose already-returned item
+  // failed quality check got the identical message as one whose initial
+  // return request was rejected, with no way to tell the two apart. This
+  // is passed only from rejectInspection (returnController.js); rejectReturn
+  // still uses "Return Rejected" for the earlier-stage rejection above.
+  "Return Quality Check Failed":
+    "Your returned item did not pass our quality check, so a refund cannot be processed for this return. Please contact BREE Support for details.",
   "Refund Initiated":
     "Your refund has been initiated and will reflect in your account soon.",
   "Refund Completed": "Your refund has been completed successfully.",
+  // FIX (return/refund customer tracking): rejectRefund previously sent no
+  // customer notification at all — a customer whose refund was rejected
+  // was left silently waiting with no email/WhatsApp and (before the
+  // tracking-page fix) no visible status change either. Approving a
+  // refund still sends nothing deliberately (see the comment at
+  // rejectRefund's call site in returnController.js) — only rejection,
+  // a genuine dead-end for the customer, gets a message.
+  "Refund Rejected":
+    "Your refund request could not be approved. Please contact BREE Support if you need assistance.",
 };
 
 export const buildOrderStatusMessage = (status) => {
@@ -730,6 +747,19 @@ export const buildOrderStatusMessage = (status) => {
 
   return messages[status] || "Your order status has been updated.";
 };
+
+// FIX (Delivered WhatsApp replaced with a thank-you message): the generic
+// "Your order has been delivered. Thank you for shopping with BREE."
+// line above (buildOrderStatusMessage's "delivered" entry) is no longer
+// used by sendOrderStatusUpdateWhatsApp — it's left in place only because
+// buildOrderStatusMessage is a shared, status-keyed lookup and nothing
+// else reads that specific entry; removing it would just be churn. The
+// actual "delivered" WhatsApp now uses this dedicated thank-you copy
+// instead, which — unlike every other status message here — has its own
+// customer-name greeting baked into the body itself, matching the exact
+// content requested for this notification.
+export const buildOrderDeliveredThankYouMessage = (customerName) =>
+  `BREE Wellness 💚\n\nHi ${customerName || "there"} 👋\n\nYour order has been successfully delivered.\n\nThank you for choosing BREE Wellness! We hope you enjoy your order. 🌿\n\nWe appreciate your trust in BREE. 💚`;
 
 /**
  * Maps an internal order status value to the human-readable label shown
@@ -763,8 +793,10 @@ export const getReadableOrderStatus = (status) => {
     "Return Received": "Return Received",
     "Return Inspection Approved": "Return Inspection Approved",
     "Return Rejected": "Return Rejected",
+    "Return Quality Check Failed": "Return Quality Check Failed",
     "Refund Initiated": "Refund Initiated",
     "Refund Completed": "Refund Completed",
+    "Refund Rejected": "Refund Rejected",
   };
 
   if (labels[status]) {
@@ -824,6 +856,18 @@ export const sendOrderStatusUpdateWhatsApp = async ({
     throw new Error("status is required");
   }
 
+  // FIX (duplicate shipping notifications / Delivered thank-you): callers
+  // (shippingController.js, cron/shippingTrackingCron.js) already refuse
+  // to call this function at all for "shipped"/"out_for_delivery" — see
+  // shouldSendBreeStatusWhatsApp() — so this function is never expected
+  // to be invoked with those two statuses. "delivered" gets the dedicated
+  // thank-you message instead of the generic status line; every other
+  // status is unaffected.
+  const messageBody =
+    status === "delivered"
+      ? buildOrderDeliveredThankYouMessage(customerName)
+      : buildOrderStatusMessage(status);
+
   return sendTemplateMessage({
     mobile,
     templateName: TEMPLATES.ORDER_STATUS,
@@ -831,7 +875,7 @@ export const sendOrderStatusUpdateWhatsApp = async ({
       customerName,
       orderNumber,
       getReadableOrderStatus(status),
-      buildOrderStatusMessage(status),
+      messageBody,
     ],
     buttonParameters: orderUuid
       ? [
@@ -871,9 +915,13 @@ export const buildSubscriptionStatusMessage = (status) => {
       "We couldn't process your subscription payment. Please update your payment method.",
     paused: "Your subscription has been paused successfully.",
     resumed: "Your subscription has been resumed successfully.",
+    halted:
+      "Your subscription has been halted because recurring payment could not be completed. Please contact support to restart it.",
     cancelled: "Your subscription has been cancelled successfully.",
     expiring:
       "Your subscription will expire soon. Please renew it to continue enjoying your benefits.",
+    expired:
+      "Your subscription has completed its billing cycles and is no longer active. Subscribe again anytime to keep enjoying your benefits.",
   };
 
   return messages[status] || "Your subscription status has been updated.";
@@ -897,8 +945,10 @@ export const getReadableSubscriptionStatus = (status) => {
     payment_failed: "Payment Failed",
     paused: "Paused",
     resumed: "Active",
+    halted: "Halted",
     cancelled: "Cancelled",
     expiring: "Expiring Soon",
+    expired: "Expired",
   };
 
   if (labels[status]) {
@@ -1418,6 +1468,7 @@ export default {
   sendOrderConfirmationWhatsApp,
   sendOrderStatusUpdateWhatsApp,
   buildOrderStatusMessage,
+  buildOrderDeliveredThankYouMessage,
   getReadableOrderStatus,
 
   // Subscription Notifications

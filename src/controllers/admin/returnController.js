@@ -6,6 +6,10 @@ import delhiveryService from "../../services/delhiveryService.js";
 import { sendOrderStatusUpdateEmail } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 import {
+  sendOrderStatusNotificationOnce,
+  buildOrderStatusNotificationKey,
+} from "../../services/orderStatusNotificationService.js";
+import {
   getWarehouseConfig,
   validateShippingAddress,
   validateWarehouseConfig,
@@ -68,6 +72,19 @@ const emitOrderUpdated = (req, order) => {
   }
 };
 
+// Builds a stable, slug-shaped notification-key segment from a return
+// event's human-readable label ("Return Approved" -> "return_approved") —
+// so buildOrderStatusNotificationKey() below produces the same
+// order_status_notifications keyspace/shape already used for every other
+// order-status event (order:{id}:status:{slug}:channel:{channel}), just
+// with a return-specific slug instead of a real order_status value.
+export const slugifyReturnEventLabel = (label) =>
+  String(label || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
 // ──────────────────────────────────────────────────────────────────────────
 // Notifications — fire-and-forget, never awaited, never allowed to throw
 // into the request. Reuses the existing generic order-status notification
@@ -76,19 +93,49 @@ const emitOrderUpdated = (req, order) => {
 // order_status values and fall back to the raw string otherwise, so passing
 // an already human-readable label (e.g. "Return Approved") degrades
 // gracefully instead of requiring new template/label entries.
-// ──────────────────────────────────────────────────────────────────────────
+//
+// FIX (return flow audit — idempotency): previously these two sends had no
+// idempotency layer of their own at all — safe in practice only because
+// every one of the 10 call sites already guards the state transition that
+// precedes it (an already-approved/already-returned/etc. repeat click
+// short-circuits before ever reaching this function). That guard is
+// necessary but was the *only* protection — no persisted, auditable record
+// existed of whether a given return/refund notification actually
+// succeeded, and nothing would stop a future call site (a cron, a webhook,
+// a retry helper) from calling this twice for the same event without
+// re-deriving the same care. Routes both sends through the exact same
+// claim/send/resolve mechanism (sendOrderStatusNotificationOnce) already
+// proven for every other order-status notification — same
+// order_status_notifications table, same key shape
+// (order:{id}:status:{slug}:channel:{channel}), no new infrastructure —
+// giving return/refund notifications a persisted, atomically-claimed,
+// exactly-once guarantee independent of the state-machine guards, and a
+// real "failed" record (with the provider error) instead of only a
+// console log line.
 const notifyReturnEvent = (order, label, notes) => {
   const recipientEmail = order.contact_email || order.email;
   const recipientPhone = order.contact_phone || order.mobile_number;
   const recipientName = order.contact_name || order.customer_name || "Customer";
+  const eventSlug = slugifyReturnEventLabel(label);
 
   if (recipientEmail) {
-    sendOrderStatusUpdateEmail({
-      to: recipientEmail,
-      name: recipientName,
+    sendOrderStatusNotificationOnce({
+      notificationKey: buildOrderStatusNotificationKey({
+        orderId: order.id,
+        status: eventSlug,
+        channel: "email",
+      }),
       orderId: order.id,
-      status: label,
-      notes,
+      status: eventSlug,
+      channel: "email",
+      send: () =>
+        sendOrderStatusUpdateEmail({
+          to: recipientEmail,
+          name: recipientName,
+          orderId: order.id,
+          status: label,
+          notes,
+        }),
     }).catch((error) => {
       log("error", "return.email_failed", {
         orderId: order.id,
@@ -98,12 +145,23 @@ const notifyReturnEvent = (order, label, notes) => {
   }
 
   if (recipientPhone) {
-    sendOrderStatusUpdateWhatsApp({
-      customerName: recipientName,
-      mobile: recipientPhone,
-      orderNumber: order.order_number,
-      orderUuid: order.id,
-      status: label,
+    sendOrderStatusNotificationOnce({
+      notificationKey: buildOrderStatusNotificationKey({
+        orderId: order.id,
+        status: eventSlug,
+        channel: "whatsapp",
+      }),
+      orderId: order.id,
+      status: eventSlug,
+      channel: "whatsapp",
+      send: () =>
+        sendOrderStatusUpdateWhatsApp({
+          customerName: recipientName,
+          mobile: recipientPhone,
+          orderNumber: order.order_number,
+          orderUuid: order.id,
+          status: label,
+        }),
     }).catch((error) => {
       log("error", "return.whatsapp_failed", {
         orderId: order.id,
@@ -135,7 +193,7 @@ const isPositiveNumber = (value) =>
 // ──────────────────────────────────────────────────────────────────────────
 const RETURN_WINDOW_HOURS = 48;
 
-const isReturnWindowOpen = (order) => {
+export const isReturnWindowOpen = (order) => {
   if (order.order_status !== "delivered") {
     return {
       eligible: false,
@@ -220,18 +278,58 @@ const resolveCustomerAddress = async (client, order) => {
     [order.address_id],
   );
 
-  if (!legacyAddressRows.length) return null;
+  if (legacyAddressRows.length) {
+    return {
+      full_name: order.contact_name || legacyAddressRows[0].label,
+      mobile: order.contact_phone || "",
+      address_line_1: legacyAddressRows[0].address_line1,
+      address_line_2: legacyAddressRows[0].address_line2,
+      city: legacyAddressRows[0].city,
+      state: legacyAddressRows[0].state,
+      pincode: legacyAddressRows[0].pincode,
+      country: legacyAddressRows[0].country || "India",
+    };
+  }
 
-  return {
-    full_name: order.contact_name || legacyAddressRows[0].label,
-    mobile: order.contact_phone || "",
-    address_line_1: legacyAddressRows[0].address_line1,
-    address_line_2: legacyAddressRows[0].address_line2,
-    city: legacyAddressRows[0].city,
-    state: legacyAddressRows[0].state,
-    pincode: legacyAddressRows[0].pincode,
-    country: legacyAddressRows[0].country || "India",
-  };
+  return null;
+};
+
+// FIX (return flow audit — reverse-shipment address resolution gap):
+// resolveCustomerAddress() above only ever checked user_addresses/legacy
+// addresses via order.address_id, unlike shippingController.createShipment()
+// (the forward-shipment path), which also falls back to the order's own
+// structured shipping_address_line1/city/state/pincode/country columns —
+// added for orders that never got a user_addresses/addresses row at all
+// (guest checkout, Magic Checkout, Bulk Booking orders; see the identical
+// fallback and its own comment in shippingController.js). Without this,
+// a return on exactly those order types could never get past "Return
+// Order" — it would always fail with "Customer address record not
+// found.", even though the order has everything Delhivery needs sitting
+// right on the row already. This mirrors that existing, already-tested
+// fallback rather than inventing a new one — same three required fields
+// (line1/city/pincode) gating whether it's used.
+export const resolveCustomerAddressWithFallback = async (client, order) => {
+  const resolved = await resolveCustomerAddress(client, order);
+  if (resolved) return resolved;
+
+  if (
+    order.shipping_address_line1 &&
+    order.shipping_city &&
+    order.shipping_pincode
+  ) {
+    return {
+      full_name: order.contact_name || order.customer_name || "",
+      mobile: order.contact_phone || order.mobile_number || "",
+      address_line_1: order.shipping_address_line1,
+      address_line_2: order.shipping_address_line2,
+      city: order.shipping_city,
+      state: order.shipping_state,
+      pincode: order.shipping_pincode,
+      country: order.shipping_country || "India",
+    };
+  }
+
+  return null;
 };
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -255,7 +353,7 @@ const resolveCustomerAddress = async (client, order) => {
 // flow and should be validated against Delhivery's reverse-logistics
 // docs/sandbox before relying on it in production.
 // ──────────────────────────────────────────────────────────────────────────
-const buildReverseShipmentRoles = (customerAddress, warehouse) => {
+export const buildReverseShipmentRoles = (customerAddress, warehouse) => {
   const destinationAddress = {
     full_name: warehouse.name,
     mobile: warehouse.phone,
@@ -603,7 +701,10 @@ export const createReverseShipment = async (req, res) => {
         .json({ success: false, message: eligibility.reason });
     }
 
-    const customerAddress = await resolveCustomerAddress(client, order);
+    const customerAddress = await resolveCustomerAddressWithFallback(
+      client,
+      order,
+    );
     if (!customerAddress) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -821,6 +922,28 @@ export const scheduleReversePickup = async (req, res) => {
 
     const order = rows[0];
 
+    // FIX (return flow audit — misleading repeat-click error): the
+    // "already scheduled" branch below this one used to be unreachable in
+    // practice — return_status and reverse_pickup_request_id are always
+    // written together in the same UPDATE (below), so by the time a
+    // repeated click got here, return_status had already moved to
+    // "pickup_scheduled" and always failed the OLD version of this first
+    // guard instead, with the confusing message "A reverse shipment must
+    // exist before scheduling pickup" for a pickup that, in fact, already
+    // exists. Checking the idempotent case first — matching the exact
+    // pattern createReverseShipment() already uses for its own repeat-
+    // click case — makes a second "Schedule Reverse Pickup" click return
+    // the existing pickup request with a 200, not a misleading error.
+    if (order.return_status === "pickup_scheduled") {
+      await client.query("ROLLBACK");
+      return res.status(200).json({
+        success: true,
+        message: "A reverse pickup has already been scheduled for this order.",
+        order,
+        delhivery: { pickupRequestId: order.reverse_pickup_request_id },
+      });
+    }
+
     if (
       order.return_status !== "reverse_shipment_created" ||
       !order.reverse_awb
@@ -832,12 +955,17 @@ export const scheduleReversePickup = async (req, res) => {
       });
     }
 
+    // Defense-in-depth only — return_status and reverse_pickup_request_id
+    // are always written together below, so this should be unreachable
+    // given the guard above, but a stale/manually-edited row shouldn't be
+    // able to trigger a second Delhivery pickup request either way.
     if (order.reverse_pickup_request_id) {
       await client.query("ROLLBACK");
-      return res.status(400).json({
-        success: false,
-        message: "A reverse pickup has already been scheduled for this order",
-        pickupRequestId: order.reverse_pickup_request_id,
+      return res.status(200).json({
+        success: true,
+        message: "A reverse pickup has already been scheduled for this order.",
+        order,
+        delhivery: { pickupRequestId: order.reverse_pickup_request_id },
       });
     }
 
@@ -1300,7 +1428,10 @@ export const rejectInspection = async (req, res) => {
     });
 
     emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Rejected", notes || reason);
+    // FIX (return flow audit): distinct label from rejectReturn's "Return
+    // Rejected" — see the comment on RETURN_STATUS_MESSAGES in
+    // whatsappNotificationService.js for why this had to change.
+    notifyReturnEvent(updated, "Return Quality Check Failed", notes || reason);
 
     log("info", "return.inspection_rejected", { orderId });
     res.json({
@@ -1445,6 +1576,19 @@ export const approveRefund = async (req, res) => {
     await client.query("COMMIT");
     emitOrderUpdated(req, updated);
 
+    // FIX (customer return/refund tracking audit, requirement 17): audited
+    // deliberately, not overlooked. approveRefund only records an internal
+    // decision + amount — Razorpay is never contacted here (see this
+    // function's own doc comment above). completeRefund is what actually
+    // moves money and already sends "Refund Initiated"/"Refund Completed"
+    // the moment that happens, and on a normal admin workflow the two
+    // actions happen back-to-back (approve, then immediately click
+    // "Initiate Refund"). Notifying here too would almost always mean the
+    // customer gets two WhatsApp/emails seconds apart for what is, from
+    // their perspective, one event ("BREE is refunding me") — a redundant
+    // duplicate, not a second useful update. rejectRefund is different: it
+    // can be the terminal outcome (no further message will ever follow),
+    // so it does notify — see its own comment.
     log("info", "return.refund_approved", { orderId, refund_amount });
     res.json({
       success: true,
@@ -1524,6 +1668,21 @@ export const rejectRefund = async (req, res) => {
 
     await client.query("COMMIT");
     emitOrderUpdated(req, updated);
+
+    // FIX (customer return/refund tracking — audit finding): this
+    // previously sent no customer notification at all, unlike every other
+    // terminal/failure branch in this controller (rejectReturn,
+    // rejectInspection). A customer whose refund is rejected is at a
+    // genuine dead end — they need to hear that from BREE directly, not
+    // infer it from a refund that simply never arrives. Uses the exact
+    // same notifyReturnEvent() → sendOrderStatusNotificationOnce()
+    // mechanism as every other event in this file — no new notification
+    // path, and idempotent by the same key shape
+    // (order:{id}:status:refund_rejected:channel:{channel}), so a repeated
+    // rejectRefund call (double-click, retry) can never send this twice.
+    // approveRefund deliberately still sends nothing — see the comment at
+    // that function's own notifyReturnEvent-free ending for why.
+    notifyReturnEvent(updated, "Refund Rejected", null);
 
     log("info", "return.refund_rejected", { orderId });
     res.json({ success: true, message: "Refund rejected", order: updated });

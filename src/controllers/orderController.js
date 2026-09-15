@@ -1252,10 +1252,28 @@ export const getOrderTracking = async (req, res) => {
     const schemaInfo = await getOrderSchemaInfo();
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
+    // FIX (customer return/refund tracking): the customer-facing tracking
+    // page previously received only order_status/delivered_at/return_status
+    // — enough to hide the "Returns & Support" contact panel, but nothing
+    // to ever show the customer their actual return/refund progress once
+    // one had started. Adds exactly the columns the customer timeline
+    // needs, and no others: deliberately EXCLUDES return_reason/
+    // return_notes (admin-authored, may contain internal remarks),
+    // return_approved_by (staff identity), and refund_reference (the
+    // Razorpay refund ID) — none of those are needed to render progress,
+    // and this is a public, unauthenticated, guessable-only-by-UUID
+    // endpoint (optionalAuth, no ownership filter — see the comment above
+    // this function), so the response is kept to the minimum the UI
+    // actually renders.
     const orderQuery = isNewOrderSchema
       ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
+           o.return_requested_at, o.return_approved_at,
+           o.reverse_awb, o.reverse_tracking_url, o.reverse_shipment_created_at,
+           o.reverse_pickup_request_id, o.returned_at,
+           o.inspection_status,
+           o.refund_status, o.refund_amount, o.refund_completed_at,
            o.parent_package_id, o.fulfillment_cycle,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.contact_name, o.contact_email,
@@ -1282,6 +1300,11 @@ export const getOrderTracking = async (req, res) => {
       : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
+           o.return_requested_at, o.return_approved_at,
+           o.reverse_awb, o.reverse_tracking_url, o.reverse_shipment_created_at,
+           o.reverse_pickup_request_id, o.returned_at,
+           o.inspection_status,
+           o.refund_status, o.refund_amount, o.refund_completed_at,
            o.parent_package_id, o.fulfillment_cycle,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.customer_name AS contact_name, o.email AS contact_email,
