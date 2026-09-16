@@ -621,6 +621,84 @@ export const extractDelhiveryTrackingDetails = (trackingResponse) => {
 // Delhivery API response and updates the order with these values.
 // Transitions order status from "ready_to_ship" → "shipped".
 // ─────────────────────────────────────────────────────────────────────────────
+// ISSUE-M32 residual fix (address snapshot immutability): extracted so it
+// can be exercised directly with plain order-row fixtures in tests, without
+// needing a full fake transactional client for the rest of createShipment
+// (Delhivery call, notifications, shipment bookkeeping — out of scope for
+// this fix). Pure precedence logic + two lookup queries; behavior is
+// byte-for-byte identical to what previously lived inline in createShipment.
+//
+// Priority: (1) the order's own structured snapshot columns — set once at
+// order-confirmation time, immutable afterwards; (2) address_id resolved
+// against the live user_addresses/addresses tables — only reached for
+// orders that predate the snapshot columns being populated, or bulk orders
+// that never have an address_id at all; (3) null — the caller must refuse
+// rather than parse the free-text shipping_address snapshot.
+export const resolveShippingAddressForOrder = async (order, { queryFn }) => {
+  if (
+    order.shipping_address_line1 &&
+    order.shipping_city &&
+    order.shipping_pincode
+  ) {
+    return {
+      full_name: order.contact_name || "",
+      mobile: order.contact_phone || "",
+      address_line_1: order.shipping_address_line1,
+      address_line_2: order.shipping_address_line2,
+      city: order.shipping_city,
+      state: order.shipping_state,
+      pincode: order.shipping_pincode,
+      country: order.shipping_country || "India",
+    };
+  }
+
+  if (!order.address_id) return null;
+
+  const { rows: userAddressRows } = await queryFn(
+    `SELECT id, full_name, phone, address_line_1, address_line_2, city, state, pincode, country
+     FROM user_addresses
+     WHERE id = ?
+     LIMIT 1`,
+    [order.address_id],
+  );
+
+  if (userAddressRows.length) {
+    return {
+      full_name: userAddressRows[0].full_name,
+      mobile: userAddressRows[0].phone,
+      address_line_1: userAddressRows[0].address_line_1,
+      address_line_2: userAddressRows[0].address_line_2,
+      city: userAddressRows[0].city,
+      state: userAddressRows[0].state,
+      pincode: userAddressRows[0].pincode,
+      country: userAddressRows[0].country || "India",
+    };
+  }
+
+  const { rows: legacyAddressRows } = await queryFn(
+    `SELECT id, label, address_line1, address_line2, city, state, pincode, country
+     FROM addresses
+     WHERE id = ?
+     LIMIT 1`,
+    [order.address_id],
+  );
+
+  if (legacyAddressRows.length) {
+    return {
+      full_name: order.contact_name || legacyAddressRows[0].label,
+      mobile: order.contact_phone || "",
+      address_line_1: legacyAddressRows[0].address_line1,
+      address_line_2: legacyAddressRows[0].address_line2,
+      city: legacyAddressRows[0].city,
+      state: legacyAddressRows[0].state,
+      pincode: legacyAddressRows[0].pincode,
+      country: legacyAddressRows[0].country || "India",
+    };
+  }
+
+  return null;
+};
+
 export const createShipment = async (req, res) => {
   const { orderId } = req.params;
 
@@ -747,83 +825,13 @@ export const createShipment = async (req, res) => {
     }
 
     // ── 3. Fetch shipping address ────────────────────────────────────────────
-    let shippingAddress = null;
-
-    // Try fetching from user_addresses first
-    if (order.address_id) {
-      const { rows: userAddressRows } = await client.query(
-        `SELECT id, full_name, phone, address_line_1, address_line_2, city, state, pincode, country
-         FROM user_addresses
-         WHERE id = ?
-         LIMIT 1`,
-        [order.address_id],
-      );
-
-      if (userAddressRows.length) {
-        shippingAddress = {
-          full_name: userAddressRows[0].full_name,
-          mobile: userAddressRows[0].phone,
-          address_line_1: userAddressRows[0].address_line_1,
-          address_line_2: userAddressRows[0].address_line_2,
-          city: userAddressRows[0].city,
-          state: userAddressRows[0].state,
-          pincode: userAddressRows[0].pincode,
-          country: userAddressRows[0].country || "India",
-        };
-      } else {
-        // Fall back to legacy addresses table
-        const { rows: legacyAddressRows } = await client.query(
-          `SELECT id, label, address_line1, address_line2, city, state, pincode, country
-           FROM addresses
-           WHERE id = ?
-           LIMIT 1`,
-          [order.address_id],
-        );
-
-        if (legacyAddressRows.length) {
-          shippingAddress = {
-            full_name: order.contact_name || legacyAddressRows[0].label,
-            mobile: order.contact_phone || "",
-            address_line_1: legacyAddressRows[0].address_line1,
-            address_line_2: legacyAddressRows[0].address_line2,
-            city: legacyAddressRows[0].city,
-            state: legacyAddressRows[0].state,
-            pincode: legacyAddressRows[0].pincode,
-            country: legacyAddressRows[0].country || "India",
-          };
-        }
-      }
-    }
-
-    // FIX (Magic Checkout for Bulk Orders): orders created from a Bulk
-    // Booking (bulkOrderService.createOrderFromBulkBooking) have no
-    // address_id — bulk bookings have no user_id, and addresses.user_id is
-    // NOT NULL, so they can never get a row in the addresses table (see
-    // upsertStructuredAddressForOrder in paymentController.js, which has the
-    // identical constraint for guest normal-checkout orders). Their
-    // structured address instead lives directly on the orders row
-    // (orders.shipping_address_line1/2/city/state/pincode/country — added
-    // alongside is_bulk_order/bulk_booking_id). This is purely additive: it
-    // only ever finds data for orders that populated these columns (bulk
-    // orders today), so every existing address_id-based order above is
-    // completely unaffected.
-    if (
-      !shippingAddress &&
-      order.shipping_address_line1 &&
-      order.shipping_city &&
-      order.shipping_pincode
-    ) {
-      shippingAddress = {
-        full_name: order.contact_name || "",
-        mobile: order.contact_phone || "",
-        address_line_1: order.shipping_address_line1,
-        address_line_2: order.shipping_address_line2,
-        city: order.shipping_city,
-        state: order.shipping_state,
-        pincode: order.shipping_pincode,
-        country: order.shipping_country || "India",
-      };
-    }
+    // ISSUE-M32 residual fix (address snapshot immutability): see
+    // resolveShippingAddressForOrder's own comment above for the priority
+    // rationale (order's own structured snapshot columns first, address_id
+    // live-lookup as a fallback for historical/bulk orders).
+    const shippingAddress = await resolveShippingAddressForOrder(order, {
+      queryFn: (sql, params) => client.query(sql, params),
+    });
 
     // No structured address record was found for this order. We
     // deliberately do NOT fall back to parsing the comma-separated
@@ -2053,7 +2061,11 @@ export const trackShipment = async (req, res) => {
 // Cancels a Delhivery shipment for an order, provided it has an AWB and
 // has not already been delivered.
 // ─────────────────────────────────────────────────────────────────────────────
-export const cancelShipment = async (req, res) => {
+export const cancelShipment = async (
+  req,
+  res,
+  { getClientFn = getClient, delhiveryServiceFn = delhiveryService } = {},
+) => {
   const { orderId } = req.params;
 
   if (!orderId) {
@@ -2063,7 +2075,7 @@ export const cancelShipment = async (req, res) => {
     });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
 
   try {
     await client.query("BEGIN");
@@ -2125,7 +2137,7 @@ export const cancelShipment = async (req, res) => {
     // ── 4. Call Delhivery API to cancel shipment ──────────────────────────────
     let cancelResponse;
     try {
-      cancelResponse = await delhiveryService.cancelShipment(order.awb_number);
+      cancelResponse = await delhiveryServiceFn.cancelShipment(order.awb_number);
     } catch (error) {
       await client.query("ROLLBACK");
       console.error("[CANCEL_SHIPMENT] Delhivery API error", error);
@@ -2150,22 +2162,36 @@ export const cancelShipment = async (req, res) => {
     }
 
     // ── 5. Update orders table ────────────────────────────────────────────────
+    // FIX (Medium #19 — Phase 3): this used to update tracking_status only,
+    // leaving order_status wherever it was before the cancellation (e.g.
+    // still 'shipped') — a cancelled shipment could coexist indefinitely
+    // with an order the rest of the app still treats as actively shipping.
+    // Terminal delivered/already-cancelled shipments are already rejected
+    // above, so any order reaching this point is safe to move to the
+    // 'cancelled' order_status too.
     await client.query(
       `UPDATE orders
        SET tracking_status = ?,
+           order_status = ?,
            delhivery_response = ?,
            updated_at = NOW()
        WHERE id = ?`,
-      ["Cancelled", JSON.stringify(cancelResponse), orderId],
+      ["Cancelled", "cancelled", JSON.stringify(cancelResponse), orderId],
     );
 
     // ── 6. Record status transition ──────────────────────────────────────────
+    // queryExecutor: client.query keeps this INSERT inside the same
+    // transaction as the UPDATE above (it previously ran on a separate
+    // pooled connection via the plain `query` default, outside the
+    // transaction entirely) — a ROLLBACK above now can't leave a stray
+    // history row behind for a cancellation that didn't actually commit.
     await appendStatusHistory({
       orderId,
       previousStatus: order.order_status,
-      newStatus: order.order_status,
+      newStatus: "cancelled",
       changedBy: null,
       notes: `Shipment cancelled with Delhivery. AWB: ${order.awb_number}`,
+      queryExecutor: client.query,
     });
 
     await client.query("COMMIT");

@@ -17,7 +17,12 @@ import {
   validateMobile,
   maskMobile,
 } from "../services/whatsappNotificationService.js";
-import { createDailyReminder } from "../services/dailyReminderService.js";
+import {
+  createDailyReminder,
+  pauseReminderForOrder,
+  endReminderForOrder,
+  resumeReminderForOrder,
+} from "../services/dailyReminderService.js";
 import {
   sendSubscriptionEmailOnce,
   sendSubscriptionNotificationOnce,
@@ -957,13 +962,17 @@ const updateSubscriptionOrder = async ({
 };
 
 // ── cancelSubscription ──────────────────────────────────────────────────────
-export const cancelSubscription = async (req, res) => {
+export const cancelSubscription = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
   let stateChanged = false;
 
   try {
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `SELECT o.id, o.razorpay_subscription_id, o.order_status,
               o.contact_email, o.contact_name, o.contact_phone,
               p.name AS product_name
@@ -982,7 +991,7 @@ export const cancelSubscription = async (req, res) => {
 
     const order = rows[0];
 
-    const rzp = getRazorpay();
+    const rzp = getRazorpayFn();
     let response;
     try {
       response = await rzp.subscriptions.cancel(
@@ -1032,6 +1041,19 @@ export const cancelSubscription = async (req, res) => {
           customerName: order.contact_name,
           planName: order.product_name,
         });
+
+        // FIX (Medium #12 — Phase 3): stop this order's daily WhatsApp
+        // reminder (if any) now that the subscription is cancelled — see
+        // dailyReminderService.js's pauseReminderForOrder/endReminderForOrder
+        // /resumeReminderForOrder comment for why this was never wired up
+        // before. Best-effort: a failure here must not fail the
+        // already-successful cancellation.
+        endReminderForOrder(order.id).catch((err) =>
+          logger.error("[CANCEL] Failed to stop daily reminder for order", {
+            orderId: order.id,
+            message: err?.message || String(err),
+          }),
+        );
       }
     } catch (dbErr) {
       logger.error("[CANCEL] DB update failed after Razorpay cancel", {
@@ -1068,13 +1090,17 @@ export const cancelSubscription = async (req, res) => {
 };
 
 // ── pauseSubscription ───────────────────────────────────────────────────────
-export const pauseSubscription = async (req, res) => {
+export const pauseSubscription = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
   let stateChanged = false;
 
   try {
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `SELECT o.id, o.razorpay_subscription_id,
               o.contact_email, o.contact_name, o.contact_phone,
               p.name AS product_name
@@ -1097,7 +1123,7 @@ export const pauseSubscription = async (req, res) => {
 
     const order = rows[0];
 
-    const rzp = getRazorpay();
+    const rzp = getRazorpayFn();
     let response;
     try {
       response = await rzp.subscriptions.pause(order.razorpay_subscription_id, {
@@ -1160,6 +1186,16 @@ export const pauseSubscription = async (req, res) => {
             message: error?.message || String(error),
           }),
         );
+
+        // FIX (Medium #12 — Phase 3): see cancelSubscription's matching
+        // comment — pause this order's daily WhatsApp reminder (if any)
+        // too, not just the subscription's own billing status.
+        pauseReminderForOrder(order.id).catch((err) =>
+          logger.error("[PAUSE] Failed to pause daily reminder for order", {
+            orderId: order.id,
+            message: err?.message || String(err),
+          }),
+        );
       }
     } catch (dbErr) {
       logger.error("[PAUSE] DB update failed after Razorpay pause", {
@@ -1183,14 +1219,18 @@ export const pauseSubscription = async (req, res) => {
 };
 
 // ── resumeSubscription ──────────────────────────────────────────────────────
-export const resumeSubscription = async (req, res) => {
+export const resumeSubscription = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   const { id: razorpaySubscriptionId } = req.params;
   const userId = req.user?.id;
   let stateChanged = false;
 
   try {
-    const { rows } = await query(
-      `SELECT o.id, o.razorpay_subscription_id,
+    const { rows } = await queryFn(
+      `SELECT o.id, o.razorpay_subscription_id, o.subscription_status,
               o.contact_email, o.contact_name, o.contact_phone,
               p.name AS product_name
        FROM orders o
@@ -1212,7 +1252,26 @@ export const resumeSubscription = async (req, res) => {
 
     const order = rows[0];
 
-    const rzp = getRazorpay();
+    // LOW-08 fix: previously this went straight to Razorpay regardless of
+    // the order's current subscription_status — an already-active (or
+    // cancelled/never-paused) subscription would still trigger a live
+    // gateway call before any local check ran. The database (via
+    // updateSubscriptionOrder's expectedSubscriptionStatuses guard below)
+    // was always the final authority; this is only a fast, local rejection
+    // for the common invalid-state case so an unnecessary Razorpay call
+    // never happens and the caller gets an immediate, clear error.
+    if (order.subscription_status !== SUBSCRIPTION_STATUS.PAUSED) {
+      logger.warn("[RESUME] Subscription is not paused — refusing to resume", {
+        razorpaySubscriptionId,
+        userId,
+        currentStatus: order.subscription_status,
+      });
+      return res.status(400).json({
+        message: `Subscription cannot be resumed from its current status ("${order.subscription_status || "unknown"}"). Only a paused subscription can be resumed.`,
+      });
+    }
+
+    const rzp = getRazorpayFn();
     let response;
     try {
       response = await rzp.subscriptions.resume(
@@ -1273,6 +1332,17 @@ export const resumeSubscription = async (req, res) => {
           customerName: order.contact_name,
           planName: order.product_name,
         });
+
+        // FIX (Medium #12 — Phase 3): re-activate this order's daily
+        // WhatsApp reminder (if it was paused, not ended) now that the
+        // subscription is active again — see
+        // dailyReminderService.js's resumeReminderForOrder.
+        resumeReminderForOrder(order.id).catch((err) =>
+          logger.error("[RESUME] Failed to resume daily reminder for order", {
+            orderId: order.id,
+            message: err?.message || String(err),
+          }),
+        );
       }
     } catch (dbErr) {
       logger.error("[RESUME] DB update failed after Razorpay resume", {

@@ -1,6 +1,7 @@
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import app from "../src/app.js";
+import { closePool } from "../src/config/database.js";
 
 const otpPaths = [
   "/api/auth/send-otp",
@@ -22,6 +23,9 @@ after(async () => {
   await new Promise((resolve, reject) => {
     server.close((error) => (error ? reject(error) : resolve()));
   });
+  // FIX (ISSUE-007): without this, importing app.js opens a MySQL pool that
+  // is never closed, and the test process hangs instead of exiting.
+  await closePool();
 });
 
 const preflight = (path, origin, method = "POST") =>

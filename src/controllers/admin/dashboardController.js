@@ -2,7 +2,18 @@ import { query } from "../../config/database.js";
 import { getOrderSchemaInfo } from "../../utils/orderSchema.js";
 import cache from "../../utils/cache.js";
 
-const DASHBOARD_TTL = 120;
+// FIX (Medium #20 — Phase 3): this cache was never invalidated on any
+// order/refund mutation, so an admin watching the dashboard could see
+// stale totals/pending-orders/revenue for up to the full TTL after making
+// a change themselves. Shortened from 120s (well past what an admin
+// actively working the Orders screen would tolerate) and paired with real
+// invalidation — see invalidateDashboardCache below, called from
+// admin/orderController.js's updateOrderStatus/bulkUpdateStatus (the
+// clearest, most directly admin-facing case: an admin's own action should
+// be reflected on the dashboard, not just eventually expire).
+const DASHBOARD_TTL = 20;
+
+export const invalidateDashboardCache = () => cache.del("admin:dashboard");
 
 const normalizeRecentOrderItems = (value) => {
   if (!value) return [];

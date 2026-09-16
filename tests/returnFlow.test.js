@@ -8,6 +8,7 @@ import {
   slugifyReturnEventLabel,
   resolveCustomerAddressWithFallback,
   buildReverseShipmentRoles,
+  resolveApprovedRefundAmount,
 } from "../src/controllers/admin/returnController.js";
 import {
   sendOrderStatusNotificationOnce,
@@ -512,7 +513,7 @@ test("inspection approval and rejection are mutually exclusive one-way doors", (
   assert.match(rejectSource, /order\.refund_status/);
 });
 
-test("approveRefund hard-requires return_status='returned', inspection_status='approved', a successful payment, and caps the amount at the order total", () => {
+test("approveRefund hard-requires return_status='returned', inspection_status='approved', and a successful payment before it ever reaches amount resolution", () => {
   const fnSource = returnControllerSource.slice(
     returnControllerSource.indexOf("export const approveRefund"),
     returnControllerSource.indexOf("export const rejectRefund"),
@@ -520,7 +521,67 @@ test("approveRefund hard-requires return_status='returned', inspection_status='a
   assert.match(fnSource, /order\.return_status !== "returned"/);
   assert.match(fnSource, /order\.inspection_status !== "approved"/);
   assert.match(fnSource, /order\.payment_status !== "paid" \|\| !order\.razorpay_payment_id/);
-  assert.match(fnSource, /Number\(refund_amount\) > refundableAmount/);
+  assert.match(fnSource, /resolveApprovedRefundAmount\(/);
+});
+
+// ── ISSUE-005 — Approve Refund frontend/backend contract mismatch ─────────
+// The real admin "Approve Refund" button is a plain confirm modal with no
+// amount field and always PATCHes an EMPTY body (bree-frontend/src/pages/
+// admin/Orders.js's handleApproveRefund) — the backend used to hard-require
+// a positive refund_amount, so every real click 400'd and refunds could
+// never be approved through the UI at all. resolveApprovedRefundAmount is
+// the actual fix; these are real behavioral calls against the exported
+// function (not a regex over the source), proving the exact empty-body
+// shape the button sends now succeeds, and that an explicit/garbage amount
+// is still fully validated.
+
+test("ISSUE-005: an empty body (the real 'Approve Refund' button's exact request) defaults to a full refund of the order total", () => {
+  const result = resolveApprovedRefundAmount({
+    refundAmountProvided: false,
+    refundAmount: undefined,
+    refundableAmount: 799,
+  });
+  assert.deepEqual(result, { ok: true, amount: 799 });
+});
+
+test("ISSUE-005: an order with no refundable amount on record is rejected outright, even with no amount requested", () => {
+  const result = resolveApprovedRefundAmount({
+    refundAmountProvided: false,
+    refundAmount: undefined,
+    refundableAmount: 0,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /no refundable amount/);
+});
+
+test("ISSUE-005: an explicit partial refund amount within the refundable total is honored exactly", () => {
+  const result = resolveApprovedRefundAmount({
+    refundAmountProvided: true,
+    refundAmount: 300,
+    refundableAmount: 799,
+  });
+  assert.deepEqual(result, { ok: true, amount: 300 });
+});
+
+test("ISSUE-005: an explicit amount above the refundable total is rejected, never silently capped or trusted", () => {
+  const result = resolveApprovedRefundAmount({
+    refundAmountProvided: true,
+    refundAmount: 999999,
+    refundableAmount: 799,
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.message, /cannot exceed the refundable amount of ₹799/);
+});
+
+test("ISSUE-005: an explicit zero/negative/non-numeric amount is rejected rather than silently defaulting", () => {
+  for (const bad of [0, -50, "abc", NaN]) {
+    const result = resolveApprovedRefundAmount({
+      refundAmountProvided: true,
+      refundAmount: bad,
+      refundableAmount: 799,
+    });
+    assert.equal(result.ok, false, `refundAmount=${bad} must not be accepted`);
+  }
 });
 
 test("completeRefund is three-mode idempotent (already_completed / recheck / create) and never calls payments.refund() twice for the same order", () => {
@@ -545,14 +606,15 @@ test("completeRefund is three-mode idempotent (already_completed / recheck / cre
   assert.match(fnSource, /if \(didTransition\)/);
 });
 
-test("rejectRefund blocks only once refund_status is already 'completed' — a real refund in motion is never silently double-issued by this endpoint", () => {
-  const fnSource = returnControllerSource.slice(
-    returnControllerSource.indexOf("export const rejectRefund"),
-    returnControllerSource.indexOf("export const completeRefund"),
-  );
-  assert.match(fnSource, /order\.refund_status === "completed"/);
-  assert.match(fnSource, /A completed refund cannot be rejected/);
-});
+// FIX (ISSUE-010): this used to be a source-text-regex test documenting
+// the OLD, narrower guard (rejectRefund blocked only 'completed', not
+// 'initiated' — the exact contradiction-risk gap the audit flagged: a
+// refund already sent to Razorpay could still be marked "rejected" in the
+// DB). Superseded by real behavioral tests that drive the actual exported
+// rejectRefund function end-to-end against a fake DB — see
+// refundConcurrency.test.js ("ISSUE-010: rejectRefund is blocked once
+// refund_status is '<initiated|processing|completed>'" and the "still
+// succeeds for a refund that was approved" regression case).
 
 // ── Security / authorization: every mutating handler locks the row and
 //    trusts nothing from the client for identity or amount ────────────────

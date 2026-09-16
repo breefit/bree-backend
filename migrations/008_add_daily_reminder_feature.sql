@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS daily_reminders (
   package_duration_days INT DEFAULT NULL,
   
   -- Status tracking
-  status VARCHAR(50) NOT NULL DEFAULT 'active',  -- active, paused, ended, cancelled
+  -- Free-text VARCHAR (not a DB enum) so a new value can be added without a
+  -- migration. Currently only 'active', 'paused', and 'ended' are ever
+  -- written by application code (dailyReminderService.js) — 'cancelled' is
+  -- reserved for a future explicit-cancellation flow that does not exist
+  -- yet (LOW-11, Phase 4 audit).
+  status VARCHAR(50) NOT NULL DEFAULT 'active',  -- active, paused, ended (cancelled: reserved, not yet used)
   
   -- Metadata
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -84,7 +89,10 @@ CREATE TABLE IF NOT EXISTS daily_reminder_sends (
   send_date DATE NOT NULL,  -- The date the reminder was supposed to be sent (YYYY-MM-DD)
   
   -- Send result
-  status VARCHAR(50) NOT NULL DEFAULT 'success',  -- success, failed, skipped
+  -- Free-text VARCHAR (not a DB enum). Currently only 'success' and
+  -- 'failed' are ever written by cron/dailyReminderCron.js — 'skipped' is
+  -- reserved, not yet used (LOW-11, Phase 4 audit).
+  status VARCHAR(50) NOT NULL DEFAULT 'success',  -- success, failed (skipped: reserved, not yet used)
   waplify_message_id VARCHAR(255) DEFAULT NULL,  -- Waplify API response message ID
   error_message TEXT DEFAULT NULL,  -- Error details if failed
   

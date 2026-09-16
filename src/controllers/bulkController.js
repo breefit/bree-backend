@@ -111,8 +111,8 @@ const escapeHtml = (value) =>
  * that needs the current row (for read-only checks, notifications, etc.)
  * fetches it the same way.
  */
-const findBulkBooking = async (id) => {
-  const { rows } = await query("SELECT * FROM bulk_bookings WHERE id = ?", [
+const findBulkBooking = async (id, { queryFn = query } = {}) => {
+  const { rows } = await queryFn("SELECT * FROM bulk_bookings WHERE id = ?", [
     id,
   ]);
   return rows[0] || null;
@@ -122,8 +122,8 @@ const findBulkBooking = async (id) => {
  * Loads a bulk_bookings row plus its communication_history array, for every
  * response that feeds the admin detail modal.
  */
-const findBulkBookingWithHistory = async (id) => {
-  const booking = await findBulkBooking(id);
+const findBulkBookingWithHistory = async (id, { queryFn = query } = {}) => {
+  const booking = await findBulkBooking(id, { queryFn });
   if (!booking) return null;
 
   try {
@@ -455,11 +455,32 @@ export const getMyBulkBookings = async (req, res) => {
 /**
  * Get all bulk bookings with pagination and search. Unchanged.
  */
-export const getBulkBookings = async (req, res) => {
+// FIX (ISSUE-020 — CSV export truncated to 50): BulkOrders.js's exportCSV
+// reuses this same paginated endpoint with limit=5000 to fetch "the
+// complete filtered dataset" for a client-side-built CSV, but the old
+// `Math.min(50, ...)` cap silently truncated every request — list AND
+// export — to 50 rows with no warning. A single unbounded LIMIT for a
+// large request is its own risk (memory/latency on a big result set), so
+// requests above one safe query's worth are now satisfied via a bounded
+// pagination loop of MAX_QUERY_CHUNK-row round trips, up to a hard
+// EXPORT_ROW_CEILING — never a single giant query, never silently
+// truncated to something smaller than what was actually asked for.
+const MAX_QUERY_CHUNK = 500;
+const EXPORT_ROW_CEILING = 20000;
+
+// `queryFn` injectable only for tests (default to the real pool).
+export const getBulkBookings = async (req, res, { queryFn = query } = {}) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(50, parseInt(req.query.limit) || 10);
+    const requestedLimit = Math.max(1, parseInt(req.query.limit) || 10);
+    const limit = Math.min(requestedLimit, EXPORT_ROW_CEILING);
     const search = req.query.search?.trim() || "";
+    // FIX (ISSUE-021): the frontend has sent `status`/`date` on every list
+    // and export request all along, but neither was ever read here — the
+    // filter silently no-op'd, returning the full unfiltered set with
+    // pagination totals computed against the wrong (unfiltered) count.
+    const status = req.query.status?.trim() || "";
+    const date = req.query.date?.trim() || "";
 
     const offset = (page - 1) * limit;
 
@@ -488,8 +509,21 @@ export const getBulkBookings = async (req, res) => {
       );
     }
 
+    if (status) {
+      whereClause += ` AND status = ?`;
+      params.push(status);
+    }
+
+    if (date) {
+      // Matches the frontend's own client-side fallback filter semantics
+      // (BulkOrders.js's applyClientFilters): the booking's created_at
+      // calendar date, not delivery_date.
+      whereClause += ` AND DATE(created_at) = ?`;
+      params.push(date);
+    }
+
     // Get total count
-    const countResult = await query(
+    const countResult = await queryFn(
       `
       SELECT COUNT(*) as total
       FROM bulk_bookings
@@ -500,19 +534,45 @@ export const getBulkBookings = async (req, res) => {
 
     const total = countResult.rows[0]?.total || 0;
 
-    // Get paginated results
-    const result = await query(
-      `
-      SELECT *
-      FROM bulk_bookings
-      WHERE ${whereClause}
-      ORDER BY created_at DESC
-      LIMIT ? OFFSET ?
-    `,
-      [...params, limit, offset],
-    );
-
-    const bookings = result.rows;
+    // Interactive paginated list requests (limit <= MAX_QUERY_CHUNK, the
+    // normal case) run as one query, offset by the requested page — same
+    // as before. A request for more than one safe chunk (the CSV export
+    // path) always wants everything matching the filter from the start,
+    // not a specific page, so it loops in MAX_QUERY_CHUNK-row round trips
+    // instead of one unbounded query.
+    let bookings;
+    if (limit <= MAX_QUERY_CHUNK) {
+      const result = await queryFn(
+        `
+        SELECT *
+        FROM bulk_bookings
+        WHERE ${whereClause}
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `,
+        [...params, limit, offset],
+      );
+      bookings = result.rows;
+    } else {
+      bookings = [];
+      let chunkOffset = 0;
+      while (bookings.length < limit) {
+        const chunkSize = Math.min(MAX_QUERY_CHUNK, limit - bookings.length);
+        const chunkResult = await queryFn(
+          `
+          SELECT *
+          FROM bulk_bookings
+          WHERE ${whereClause}
+          ORDER BY created_at DESC
+          LIMIT ? OFFSET ?
+        `,
+          [...params, chunkSize, chunkOffset],
+        );
+        bookings = bookings.concat(chunkResult.rows);
+        if (chunkResult.rows.length < chunkSize) break; // exhausted the filtered set
+        chunkOffset += chunkSize;
+      }
+    }
 
     res.status(200).json({
       success: true,
@@ -618,7 +678,7 @@ export const getBulkBooking = async (req, res) => {
  *    the "quote ready" customer notification and a "Quote shared
  *    successfully" response instead of the generic update message.
  */
-export const updateBulkBooking = async (req, res) => {
+export const updateBulkBooking = async (req, res, { queryFn = query } = {}) => {
   try {
     const { id } = req.params;
     const { status, quote_price, delivery_date, admin_notes } = req.body;
@@ -676,7 +736,7 @@ export const updateBulkBooking = async (req, res) => {
     }
 
     // Check if booking exists
-    const existing = await findBulkBooking(id);
+    const existing = await findBulkBooking(id, { queryFn });
 
     if (!existing) {
       return res.status(404).json({
@@ -921,6 +981,32 @@ export const updateBulkBooking = async (req, res) => {
     if (quote_price !== undefined) {
       updates.push("quote_price = ?");
       params.push(quote_price === null ? null : parseFloat(quote_price));
+
+      // FIX (Phase 3B — Medium #10, bulk quote/payment race): a re-quote
+      // used to leave any already-issued razorpay_order_id (created for the
+      // OLD amount by ensureBulkRazorpayOrder) in place — Razorpay order
+      // amounts are immutable once created, so a customer whose checkout
+      // popup already had that stale order open could complete payment at
+      // the OLD price after the price changed underneath them. Genuinely
+      // changing the price (not just re-saving the same value) now
+      // invalidates that stale order reference and resets quote_approved —
+      // the customer must see and approve the NEW price before any new
+      // Razorpay order can be created for this booking (ensureBulkRazorpayOrder
+      // already refuses to proceed without quote_approved). rejectIfReadOnly
+      // above already blocks this whole path once order_created=1, so this
+      // only ever affects a not-yet-paid booking.
+      const newQuotePrice = quote_price === null ? null : parseFloat(quote_price);
+      const isGenuinePriceChange =
+        Number(existing.quote_price) !== Number(newQuotePrice);
+      if (isGenuinePriceChange && (existing.razorpay_order_id || existing.quote_approved)) {
+        updates.push("razorpay_order_id = NULL");
+        updates.push("quote_approved = 0");
+        console.info("[BULK] Quote price changed — invalidated stale Razorpay order reference and reset approval", {
+          bulkBookingId: id,
+          oldPrice: existing.quote_price,
+          newPrice: newQuotePrice,
+        });
+      }
     }
 
     if (delivery_date !== undefined) {
@@ -957,6 +1043,12 @@ export const updateBulkBooking = async (req, res) => {
 
     if (isSharingQuote) {
       updates.push("quote_shared_at = NOW()");
+      // FIX (Medium #9 — Phase 3): 15-day validity window from the moment
+      // the quote is (re-)shared — re-quoting (a genuine price/delivery
+      // date change, per isSharingQuote's own guard above) resets this the
+      // same way it resets quote_shared_at, so an updated quote gets a
+      // fresh window rather than inheriting an old deadline.
+      updates.push("quote_expires_at = DATE_ADD(NOW(), INTERVAL 15 DAY)");
     }
 
     if (updates.length === 0) {
@@ -1002,7 +1094,7 @@ export const updateBulkBooking = async (req, res) => {
         updateParams.push(quotePriceCandidate, deliveryDateCandidate);
       }
 
-      const updateResult = await query(updateSql, updateParams);
+      const updateResult = await queryFn(updateSql, updateParams);
       const updateAffectedRows = Number(
         updateResult.affectedRows ?? updateResult.rowCount ?? 0,
       );
@@ -1012,7 +1104,9 @@ export const updateBulkBooking = async (req, res) => {
         // request. Preserve any unrelated fields from this request, but do
         // not claim the same quote notification a second time.
         const regularUpdates = updates.filter(
-          (update) => update !== "quote_shared_at = NOW()",
+          (update) =>
+            update !== "quote_shared_at = NOW()" &&
+            update !== "quote_expires_at = DATE_ADD(NOW(), INTERVAL 15 DAY)",
         );
         await query(
           `UPDATE bulk_bookings SET ${regularUpdates.join(", ")} WHERE id = ?`,
@@ -1037,7 +1131,7 @@ export const updateBulkBooking = async (req, res) => {
     }
 
     // Fetch updated booking
-    const updated = await findBulkBookingWithHistory(id);
+    const updated = await findBulkBookingWithHistory(id, { queryFn });
 
     if (shouldNotifyInProgress) {
       notifyBulkOrderInProgress({
@@ -1267,18 +1361,22 @@ export const getBulkQuoteForApproval = async (req, res) => {
  * order (false when an existing one was reused).
  *
  * Returns `{ ok: false, code, booking }` on a validation failure — `code` is
- * one of NOT_FOUND / READ_ONLY / INVALID_QUOTE / NOT_APPROVED / ALREADY_PAID
- * so the caller can render appropriate wording.
+ * one of NOT_FOUND / READ_ONLY / INVALID_QUOTE / NOT_APPROVED /
+ * QUOTE_EXPIRED / QUOTE_CHANGED / ALREADY_PAID so the caller can render appropriate
+ * wording.
  *
  * Throws only on an unexpected DB/Razorpay error — callers should still
  * wrap calls in their own try/catch for a 500 response.
  */
-const ensureBulkRazorpayOrder = async (id) => {
+export const ensureBulkRazorpayOrder = async (
+  id,
+  { queryFn = query, getClientFn = getClient, getRazorpayFn = getRazorpay } = {},
+) => {
   // ── Phase 1 transaction: lock the row, validate, and decide whether a
   // *new* Razorpay order is needed. Released immediately afterward — the
   // external Razorpay call below must never run while this lock (and the
   // pooled connection) is held. ─────────────────────────────────────────
-  const phase1 = await getClient();
+  const phase1 = await getClientFn();
   let razorpayOrderId;
   let needsRazorpayOrder = false;
   let lockedQuotePrice;
@@ -1309,6 +1407,18 @@ const ensureBulkRazorpayOrder = async (id) => {
       await phase1.query("ROLLBACK");
       return { ok: false, code: "NOT_APPROVED" };
     }
+    // FIX (Medium #9 — Phase 3): a months-old approved quote used to
+    // remain payable at its frozen quote_price indefinitely. Rows quoted
+    // before this migration have quote_expires_at = NULL — deliberately
+    // NOT treated as expired (no retroactive lockout of pre-existing
+    // approved quotes with no window ever set for them).
+    if (
+      locked.quote_expires_at &&
+      new Date(locked.quote_expires_at).getTime() <= Date.now()
+    ) {
+      await phase1.query("ROLLBACK");
+      return { ok: false, code: "QUOTE_EXPIRED" };
+    }
     if (locked.payment_status === "paid") {
       await phase1.query("ROLLBACK");
       return { ok: false, code: "ALREADY_PAID", booking: locked };
@@ -1335,7 +1445,7 @@ const ensureBulkRazorpayOrder = async (id) => {
   const originalRazorpayOrderId = razorpayOrderId;
 
   const amountPaise = Math.round(Number(lockedQuotePrice) * 100);
-  const razorpay = getRazorpay();
+  const razorpay = getRazorpayFn();
   const bookingRef =
     lockedBookingSnapshot.bulk_booking_number || lockedBookingSnapshot.id;
 
@@ -1390,6 +1500,7 @@ const ensureBulkRazorpayOrder = async (id) => {
   }
 
   let created = false;
+  let quoteChangedDuringCreate = false;
 
   // The Razorpay order-create HTTP call runs with NO DB transaction open —
   // holding a row lock/pooled connection across a third-party network round
@@ -1429,12 +1540,12 @@ const ensureBulkRazorpayOrder = async (id) => {
     // caller (admin AND/OR customer page load) having done the same thing
     // between phase 1 and now — this is exactly what makes a page refresh
     // safe to call this repeatedly without ever creating two orders. ──────
-    const phase2 = await getClient();
+    const phase2 = await getClientFn();
     try {
       await phase2.query("BEGIN");
 
       const { rows: relockedRows } = await phase2.query(
-        "SELECT razorpay_order_id FROM bulk_bookings WHERE id = ? FOR UPDATE",
+        "SELECT razorpay_order_id, quote_price, quote_approved, payment_status FROM bulk_bookings WHERE id = ? FOR UPDATE",
         [id],
       );
       const relocked = relockedRows[0];
@@ -1448,6 +1559,25 @@ const ensureBulkRazorpayOrder = async (id) => {
       // that same stale value straight back and silently discard the valid
       // order we just created. Only trust `relocked` as "someone else's
       // fresh write" if it's a DIFFERENT value from what we originally read.
+      //
+      // FIX (Phase 3B — Medium #10): this also used to write the
+      // just-created rzpOrder.id unconditionally once the "someone else
+      // already wrote a fresher one" check above was cleared — but a
+      // concurrent updateBulkBooking re-quote could land BETWEEN phase 1
+      // (which decided the amount to charge) and this re-lock, changing
+      // quote_price/quote_approved without ever writing a DIFFERENT
+      // razorpay_order_id (e.g. the row started and stays NULL right up
+      // until this write) — invisible to the check above. Re-validating
+      // quote_price/quote_approved/payment_status here, against the exact
+      // values phase 1 used to size the Razorpay order, closes that gap:
+      // a quote that changed underneath this call is refused rather than
+      // silently attaching an order priced for the OLD amount.
+      const quoteStillValid =
+        relocked &&
+        Number(relocked.quote_price) === Number(lockedQuotePrice) &&
+        Boolean(relocked.quote_approved) &&
+        relocked.payment_status !== "paid";
+
       if (
         relocked?.razorpay_order_id &&
         relocked.razorpay_order_id !== originalRazorpayOrderId
@@ -1457,6 +1587,16 @@ const ensureBulkRazorpayOrder = async (id) => {
         // untouched — no charge, no cleanup needed).
         razorpayOrderId = relocked.razorpay_order_id;
         await phase2.query("COMMIT");
+      } else if (!quoteStillValid) {
+        // The quote changed (or was un-approved / paid elsewhere) between
+        // phase 1 and now — the order we just created is for a stale
+        // amount. Leave the booking exactly as this concurrent write found
+        // it; the order we created goes unused on Razorpay's side (same
+        // "no charge, no cleanup needed" reasoning as above). quoteChanged
+        // is checked right after this try/catch/finally block, once the
+        // connection has been released via the existing finally below.
+        await phase2.query("ROLLBACK");
+        quoteChangedDuringCreate = true;
       } else {
         razorpayOrderId = rzpOrder.id;
         await phase2.query(
@@ -1472,6 +1612,13 @@ const ensureBulkRazorpayOrder = async (id) => {
     } finally {
       phase2.release();
     }
+
+    if (quoteChangedDuringCreate) {
+      console.warn("[BULK] Quote changed while a Razorpay order was being created for it — discarding the stale attempt", {
+        bulkBookingId: id,
+      });
+      return { ok: false, code: "QUOTE_CHANGED" };
+    }
   } else {
     console.info("[BULK] Reusing existing Razorpay order", {
       bookingId: id,
@@ -1479,7 +1626,7 @@ const ensureBulkRazorpayOrder = async (id) => {
     });
   }
 
-  const booking = await findBulkBooking(id);
+  const booking = await findBulkBooking(id, { queryFn });
 
   console.info("[BULK] Razorpay order resolution complete", {
     bulkBookingNumber: bookingRef,
@@ -1655,7 +1802,11 @@ export const sendBulkDispatch = async (req, res) => {
  * @route POST /api/bulk-bookings/:id/verify-payment
  * @body { razorpay_order_id, razorpay_payment_id, razorpay_signature }
  */
-export const verifyBulkPayment = async (req, res) => {
+export const verifyBulkPayment = async (
+  req,
+  res,
+  { queryFn = query, getClientFn = getClient, getRazorpayFn = getRazorpay } = {},
+) => {
   try {
     const { id } = req.params;
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
@@ -1667,7 +1818,7 @@ export const verifyBulkPayment = async (req, res) => {
         .json({ success: false, message: "Missing payment fields" });
     }
 
-    const booking = await findBulkBooking(id);
+    const booking = await findBulkBooking(id, { queryFn });
     if (!booking) {
       return res
         .status(404)
@@ -1712,6 +1863,42 @@ export const verifyBulkPayment = async (req, res) => {
       !booking.razorpay_order_id ||
       booking.razorpay_order_id !== razorpay_order_id
     ) {
+      // FIX (Phase 3B — Medium #10, bulk quote/payment race): this
+      // razorpay_order_id can now be legitimately cleared by a re-quote
+      // (see updateBulkBooking) WHILE a customer's checkout popup — already
+      // showing the OLD order — is still open. If they complete payment in
+      // that stale popup, Razorpay genuinely captures money against a
+      // razorpay_payment_id this booking no longer references. Best-effort,
+      // non-blocking check: if that specific payment id was in fact
+      // captured, flag it for reconciliation instead of only rejecting with
+      // no trace at all. A failure here (Razorpay unreachable, garbage
+      // payment id, etc.) never changes the rejection itself.
+      try {
+        const razorpay = getRazorpayFn();
+        const strandedPayment = await razorpay.payments.fetch(razorpay_payment_id);
+        if (strandedPayment?.status === "captured") {
+          console.error("[BULK] ALERT: a captured payment references a razorpay_order_id no longer attached to this booking (likely a stale checkout popup after a re-quote) — needs manual reconciliation", {
+            bulkBookingId: booking.id,
+            bulkBookingNumber: booking.bulk_booking_number,
+            razorpayPaymentId: razorpay_payment_id,
+            staleRazorpayOrderId: razorpay_order_id,
+            currentRazorpayOrderId: booking.razorpay_order_id,
+            capturedPaise: strandedPayment.amount,
+          });
+          await queryFn(
+            `UPDATE bulk_bookings
+             SET payment_status = 'captured_mismatch', updated_at = NOW()
+             WHERE id = ? AND payment_status <> 'paid'`,
+            [booking.id],
+          ).catch(() => {});
+        }
+      } catch (reconcileErr) {
+        console.warn("[BULK] Could not check stale payment for reconciliation", {
+          bulkBookingId: booking.id,
+          message: reconcileErr?.message || String(reconcileErr),
+        });
+      }
+
       return res.status(400).json({
         success: false,
         message:
@@ -1734,7 +1921,7 @@ export const verifyBulkPayment = async (req, res) => {
     // ── Verify the payment itself with Razorpay (status/amount/currency) ───
     let rzpPayment;
     try {
-      const razorpay = getRazorpay();
+      const razorpay = getRazorpayFn();
       rzpPayment = await razorpay.payments.fetch(razorpay_payment_id);
     } catch (err) {
       console.error("[BULK] Razorpay payment fetch failed", err?.message);
@@ -1753,9 +1940,43 @@ export const verifyBulkPayment = async (req, res) => {
       });
     }
     if (Number(rzpPayment.amount) !== expectedPaise) {
+      // FIX (Phase 3B — Medium #10, bulk quote/payment race): this used to
+      // just 400 with no DB trace whatsoever — if the mismatch happened
+      // because the admin re-quoted WHILE this exact payment was already
+      // captured at Razorpay (money genuinely moved, at the price that was
+      // authoritative when the customer's checkout popup opened), that
+      // captured payment was silently stranded: invisible to any admin
+      // screen, undiscoverable except by manually checking the Razorpay
+      // dashboard. Recorded here instead of only logged — a safer default
+      // than auto-refunding (removes a human check on what could also be a
+      // detection false-positive) but no longer silent. This does NOT mark
+      // the booking paid/read-only — the booking stays open for an admin to
+      // resolve (refund the stray payment, or re-quote to match it) via the
+      // normal flow.
+      console.error("[BULK] ALERT: captured payment amount does not match the current quote — needs manual reconciliation", {
+        bulkBookingId: booking.id,
+        bulkBookingNumber: booking.bulk_booking_number,
+        razorpayPaymentId: razorpay_payment_id,
+        razorpayOrderId: razorpay_order_id,
+        capturedPaise: rzpPayment.amount,
+        expectedPaise,
+        currentQuotePrice: booking.quote_price,
+      });
+      await queryFn(
+        `UPDATE bulk_bookings
+         SET payment_status = 'captured_mismatch', updated_at = NOW()
+         WHERE id = ? AND payment_status <> 'paid'`,
+        [booking.id],
+      ).catch((err) =>
+        console.error("[BULK] Failed to record captured_mismatch flag", {
+          bulkBookingId: booking.id,
+          message: err?.message || String(err),
+        }),
+      );
       return res.status(400).json({
         success: false,
-        message: "Payment amount does not match the quoted amount.",
+        message:
+          "Payment amount does not match the current quoted amount. Our team has been notified — please contact support.",
       });
     }
     if (rzpPayment.currency !== "INR") {
@@ -1775,7 +1996,7 @@ export const verifyBulkPayment = async (req, res) => {
     // present and valid.
     let magicCheckoutAddress = null;
     try {
-      const razorpay = getRazorpay();
+      const razorpay = getRazorpayFn();
       const rzpOrderDetails = await razorpay.orders.fetch(razorpay_order_id);
       const shippingAddr = rzpOrderDetails?.customer_details?.shipping_address;
       if (
@@ -1810,7 +2031,7 @@ export const verifyBulkPayment = async (req, res) => {
 
     // ── Transaction: mark payment paid under a row lock, guarding against
     // concurrent/duplicate verification calls and a mid-flight admin confirm.
-    const client = await getClient();
+    const client = await getClientFn();
     let updatedBooking;
     try {
       await client.query("BEGIN");
@@ -1858,7 +2079,7 @@ export const verifyBulkPayment = async (req, res) => {
           [razorpay_payment_id, razorpay_signature, id],
         );
         await client.query("COMMIT");
-        updatedBooking = await findBulkBooking(id);
+        updatedBooking = await findBulkBooking(id, { queryFn });
       }
     } catch (err) {
       await client.query("ROLLBACK");
@@ -1901,7 +2122,7 @@ export const verifyBulkPayment = async (req, res) => {
     }
 
     const finalBooking = orderResult
-      ? await findBulkBooking(id)
+      ? await findBulkBooking(id, { queryFn })
       : updatedBooking;
 
     res.status(200).json({
@@ -2045,6 +2266,26 @@ export const getBulkPaymentDetails = async (req, res) => {
           return res.status(409).json({
             success: false,
             message: "This booking has already been converted into an Order.",
+          });
+        }
+        if (result.code === "QUOTE_EXPIRED") {
+          return res.status(410).json({
+            success: false,
+            code: "QUOTE_EXPIRED",
+            message:
+              "This quote has expired. Please contact us for an updated quote.",
+          });
+        }
+        if (result.code === "QUOTE_CHANGED") {
+          // FIX (Phase 3B — Medium #10): the quote changed while this
+          // request was creating a Razorpay order for the (now stale)
+          // previous amount — refuse rather than hand back an order the
+          // customer could still pay at the old price. A page reload calls
+          // this same endpoint again and picks up the current quote.
+          return res.status(409).json({
+            success: false,
+            code: "QUOTE_CHANGED",
+            message: "The quote for this booking has just been updated. Please refresh the page.",
           });
         }
         if (result.code === "ALREADY_PAID") {

@@ -13,7 +13,6 @@ import {
   getOrderLiveTracking,
   getOrderHistory,
   createOrder as createOrderCheckout,
-  updatePaymentStatus,
 } from "../controllers/orderController.js";
 import { validateCart } from "../controllers/cartController.js";
 import {
@@ -98,7 +97,16 @@ orderRouter.get("/:id", optionalAuth, getOrder);
 // Checkout flow endpoints
 orderRouter.post("/validate-cart", optionalAuth, validateCart);
 orderRouter.post("/create", auth, createOrderCheckout);
-orderRouter.put("/:id/payment-status", auth, updatePaymentStatus);
+// FIX (ISSUE-001 — payment bypass): PUT /:id/payment-status used to let any
+// authenticated customer write payment_status/order_status directly onto
+// their own order (ownership-checked, but not payment-truth-checked) — a
+// customer could mark an unpaid order "paid"/"delivered" themselves. No
+// legitimate frontend caller ever existed for this route (confirmed by
+// repo-wide search). Payment/order status is set exclusively by the
+// verified Razorpay flow (paymentController's verifyPayment/handleWebhook)
+// or the governed admin transition logic in admin/orderController.js —
+// removed rather than re-gated, since customers have no legitimate reason
+// to call this endpoint at all.
 
 // ── Payment ───────────────────────────────────────────────────────────────────
 export const paymentRouter = Router();

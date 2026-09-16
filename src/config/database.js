@@ -15,14 +15,68 @@ import mysql from "mysql2/promise";
 
 const cleanEnv = (value) => value?.trim();
 
+// FIX (ISSUE-007 — test suite could touch the production database): this
+// repo has no separate test database — DATABASE_URL is the live production
+// connection string (confirmed in docs/audit/BREE_COMPLETE_DEBUG_REPORT.md).
+// Under NODE_ENV=test, DATABASE_URL is never read at all — only a distinct
+// TEST_DATABASE_URL is trusted for a real connection. If none is configured
+// (the default in this repo today), the pool is pointed at an address
+// nothing listens on, so any code path that still tries a real query fails
+// loudly (ECONNREFUSED) instead of silently reaching production; every
+// startup side effect below (the connectivity ping, the schema-migration
+// chain) is skipped outright in test mode. Tests that need real query
+// behavior use the queryExecutor-injection pattern already established in
+// this codebase (see tests/shippingNotifications.test.js) against an
+// in-memory fake instead of a live database.
+const NODE_ENV = cleanEnv(process.env.NODE_ENV);
+export const isTestEnv = NODE_ENV === "test";
+
 const dbHost = cleanEnv(process.env.DB_HOST);
 const dbPort = Number(cleanEnv(process.env.DB_PORT) || 3306);
 const dbUser = cleanEnv(process.env.DB_USER);
 const dbPassword = cleanEnv(process.env.DB_PASSWORD);
 const dbName = cleanEnv(process.env.DB_NAME);
-const databaseUrlRaw = cleanEnv(process.env.DATABASE_URL);
+const prodDatabaseUrlRaw = cleanEnv(process.env.DATABASE_URL);
+const testDatabaseUrlRaw = cleanEnv(process.env.TEST_DATABASE_URL);
+
+if (isTestEnv && testDatabaseUrlRaw && prodDatabaseUrlRaw && testDatabaseUrlRaw === prodDatabaseUrlRaw) {
+  // Hard abort, never a warning: TEST_DATABASE_URL must never be allowed to
+  // resolve to the same database as production.
+  console.error(
+    "[FATAL] TEST_DATABASE_URL is identical to the production DATABASE_URL. " +
+      "Refusing to run tests against production. Aborting immediately.",
+  );
+  process.exit(1);
+}
 
 let poolConfig;
+let databaseUrlRaw = null;
+
+if (isTestEnv) {
+  if (testDatabaseUrlRaw) {
+    databaseUrlRaw = testDatabaseUrlRaw;
+  } else {
+    console.warn(
+      "[DB] NODE_ENV=test and no TEST_DATABASE_URL is configured — real " +
+        "database queries are unavailable in this run. DATABASE_URL " +
+        "(production) is never used in test mode. Tests must inject a fake " +
+        "queryExecutor; any code path that attempts a real query will fail " +
+        "fast instead of reaching production.",
+    );
+    // Deliberately unreachable: localhost with nothing listening on the
+    // MySQL port, so a stray real query fails fast (ECONNREFUSED) rather
+    // than silently succeeding against whatever DATABASE_URL happens to be.
+    poolConfig = {
+      host: "127.0.0.1",
+      port: 1,
+      user: "test_db_not_configured",
+      password: "",
+      database: "test_db_not_configured",
+    };
+  }
+} else {
+  databaseUrlRaw = prodDatabaseUrlRaw;
+}
 
 if (databaseUrlRaw) {
   try {
@@ -43,6 +97,19 @@ if (databaseUrlRaw) {
     console.error("❌ Invalid DATABASE_URL format:", databaseUrlRaw);
     console.error("Falling back to DB_HOST / DB_USER / DB_PASSWORD / DB_NAME");
   }
+}
+
+if (!poolConfig && isTestEnv) {
+  // Never fall back to the DB_HOST/DB_USER/DB_NAME production vars in test
+  // mode either — same unreachable placeholder as the no-TEST_DATABASE_URL
+  // case above.
+  poolConfig = {
+    host: "127.0.0.1",
+    port: 1,
+    user: "test_db_not_configured",
+    password: "",
+    database: "test_db_not_configured",
+  };
 }
 
 if (!poolConfig) {
@@ -141,14 +208,20 @@ const testConnection = async () => {
   }
 };
 
-try {
-  // console.log("STEP 5 - Testing database connection");
-  await testConnection();
-  // console.log("STEP 6 - Database connected successfully");
-} catch (err) {
-  console.error("❌ Database connection failed");
-  console.error(err.stack || err);
-  // console.log("⚠️ Continuing startup without DB");
+// FIX (ISSUE-007): never probe a real connection at import time in test
+// mode — importing this module (transitively, via almost any controller)
+// used to ping whatever DATABASE_URL pointed at, which the test suite's own
+// in-code comment confirms is production, on every single test run.
+if (!isTestEnv) {
+  try {
+    // console.log("STEP 5 - Testing database connection");
+    await testConnection();
+    // console.log("STEP 6 - Database connected successfully");
+  } catch (err) {
+    console.error("❌ Database connection failed");
+    console.error(err.stack || err);
+    // console.log("⚠️ Continuing startup without DB");
+  }
 }
 
 // FIX (Order Number feature): ensure orders.order_number + the
@@ -453,13 +526,15 @@ const ensureDailyReminderPhoneColumns = async () => {
 // historical duplicate rows already exist, this logs and skips rather than
 // crashing startup — cleaning those up, if ever needed, is a separate,
 // deliberate action, not something this should do automatically.
-const ensureDailyReminderOrderProductUnique = async () => {
+export const ensureDailyReminderOrderProductUnique = async ({
+  queryFn = pool.query.bind(pool),
+} = {}) => {
   try {
-    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const [dbRows] = await queryFn("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;
     if (!currentDb) return;
 
-    const [uniqueIndexes] = await pool.query(
+    const [uniqueIndexes] = await queryFn(
       `SELECT DISTINCT index_name
        FROM information_schema.statistics
        WHERE table_schema = ?
@@ -469,21 +544,30 @@ const ensureDailyReminderOrderProductUnique = async () => {
     );
     if (uniqueIndexes.length) return;
 
-    const [duplicates] = await pool.query(
-      `SELECT order_id, product_id
+    const [duplicates] = await queryFn(
+      `SELECT order_id, product_id, COUNT(*) AS occurrences
        FROM daily_reminders
        GROUP BY order_id, product_id
-       HAVING COUNT(*) > 1
-       LIMIT 1`,
+       HAVING COUNT(*) > 1`,
     );
     if (duplicates.length) {
-      console.warn(
-        "⚠️ daily_reminders has existing duplicate (order_id, product_id) rows — skipping unique index. Investigate before adding it manually.",
+      // FIX (Medium #24 — Phase 3): this used to be a one-line
+      // console.warn with no further detail, repeated identically on every
+      // restart forever with no escalation — easy to lose in normal log
+      // volume, and gave an operator nothing to act on beyond "some
+      // duplicate exists somewhere." Escalated to console.error (more
+      // likely to be surfaced by log-level-based alerting) and now reports
+      // exactly how many duplicate groups exist and their ids, so the
+      // (still deliberately non-destructive — no automatic cleanup) skip
+      // is at least immediately actionable.
+      console.error(
+        `❌ daily_reminders has ${duplicates.length} duplicate (order_id, product_id) group(s) — skipping the uq_daily_reminders_order_product unique index. Investigate and clean up before adding it manually.`,
+        { duplicateGroups: duplicates.slice(0, 20) },
       );
       return;
     }
 
-    await pool.query(
+    await queryFn(
       `ALTER TABLE daily_reminders
        ADD UNIQUE INDEX uq_daily_reminders_order_product (order_id, product_id)`,
     );
@@ -544,6 +628,15 @@ const ensureBulkBookingWorkflowColumns = async () => {
     }
     if (!existing.has("quote_approved_at")) {
       additions.push("ADD COLUMN quote_approved_at DATETIME NULL DEFAULT NULL");
+    }
+    // FIX (Medium #9 — Phase 3): nothing ever bounded how long an approved
+    // quote stays payable at its frozen quote_price — a months-old quote
+    // was payable indefinitely at a stale price. Set alongside
+    // quote_shared_at whenever a quote is (re-)shared (see bulkController.js
+    // updateBulkBooking's isSharingQuote block) and enforced in
+    // ensureBulkRazorpayOrder before a new Razorpay order can be created.
+    if (!existing.has("quote_expires_at")) {
+      additions.push("ADD COLUMN quote_expires_at DATETIME NULL DEFAULT NULL");
     }
     if (!existing.has("payment_link_shared_at")) {
       additions.push(
@@ -783,6 +876,85 @@ const ensureBulkBookingCommunicationsTable = async () => {
   } catch (err) {
     console.error(
       "❌ Could not ensure bulk_booking_communications table exists:",
+      err?.message || err,
+    );
+  }
+};
+
+// FIX (Phase 3B — Medium #5): Razorpay webhook event-id idempotency
+// ledger. See services/webhookIdempotencyService.js for the full claim/
+// complete/fail state machine and the reasoning behind deriving the
+// idempotency key from a hash of the raw webhook body (Razorpay does not
+// provide a dedicated event/delivery id). UNIQUE(provider, event_id) is
+// the atomic-claim backstop — safe across multiple backend
+// instances/processes, since it's enforced by MySQL itself, not by any
+// in-process state. No webhook payload contents or secrets are stored
+// here — only the event type, a derived id, and a short (truncated) error
+// message on failure.
+const ensureWebhookEventsTable = async () => {
+  try {
+    const [tables] = await pool.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = DATABASE() AND table_name = 'webhook_events'`,
+    );
+
+    if (!tables.length) {
+      await pool.query(`
+        CREATE TABLE webhook_events (
+          id             CHAR(36)     NOT NULL PRIMARY KEY,
+          provider       VARCHAR(20)  NOT NULL,
+          event_id       VARCHAR(64)  NOT NULL,
+          event_type     VARCHAR(100) NOT NULL,
+          status         VARCHAR(20)  NOT NULL DEFAULT 'processing',
+          error_message  VARCHAR(1000) NULL DEFAULT NULL,
+          created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          processed_at   DATETIME     NULL DEFAULT NULL,
+          UNIQUE KEY uq_webhook_events_provider_event_id (provider, event_id)
+        )
+      `);
+      // console.log("✅ Created webhook_events table");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure webhook_events table exists:",
+      err?.message || err,
+    );
+  }
+};
+
+// FIX (Phase 3B — Medium #6): checkout double-submit / duplicate-order
+// protection. See services/checkoutIdempotencyService.js for the full
+// claim/complete/fail state machine and the reasoning behind the
+// idempotency key. UNIQUE(idempotency_key) is the atomic-claim backstop —
+// safe across multiple backend instances/processes/PM2 workers, enforced
+// by MySQL itself.
+const ensureCheckoutIdempotencyTable = async () => {
+  try {
+    const [tables] = await pool.query(
+      `SELECT table_name FROM information_schema.tables
+       WHERE table_schema = DATABASE() AND table_name = 'checkout_idempotency'`,
+    );
+
+    if (!tables.length) {
+      await pool.query(`
+        CREATE TABLE checkout_idempotency (
+          id               CHAR(36)      NOT NULL PRIMARY KEY,
+          idempotency_key  VARCHAR(100)  NOT NULL,
+          user_id          CHAR(36)      NULL DEFAULT NULL,
+          status           VARCHAR(20)   NOT NULL DEFAULT 'processing',
+          order_id         CHAR(36)      NULL DEFAULT NULL,
+          razorpay_order_id VARCHAR(255) NULL DEFAULT NULL,
+          error_message    VARCHAR(1000) NULL DEFAULT NULL,
+          created_at       DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at       DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_checkout_idempotency_key (idempotency_key)
+        )
+      `);
+      // console.log("✅ Created checkout_idempotency table");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure checkout_idempotency table exists:",
       err?.message || err,
     );
   }
@@ -1230,6 +1402,23 @@ const ensureOrderShipmentColumns = async () => {
         "ADD COLUMN pickup_request_id VARCHAR(255) NULL DEFAULT NULL",
       );
     }
+    // FIX (Medium #17 — Phase 3): a persistently-failing Delhivery tracking
+    // API call for a given order was only ever console.error'd, retried
+    // silently on the next 30-minute tick, indefinitely — no counter, no
+    // escalation. cron/shippingTrackingCron.js increments
+    // tracking_sync_failure_count on each failure, resets it to 0 on the
+    // next success, and logs a distinct high-visibility alert once an
+    // order crosses a consecutive-failure threshold.
+    if (!existing.has("tracking_sync_failure_count")) {
+      additions.push(
+        "ADD COLUMN tracking_sync_failure_count INT NOT NULL DEFAULT 0",
+      );
+    }
+    if (!existing.has("tracking_sync_last_failure_at")) {
+      additions.push(
+        "ADD COLUMN tracking_sync_last_failure_at DATETIME NULL DEFAULT NULL",
+      );
+    }
 
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
@@ -1238,6 +1427,77 @@ const ensureOrderShipmentColumns = async () => {
   } catch (err) {
     console.error(
       "❌ Could not ensure orders Delhivery shipment columns exist:",
+      err?.message || err,
+    );
+  }
+};
+
+// FIX (Medium #25 — Phase 3): cron/shippingTrackingCron.js's 30-minute tick
+// and the manual GET /api/shipping/track/:awb endpoint both filter directly
+// on awb_number/tracking_status, but no index ever covered either column —
+// both columns were added by ensureOrderShipmentColumns above via a plain
+// ALTER TABLE with no accompanying index, so every one of those lookups was
+// a full table scan. Same idempotent information_schema.statistics pattern
+// as ensureBulkBookingUserIdIndexAndBackfill above. queryFn defaults to the
+// real pool so production behavior is unchanged; tests inject a fake.
+export const ensureOrderShipmentTrackingIndex = async ({
+  queryFn = pool.query.bind(pool),
+} = {}) => {
+  try {
+    const [dbRows] = await queryFn("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [idxRows] = await queryFn(
+      `SELECT 1 FROM information_schema.statistics
+       WHERE table_schema = ? AND table_name = 'orders'
+         AND index_name = 'idx_orders_awb_tracking_status'
+       LIMIT 1`,
+      [currentDb],
+    );
+
+    if (!idxRows.length) {
+      await queryFn(
+        "CREATE INDEX idx_orders_awb_tracking_status ON orders(awb_number, tracking_status)",
+      );
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure idx_orders_awb_tracking_status index exists:",
+      err?.message || err,
+    );
+  }
+};
+
+// FIX (Medium #26 — Phase 3): auth (OTP/phone lookup) and payment code both
+// do direct WHERE phone = ? lookups against users, with no index covering
+// that column — every one of those was a full table scan. Same pattern as
+// above.
+export const ensureUsersPhoneIndex = async ({
+  queryFn = pool.query.bind(pool),
+} = {}) => {
+  try {
+    const [dbRows] = await queryFn("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [idxRows] = await queryFn(
+      `SELECT 1 FROM information_schema.statistics
+       WHERE table_schema = ? AND table_name = 'users'
+         AND index_name = 'idx_users_phone'
+       LIMIT 1`,
+      [currentDb],
+    );
+
+    if (!idxRows.length) {
+      // Non-unique: phone is not guaranteed unique on this table (unlike
+      // email/customer_number, which already have their own unique
+      // indexes) — this is purely a lookup-speed index.
+      await queryFn("CREATE INDEX idx_users_phone ON users(phone)");
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure idx_users_phone index exists:",
       err?.message || err,
     );
   }
@@ -1480,35 +1740,58 @@ const ensurePackageNumberSchema = async () => {
   }
 };
 
-// Run startup migrations in a fault-tolerant way: if one fails unexpectedly,
-// the remaining migrations still execute instead of the whole chain aborting.
-await ensureOrderNumberSchema().catch(console.error);
-await ensureRenewalOrderColumns().catch(console.error);
-await ensureSubscriptionEmailNotificationSchema();
-await ensureOrderStatusNotificationSchema();
-await ensureOrderShippingColumns().catch(console.error);
-await ensureDailyReminderPhoneColumns().catch(console.error);
-await ensureDailyReminderOrderProductUnique().catch(console.error);
-await ensureBulkBookingWorkflowColumns().catch(console.error);
-await ensureBulkBookingUserIdIndexAndBackfill().catch(console.error);
-await ensureBulkBookingNumberSchema().catch(console.error);
-await ensureBulkBookingNumberBackfill().catch(console.error);
-await ensureBulkBookingCommunicationsTable().catch(console.error);
-await ensureOrderBulkColumns().catch(console.error);
-await ensureOrderUserIdBackfill().catch(console.error);
-await ensureOrderShippingAddressColumns().catch(console.error);
-await ensureOrderConfirmationNotificationColumns().catch(console.error);
-await ensureOrderShipmentColumns().catch(console.error);
-await ensureOrderReturnColumns().catch(console.error);
-await ensureDeliveredAtBackfill().catch(console.error);
-await ensurePackageProductColumns().catch(console.error);
-await ensurePackageOrderColumns().catch(console.error);
-await ensurePackagePurchasesTable().catch(console.error);
-await ensurePackageNumberSchema().catch(console.error);
+// FIX (ISSUE-007): the entire startup-migration chain used to run
+// unconditionally on import — every test file that transitively imports
+// this module (nearly all of them, via any controller) ran ~20 real
+// ALTER TABLE/CREATE TABLE IF NOT EXISTS statements against DATABASE_URL,
+// which is production. Skipped outright in test mode; a dedicated
+// TEST_DATABASE_URL (see above) is expected to already have the schema it
+// needs, or to be migrated deliberately/out-of-band, never as a side effect
+// of `npm test`.
+if (!isTestEnv) {
+  // Run startup migrations in a fault-tolerant way: if one fails
+  // unexpectedly, the remaining migrations still execute instead of the
+  // whole chain aborting.
+  await ensureOrderNumberSchema().catch(console.error);
+  await ensureRenewalOrderColumns().catch(console.error);
+  await ensureSubscriptionEmailNotificationSchema();
+  await ensureOrderStatusNotificationSchema();
+  await ensureOrderShippingColumns().catch(console.error);
+  await ensureDailyReminderPhoneColumns().catch(console.error);
+  await ensureDailyReminderOrderProductUnique().catch(console.error);
+  await ensureBulkBookingWorkflowColumns().catch(console.error);
+  await ensureBulkBookingUserIdIndexAndBackfill().catch(console.error);
+  await ensureBulkBookingNumberSchema().catch(console.error);
+  await ensureBulkBookingNumberBackfill().catch(console.error);
+  await ensureBulkBookingCommunicationsTable().catch(console.error);
+  await ensureOrderBulkColumns().catch(console.error);
+  await ensureOrderUserIdBackfill().catch(console.error);
+  await ensureOrderShippingAddressColumns().catch(console.error);
+  await ensureOrderConfirmationNotificationColumns().catch(console.error);
+  await ensureOrderShipmentColumns().catch(console.error);
+  await ensureOrderShipmentTrackingIndex().catch(console.error);
+  await ensureUsersPhoneIndex().catch(console.error);
+  await ensureOrderReturnColumns().catch(console.error);
+  await ensureDeliveredAtBackfill().catch(console.error);
+  await ensurePackageProductColumns().catch(console.error);
+  await ensurePackageOrderColumns().catch(console.error);
+  await ensurePackagePurchasesTable().catch(console.error);
+  await ensurePackageNumberSchema().catch(console.error);
+  await ensureWebhookEventsTable().catch(console.error);
+  await ensureCheckoutIdempotencyTable().catch(console.error);
+}
 
 export const query = async (text, params = []) => {
   return runQuery(pool, text, params);
 };
+
+// FIX (ISSUE-007 — process hangs instead of exiting): pool.end() was never
+// called anywhere in the repo, so any process that created this pool kept
+// its idle MySQL sockets open forever, consistent with the audit's
+// observation that `npm test` never exited on its own. Test files that
+// actually open the pool (i.e. import app.js) call this in an `after()`
+// hook so the test process can exit cleanly.
+export const closePool = () => pool.end();
 
 export const getClient = async () => {
   const connection = await pool.getConnection();

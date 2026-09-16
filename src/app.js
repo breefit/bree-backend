@@ -87,7 +87,7 @@ const isAllowedRazorpayOrigin = (origin) => {
   return /(^|\.)razorpay\.(com|in)$/i.test(normalized);
 };
 
-const createCorsOptions = ({ allowNullOrigin = false } = {}) => ({
+const createCorsOptions = ({ allowNullOrigin = false, allowRazorpayOrigin = false } = {}) => ({
   origin: (origin, callback) => {
     // Allow server-to-server requests (no Origin header)
     if (!origin) {
@@ -101,9 +101,20 @@ const createCorsOptions = ({ allowNullOrigin = false } = {}) => ({
     }
 
     const normalized = origin.replace(/\/$/, "");
+    // FIX (Medium #3 — Phase 3): isAllowedRazorpayOrigin used to be checked
+    // for EVERY route, credentialed — any *.razorpay.com/*.razorpay.in
+    // origin got cookie-bearing CORS access to /api/auth, /api/admin,
+    // /api/orders, everything. The only genuine reason this exception
+    // exists at all is that Razorpay's Magic Checkout widget (running in an
+    // iframe served from Razorpay's own origin) calls
+    // POST /api/payment/shipping-info directly from the customer's browser
+    // during checkout, before payment completes — see the "Shipping Info"
+    // callback comment in paymentController.js. No other route is ever
+    // legitimately called from a Razorpay-hosted origin, so the exception
+    // is now opt-in per CORS-options-instance instead of global.
     if (
       allowedOrigins.includes(normalized) ||
-      isAllowedRazorpayOrigin(normalized)
+      (allowRazorpayOrigin && isAllowedRazorpayOrigin(normalized))
     ) {
       return callback(null, true);
     }
@@ -123,15 +134,23 @@ const createCorsOptions = ({ allowNullOrigin = false } = {}) => ({
 
 const standardCors = cors(createCorsOptions());
 const publicOtpCors = cors(createCorsOptions({ allowNullOrigin: true }));
+const shippingInfoCors = cors(createCorsOptions({ allowRazorpayOrigin: true }));
 const publicOtpPaths = new Set([
   "/api/auth/send-otp",
   "/api/auth/verify-otp",
   "/api/auth/resend-otp",
 ]);
+const razorpayOriginPaths = new Set(["/api/payment/shipping-info"]);
 
 app.use((req, res, next) => {
   const isPublicOtpRequest =
     publicOtpPaths.has(req.path) && ["POST", "OPTIONS"].includes(req.method);
+  const isShippingInfoRequest =
+    razorpayOriginPaths.has(req.path) && ["POST", "OPTIONS"].includes(req.method);
+
+  if (isShippingInfoRequest) {
+    return shippingInfoCors(req, res, next);
+  }
 
   return (isPublicOtpRequest ? publicOtpCors : standardCors)(req, res, next);
 });
@@ -155,8 +174,37 @@ app.use(
   },
 );
 
+// FIX (ISSUE-015 — Meta webhook had no signature verification): same
+// raw-body-before-JSON-parsing shape as the Razorpay webhook above, so
+// POST /api/webhooks/meta can verify Meta's X-Hub-Signature-256 header
+// against the exact bytes Meta sent, not a re-serialized (and therefore
+// potentially byte-different) JSON.parse/stringify round trip.
+app.use(
+  "/api/webhooks/meta",
+  express.raw({ type: "application/json" }),
+  (req, res, next) => {
+    req.rawBody = req.body;
+    next();
+  },
+);
+
+// FIX (Medium #2 — Phase 3, CSRF): this API is JSON-only by design (every
+// route reads req.body as JSON — confirmed via a full-repo audit; nothing
+// sends application/x-www-form-urlencoded to this backend, only outbound to
+// Delhivery from delhiveryService.js) — but express.urlencoded() being
+// registered here meant that claim wasn't actually true: a plain cross-site
+// <form method="POST" enctype="application/x-www-form-urlencoded"> submits
+// with no CORS preflight (browsers don't preflight "simple" form submits)
+// and cookies attached (SameSite=None in production, required for the
+// cross-origin frontend/backend split — see utils/jwt.js), so it WAS
+// parsed into req.body just like a real request, defeating the "JSON-only
+// bodies" half of this app's only CSRF mitigation. Removing it closes that
+// gap: a form-encoded cross-site POST now arrives with an empty req.body,
+// which every controller's existing required-field validation already
+// rejects. A JS-driven cross-origin attack sending real JSON instead is
+// still blocked by the pre-existing strict CORS origin allow-list (that
+// Content-Type forces a real preflight, which a disallowed origin fails).
 app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(cookieParser());
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -178,9 +226,33 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
   message: { message: "Too many auth attempts. Try again in 15 minutes." },
 });
-app.use("/api/auth/register", authLimiter);
-app.use("/api/auth/login", authLimiter);
+// FIX (Medium #1 — Phase 3): this limiter used to also be bound to
+// /api/auth/register and /api/auth/login, neither of which exists in
+// routes/auth.js (auth is OTP/Google-based, not register+password login) —
+// dead configuration. /change-password is the only real route it protects.
 app.use("/api/auth/change-password", authLimiter);
+
+// FIX (Medium #1 — Phase 3): send-otp/resend-otp previously had NO
+// per-IP rate limit of their own — only the shared 200 req/min/IP `/api`
+// limiter above, plus a 30s per-MOBILE resend cooldown in authController.js.
+// That let one IP cycle through many different mobile numbers to spam
+// WhatsApp OTPs well within the shared budget. verify-otp already has its
+// own brute-force guard (MAX_VERIFY_ATTEMPTS in authController.js) and is
+// deliberately excluded here so a legitimate user re-typing a wrong OTP a
+// few times is never rate-limited on top of that.
+const otpRequestLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: "Too many OTP requests from this network. Please try again later." },
+  // Skip CORS preflight — mirrors paymentLimiter above; an OPTIONS request
+  // never reaches the OTP controller and must never consume budget a real
+  // POST needs.
+  skip: (req) => req.method === "OPTIONS",
+});
+app.use("/api/auth/send-otp", otpRequestLimiter);
+app.use("/api/auth/resend-otp", otpRequestLimiter);
 
 // ── Payment rate limiter ───────────────────────────────────────────────────────
 // Applied ONLY to the two mutating payment endpoints. Deliberately excluded:

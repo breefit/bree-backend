@@ -2,28 +2,21 @@ import crypto from "crypto";
 import { query, getClient } from "../config/database.js";
 import { getOrderSchemaInfo } from "../utils/orderSchema.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
+import { VALID_ORDER_STATUSES, VALID_PAYMENT_STATUSES } from "../constants/orderStatus.js";
 
 // ==========================================================================
 // Constants
 // ==========================================================================
 
-/** Order lifecycle values used by this controller (order_status column). */
-export const ORDER_STATUS = {
-  PENDING_PAYMENT: "pending_payment",
-  PAID: "paid",
-  PROCESSING: "processing",
-  SHIPPED: "shipped",
-  DELIVERED: "delivered",
-  CANCELLED: "cancelled",
-};
-
-/** Payment lifecycle values used by this controller (payment_status column). */
-export const PAYMENT_STATUS = {
-  PENDING: "pending",
-  SUCCESS: "success",
-  FAILED: "failed",
-  REFUNDED: "refunded",
-};
+// LOW-16 fix: this file used to define its own local ORDER_STATUS/
+// PAYMENT_STATUS objects, only partially used (only PENDING_PAYMENT/PENDING
+// were ever referenced) and genuinely inconsistent with the canonical list
+// in constants/orderStatus.js — most notably PAYMENT_STATUS.SUCCESS =
+// "success" while every other controller in the codebase uses "paid" for a
+// successful payment. Sourced from the canonical list instead, so this
+// file can never drift from it again.
+const ORDER_STATUS = { PENDING_PAYMENT: VALID_ORDER_STATUSES[0] };
+const PAYMENT_STATUS = { PENDING: VALID_PAYMENT_STATUSES[0] };
 
 /** User-facing error messages, centralized so they stay consistent across endpoints. */
 const ERROR_MESSAGES = {
@@ -98,11 +91,6 @@ const validateOrderId = (id) => isValidUUID(id);
 
 const isPositiveInteger = (value) => Number.isInteger(value) && value > 0;
 
-const toSafeNumber = (value, fallback = 0) => {
-  const num = Number(value);
-  return Number.isFinite(num) ? num : fallback;
-};
-
 /**
  * Validates the top-level fields of a checkout request before any database
  * work happens.
@@ -123,10 +111,6 @@ const validateCheckoutRequest = (
   }
   return null;
 };
-
-/** Checks that both status fields are present for a payment-status update. */
-const validateStatusFields = (payment_status, order_status) =>
-  Boolean(payment_status) && Boolean(order_status);
 
 // ==========================================================================
 // Schema/column detection cache
@@ -456,7 +440,6 @@ export const createOrder = async (req, res) => {
       contactEmail,
       contactPhone,
       contactName,
-      tax = 0,
     } = req.body;
 
     // console.log("========== CREATE ORDER REQUEST ==========");
@@ -499,7 +482,16 @@ export const createOrder = async (req, res) => {
       normalizedCart.push({ productId, quantity });
     }
 
-    const safeTax = toSafeNumber(tax, 0);
+    // FIX (Medium #8 — Phase 3): this legacy route used to read `tax`
+    // straight from req.body and fold it into `total` with only numeric
+    // coercion, no server-side recomputation — a client could submit any
+    // numeric (including negative) tax value and it flowed directly into
+    // the authoritative order total. No server-side tax-rate table exists
+    // anywhere in this codebase (confirmed — the Magic Checkout flow in
+    // paymentController.js never accepts a client tax field at all), so
+    // there is no "correct" value to compute here instead; always 0 rather
+    // than trusting client input.
+    const safeTax = 0;
 
     await client.query("BEGIN");
 
@@ -1161,54 +1153,17 @@ export const getMyOrders = async (req, res) => {
   }
 };
 
-// ==========================================================================
-// UPDATE PAYMENT STATUS
-// ==========================================================================
-
-/**
- * Updates an order's payment_status and order_status.
- *
- * @route PATCH /api/orders/:id/payment-status
- * @param {import('express').Request} req - params: { id }; body: { payment_status, order_status }
- * @param {import('express').Response} res
- * @returns {Promise<void>} JSON: { success }
- */
-export const updatePaymentStatus = async (req, res) => {
-  try {
-    const userId = req.user?.id;
-    const { id } = req.params;
-    const { payment_status, order_status } = req.body;
-
-    if (!validateOrderId(id)) {
-      return sendError(res, 400, ERROR_MESSAGES.INVALID_ORDER_ID);
-    }
-    if (!validateStatusFields(payment_status, order_status)) {
-      return sendError(res, 400, ERROR_MESSAGES.MISSING_FIELDS);
-    }
-
-    const { rows: orderRows } = await query(
-      "SELECT id FROM orders WHERE id = ? AND user_id = ?",
-      [id, userId],
-    );
-
-    if (!orderRows.length) {
-      return sendError(res, 404, ERROR_MESSAGES.ORDER_NOT_FOUND);
-    }
-
-    await query(
-      "UPDATE orders SET payment_status = ?, order_status = ?, updated_at = now() WHERE id = ?",
-      [payment_status, order_status, id],
-    );
-
-    sendJson(res, 200, { success: true });
-  } catch (error) {
-    log("error", "order.update_payment_status_failed", {
-      orderId: req.params?.id,
-      error: error?.message,
-    });
-    sendError(res, 500, "Failed to update payment status");
-  }
-};
+// FIX (ISSUE-001 — payment bypass): `updatePaymentStatus` (PUT
+// /api/orders/:id/payment-status) used to let any authenticated customer
+// write payment_status/order_status directly onto their own order —
+// ownership-checked but not payment-truth-checked, so a customer could mark
+// their own unpaid order "paid"/"delivered" with a single request. No
+// legitimate frontend caller ever existed for this route (confirmed by a
+// repo-wide search across both bree-backend and bree-frontend). Removed
+// entirely, along with its route registration in routes/index.js — payment/
+// order status is set exclusively by the verified Razorpay flow
+// (paymentController's verifyPayment/handleWebhook) or the governed admin
+// transition logic in admin/orderController.js.
 
 // ==========================================================================
 // GET ORDER TRACKING
@@ -1225,7 +1180,10 @@ export const updatePaymentStatus = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON: { success, order, items, history }
  */
-export const getOrderTracking = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool) — same
+// pattern used throughout this codebase — so ISSUE-009's PII-minimization
+// fix can be asserted against a real fixture without a database.
+export const getOrderTracking = async (req, res, { queryFn = query } = {}) => {
   try {
     // FIX (genuinely public tracking): this page is meant to work from a
     // WhatsApp/email link with no session at all — but the query used to
@@ -1249,7 +1207,7 @@ export const getOrderTracking = async (req, res) => {
       return sendError(res, 400, ERROR_MESSAGES.INVALID_ORDER_ID);
     }
 
-    const schemaInfo = await getOrderSchemaInfo();
+    const schemaInfo = await getOrderSchemaInfo(queryFn);
     const isNewOrderSchema = schemaInfo.isNewOrderSchema;
 
     // FIX (customer return/refund tracking): the customer-facing tracking
@@ -1265,8 +1223,21 @@ export const getOrderTracking = async (req, res) => {
     // endpoint (optionalAuth, no ownership filter — see the comment above
     // this function), so the response is kept to the minimum the UI
     // actually renders.
+    //
+    // FIX (ISSUE-009 — public tracking over-exposed PII): `o.user_id` (the
+    // account owner's internal id) and `ua.phone` were selected here but
+    // never read by the frontend tracking page anywhere (confirmed by
+    // repo-wide grep) — a leaked tracking URL (logs, Referer header,
+    // screenshot, pasted into support chat) used to hand a third party the
+    // customer's full phone number and internal account id for zero UI
+    // benefit. Both removed outright. The structured `ua_*`/`la_*` address
+    // JOIN columns below still need to be SELECTed to compute the single
+    // resolved `shipping_address` string the UI actually renders — but are
+    // stripped from the response before it's sent (see responseOrder,
+    // below) rather than shipped to the client as extra, redundant,
+    // separately-reusable structured PII.
     const orderQuery = isNewOrderSchema
-      ? `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
+      ? `SELECT o.id, o.order_number, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
            o.return_requested_at, o.return_approved_at,
@@ -1278,7 +1249,6 @@ export const getOrderTracking = async (req, res) => {
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.contact_name, o.contact_email,
            ua.full_name AS ua_full_name,
-           ua.phone AS ua_phone,
            ua.address_line_1 AS ua_address_line_1,
            ua.address_line_2 AS ua_address_line_2,
            ua.city AS ua_city,
@@ -1297,7 +1267,7 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN addresses la ON la.id = o.address_id AND la.user_id = o.user_id
          LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
          WHERE o.id = ?`
-      : `SELECT o.id, o.order_number, o.user_id, o.order_status, o.payment_status, o.shipping_address,
+      : `SELECT o.id, o.order_number, o.order_status, o.payment_status, o.shipping_address,
            o.subtotal, o.shipping, o.tax, o.total, o.is_free_shipping, o.shipping_charge, o.estimated_delivery, o.created_at,
            o.delivered_at, o.return_status,
            o.return_requested_at, o.return_approved_at,
@@ -1309,7 +1279,6 @@ export const getOrderTracking = async (req, res) => {
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.customer_name AS contact_name, o.email AS contact_email,
            ua.full_name AS ua_full_name,
-           ua.phone AS ua_phone,
            ua.address_line_1 AS ua_address_line_1,
            ua.address_line_2 AS ua_address_line_2,
            ua.city AS ua_city,
@@ -1329,7 +1298,7 @@ export const getOrderTracking = async (req, res) => {
          LEFT JOIN package_purchases pkg ON pkg.id = o.parent_package_id
          WHERE o.id = ?`;
 
-    const { rows: orderRows } = await query(orderQuery, [id]);
+    const { rows: orderRows } = await queryFn(orderQuery, [id]);
 
     if (!orderRows.length) {
       return sendError(res, 404, ERROR_MESSAGES.ORDER_NOT_FOUND);
@@ -1339,14 +1308,18 @@ export const getOrderTracking = async (req, res) => {
 
     const [{ rows: orderItems }, { rows: historyRows }, { rows: reminderRows }] =
       await Promise.all([
-        query(
+        queryFn(
           `SELECT id, product_name, product_image, product_price, quantity, subtotal
            FROM order_items
            WHERE order_id = ?`,
           [order.id],
         ),
-        query(
-          `SELECT id, previous_status, new_status, changed_by, notes, created_at
+        // FIX (ISSUE-009): `changed_by` (the admin/user id that made the
+        // change) is never read by the frontend timeline — an internal,
+        // admin-identifying field with no reason to be in a public,
+        // unauthenticated response.
+        queryFn(
+          `SELECT id, previous_status, new_status, notes, created_at
            FROM order_status_history
            WHERE order_id = ?
            ORDER BY created_at ASC`,
@@ -1355,7 +1328,7 @@ export const getOrderTracking = async (req, res) => {
         // Same daily_reminders lookup as getOrder() — the customer tracking
         // page's Order Summary needs this to show the WhatsApp Reminder
         // line, and previously this endpoint never fetched it at all.
-        query(
+        queryFn(
           `SELECT id, product_id, reminder_time, reminder_enabled, status,
                   reminder_price_paid, reminder_start_date, reminder_end_date,
                   reminder_whatsapp_number, reminder_phone_source
@@ -1387,8 +1360,40 @@ export const getOrderTracking = async (req, res) => {
         order.la_country,
       ]);
 
+    // FIX (ISSUE-009): the raw ua_*/la_* join columns above are only ever
+    // computation inputs for the single resolved `shipping_address` string
+    // the UI renders — they were previously spread straight into the
+    // public response too, needlessly re-exposing the same address as
+    // separate, more easily machine-harvested structured fields (plus
+    // ua_full_name/la_label, redundant with contact_name). Destructured
+    // out here rather than SELECTed differently, since the fallback chain
+    // above still needs them to compute resolvedShippingAddress.
+    // `ua_phone`/`user_id` are stripped here too as defense-in-depth, even
+    // though they're no longer SELECTed at all above — a response-level
+    // strip means a future edit that accidentally re-adds either to the
+    // query can never silently reintroduce this leak.
+    const {
+      ua_full_name,
+      ua_phone,
+      ua_address_line_1,
+      ua_address_line_2,
+      ua_city,
+      ua_state,
+      ua_pincode,
+      ua_country,
+      la_label,
+      la_address_line1,
+      la_address_line2,
+      la_city,
+      la_state,
+      la_pincode,
+      la_country,
+      user_id,
+      ...publicOrderFields
+    } = order;
+
     const responseOrder = {
-      ...order,
+      ...publicOrderFields,
       shipping_address: resolvedShippingAddress,
       items: orderItems,
       reminders: reminderRows,

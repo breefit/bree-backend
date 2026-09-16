@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS users (
   customer_number  VARCHAR(20)  DEFAULT NULL UNIQUE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- FIX (Medium #26 — Phase 3): auth (OTP/phone lookup) and payment code do
+-- direct WHERE phone = ? lookups against this table; non-unique since
+-- phone isn't guaranteed unique here (unlike email/customer_number above).
+-- Also created idempotently at runtime by ensureUsersPhoneIndex in
+-- config/database.js for databases that predate this line.
+CREATE INDEX idx_users_phone ON users(phone);
+
 -- ---------------------------------------------------------------------------
 -- TABLE: admins
 -- ---------------------------------------------------------------------------
@@ -195,7 +202,15 @@ CREATE TABLE IF NOT EXISTS orders (
   shipping_charge          DECIMAL(10,2) NOT NULL DEFAULT 0,
   estimated_delivery       VARCHAR(100)  DEFAULT NULL,
 
-  CONSTRAINT fk_orders_user    FOREIGN KEY (user_id)    REFERENCES users(id)     ON DELETE CASCADE,
+  -- FIX (ISSUE-017 — financial-data safety): was ON DELETE CASCADE, meaning
+  -- a deleted user row would silently delete every one of their orders
+  -- (and, transitively, order_items/payments/order_status_history via
+  -- their own CASCADE FKs to orders) — a real risk for financial/audit
+  -- records if a "delete my account"/GDPR-erasure feature is ever added.
+  -- user_id is already nullable (guest checkout orders have user_id=NULL),
+  -- so SET NULL is schema-compatible — matches fk_orders_address below.
+  -- See migrations/009_orders_user_fk_set_null.sql for existing databases.
+  CONSTRAINT fk_orders_user    FOREIGN KEY (user_id)    REFERENCES users(id)     ON DELETE SET NULL,
   CONSTRAINT fk_orders_address FOREIGN KEY (address_id) REFERENCES addresses(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -397,6 +412,192 @@ CREATE TABLE IF NOT EXISTS order_number_counter (
   current_value  INT(11)      NOT NULL,
   updated_at     TIMESTAMP    NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: webhook_events  (Phase 3B — Razorpay webhook idempotency ledger)
+-- ---------------------------------------------------------------------------
+-- event_id is a SHA-256 hash of the raw webhook body, not a Razorpay-
+-- provided field — Razorpay's webhook payloads carry no dedicated event/
+-- delivery id (see src/services/webhookIdempotencyService.js). No webhook
+-- payload contents or secrets are stored here.
+CREATE TABLE IF NOT EXISTS webhook_events (
+  id             CHAR(36)      NOT NULL PRIMARY KEY,
+  provider       VARCHAR(20)   NOT NULL,
+  event_id       VARCHAR(64)   NOT NULL,
+  event_type     VARCHAR(100)  NOT NULL,
+  status         VARCHAR(20)   NOT NULL DEFAULT 'processing',
+  error_message  VARCHAR(1000) NULL DEFAULT NULL,
+  created_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  processed_at   DATETIME      NULL DEFAULT NULL,
+  UNIQUE KEY uq_webhook_events_provider_event_id (provider, event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: checkout_idempotency  (Phase 3B — checkout double-submit protection)
+-- ---------------------------------------------------------------------------
+-- idempotency_key is client-generated (see
+-- src/services/checkoutIdempotencyService.js and bree-frontend's
+-- Checkout.js) — one per checkout page mount, not per user, so a customer
+-- can still legitimately place multiple separate orders.
+CREATE TABLE IF NOT EXISTS checkout_idempotency (
+  id                CHAR(36)      NOT NULL PRIMARY KEY,
+  idempotency_key   VARCHAR(100)  NOT NULL,
+  user_id           CHAR(36)      NULL DEFAULT NULL,
+  status            VARCHAR(20)   NOT NULL DEFAULT 'processing',
+  order_id          CHAR(36)      NULL DEFAULT NULL,
+  razorpay_order_id VARCHAR(255)  NULL DEFAULT NULL,
+  error_message     VARCHAR(1000) NULL DEFAULT NULL,
+  created_at        DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_checkout_idempotency_key (idempotency_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: order_status_notifications  (Phase 4 — LOW-20: added to fresh-install
+-- schema; was previously created only via a runtime migration)
+-- ---------------------------------------------------------------------------
+-- Idempotency/claim ledger for order-status-change customer notifications —
+-- one row per (order, status, channel), claimed atomically before sending,
+-- so no duplicate WhatsApp/email ever goes out no matter how many times the
+-- same status transition is observed. See
+-- src/services/orderStatusNotificationService.js.
+CREATE TABLE IF NOT EXISTS order_status_notifications (
+  notification_key  VARCHAR(255)  NOT NULL PRIMARY KEY,
+  status             VARCHAR(20)   NOT NULL DEFAULT 'pending',
+  attempts           INT           NOT NULL DEFAULT 0,
+  last_attempt_at    DATETIME      NULL DEFAULT NULL,
+  sent_at            DATETIME      NULL DEFAULT NULL,
+  last_error         VARCHAR(1000) NULL DEFAULT NULL,
+  created_at         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: bulk_booking_number_counter  (Phase 4 — LOW-20: sequence generator
+-- for BB-###### bulk booking numbers; was previously runtime-only)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS bulk_booking_number_counter (
+  id             TINYINT    NOT NULL PRIMARY KEY,
+  current_value  INT        NOT NULL,
+  updated_at     TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: bulk_booking_communications  (Phase 4 — LOW-20: was previously
+-- runtime-only)
+-- ---------------------------------------------------------------------------
+-- Communication-history log for Bulk Order quote/confirmation/dispatch
+-- events, shown on the admin bulk booking detail screen.
+CREATE TABLE IF NOT EXISTS bulk_booking_communications (
+  id               CHAR(36)      NOT NULL PRIMARY KEY,
+  bulk_booking_id  CHAR(36)      NOT NULL,
+  type             VARCHAR(40)   NOT NULL,
+  label            VARCHAR(100)  NOT NULL,
+  sent_by          VARCHAR(36)   NULL DEFAULT NULL,
+  sent_at          TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_bulk_booking_communications_booking (bulk_booking_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: package_purchases  (Phase 4 — LOW-20: Model B pay-once recurring
+-- package parent record; was previously runtime-only)
+-- ---------------------------------------------------------------------------
+-- One row per pay-once, BREE-fulfilled recurring package purchase. See
+-- src/services/packageFulfillmentService.js and docs/DATABASE.md's
+-- "Recurring Package Database" section. origin_order_id UNIQUE is the
+-- idempotency key preventing a duplicate row for the same origin order.
+CREATE TABLE IF NOT EXISTS package_purchases (
+  id                          CHAR(36)      NOT NULL PRIMARY KEY,
+  package_number              VARCHAR(30)   NULL UNIQUE,
+  user_id                     CHAR(36)      NULL,
+  product_id                  CHAR(36)      NOT NULL,
+  origin_order_id             CHAR(36)      NOT NULL UNIQUE,
+  total_cycles                INT           NOT NULL,
+  fulfillment_interval_days   INT           NOT NULL,
+  cycles_created               INT           NOT NULL DEFAULT 1,
+  next_fulfillment_date       DATETIME      NULL DEFAULT NULL,
+  status                      VARCHAR(20)   NOT NULL DEFAULT 'active',
+  created_at                  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at                  DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_package_purchases_user
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+  CONSTRAINT fk_package_purchases_product
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
+  CONSTRAINT fk_package_purchases_origin_order
+    FOREIGN KEY (origin_order_id) REFERENCES orders(id) ON DELETE CASCADE,
+  INDEX idx_package_purchases_status_next (status, next_fulfillment_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: package_number_counter  (Phase 4 — LOW-20: sequence generator for
+-- PKG-###### package numbers; was previously runtime-only)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS package_number_counter (
+  id             TINYINT    NOT NULL PRIMARY KEY,
+  current_value  INT        NOT NULL,
+  updated_at     TIMESTAMP  NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: daily_reminders  (Phase 4 — LOW-20: was previously created only by
+-- migrations/008_add_daily_reminder_feature.sql, absent from this
+-- fresh-install dump)
+-- ---------------------------------------------------------------------------
+-- A customer's purchase of the Daily WhatsApp Reminder add-on for one
+-- order/product. See src/services/dailyReminderService.js and
+-- cron/dailyReminderCron.js.
+CREATE TABLE IF NOT EXISTS daily_reminders (
+  id                     CHAR(36)      NOT NULL PRIMARY KEY,
+  user_id                CHAR(36)      NOT NULL,
+  order_id               CHAR(36)      NOT NULL,
+  product_id             CHAR(36)      NOT NULL,
+  reminder_enabled       TINYINT(1)    NOT NULL DEFAULT 1,
+  reminder_time          TIME          NULL DEFAULT NULL,
+  reminder_channel       VARCHAR(20)   NOT NULL DEFAULT 'whatsapp',
+  reminder_whatsapp_number VARCHAR(20) NULL DEFAULT NULL,
+  delivery_date          DATE          NULL DEFAULT NULL,
+  reminder_start_date    DATE          NULL DEFAULT NULL,
+  reminder_end_date      DATE          NULL DEFAULT NULL,
+  package_duration_days  INT           NULL DEFAULT NULL,
+  -- Free-text (not a DB enum) so a new value can be added without a
+  -- migration. Only 'active'/'paused'/'ended' are currently written by
+  -- application code — 'cancelled' is reserved, not yet used.
+  status                 VARCHAR(50)   NOT NULL DEFAULT 'active',
+  created_at             DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at             DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_daily_reminders_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  CONSTRAINT fk_daily_reminders_order FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE,
+  CONSTRAINT fk_daily_reminders_product FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+  INDEX idx_daily_reminders_user (user_id),
+  INDEX idx_daily_reminders_order (order_id),
+  INDEX idx_daily_reminders_product (product_id),
+  INDEX idx_daily_reminders_status (status),
+  INDEX idx_daily_reminders_active (reminder_enabled, status, reminder_start_date, reminder_end_date),
+  INDEX idx_daily_reminders_delivery (delivery_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: daily_reminder_sends  (Phase 4 — LOW-20: was previously created
+-- only by migrations/008_add_daily_reminder_feature.sql)
+-- ---------------------------------------------------------------------------
+-- Idempotency ledger: one row per (reminder, send_date), claimed atomically
+-- before sending — guarantees a single WhatsApp reminder per day even under
+-- concurrent cron ticks. See cron/dailyReminderCron.js's
+-- claimReminderSendSlot.
+CREATE TABLE IF NOT EXISTS daily_reminder_sends (
+  id                 CHAR(36)      NOT NULL PRIMARY KEY,
+  reminder_id        CHAR(36)      NOT NULL,
+  send_date          DATE          NOT NULL,
+  -- Free-text (not a DB enum). Only 'success'/'failed' are currently
+  -- written by cron/dailyReminderCron.js — 'skipped' is reserved, not yet
+  -- used.
+  status             VARCHAR(50)   NOT NULL DEFAULT 'success',
+  waplify_message_id VARCHAR(255)  NULL DEFAULT NULL,
+  error_message      TEXT          NULL DEFAULT NULL,
+  sent_at            DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_daily_reminder_sends_reminder FOREIGN KEY (reminder_id) REFERENCES daily_reminders(id) ON DELETE CASCADE,
+  UNIQUE KEY unique_reminder_send (reminder_id, send_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- =============================================================================

@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { randomUUID, createHash } from "crypto";
 import { getRazorpay } from "../config/razorpay.js";
 import {
   verifyPaymentSignature,
@@ -23,7 +23,21 @@ import {
   sendSubscriptionNotificationOnce,
 } from "../services/subscriptionEmailNotificationService.js";
 import { createPackagePurchaseFromOrder } from "../services/packageFulfillmentService.js";
+import {
+  claimWebhookEvent,
+  markWebhookEventCompleted,
+  markWebhookEventFailed,
+} from "../services/webhookIdempotencyService.js";
+import {
+  claimCheckoutIdempotencyKey,
+  markCheckoutIdempotencyCompleted,
+  markCheckoutIdempotencyFailed,
+} from "../services/checkoutIdempotencyService.js";
 import { createDailyReminder } from "../services/dailyReminderService.js";
+import {
+  sendOrderStatusNotificationOnce,
+  buildOrderStatusNotificationKey,
+} from "../services/orderStatusNotificationService.js";
 import delhiveryService from "../services/delhiveryService.js";
 import {
   calculateOrderTotals,
@@ -196,6 +210,37 @@ export const classifyPaymentState = ({
   return "reconcile";
 };
 
+// FIX (Medium #22 — Phase 3): payments.status previously never reached a
+// 'failed' terminal state — every write to this column across the backend
+// was 'created' or 'captured', so a failed payment attempt left its
+// payments row stuck at 'created' forever while orders.payment_status
+// (updated separately, right next to each call site below) correctly
+// showed 'failed' — a dual/inconsistent source of truth. Extracted as its
+// own small function (rather than adding broad dependency injection to the
+// large, non-DI handleWebhook) so it can be driven directly in tests with
+// a fake queryFn, matching how payments rows are already keyed elsewhere
+// in this file (razorpay_order_id for one-time payments,
+// razorpay_subscription_id for subscription charges).
+export const markPaymentRowFailed = async ({
+  razorpayOrderId = null,
+  razorpaySubscriptionId = null,
+  queryFn = query,
+} = {}) => {
+  if (razorpaySubscriptionId) {
+    return queryFn(
+      `UPDATE payments SET status = 'failed', updated_at = NOW() WHERE razorpay_subscription_id = ?`,
+      [razorpaySubscriptionId],
+    );
+  }
+  if (razorpayOrderId) {
+    return queryFn(
+      `UPDATE payments SET status = 'failed', updated_at = NOW() WHERE razorpay_order_id = ?`,
+      [razorpayOrderId],
+    );
+  }
+  return { rows: [], rowCount: 0 };
+};
+
 export const getMissingContactUpdates = ({
   currentEmail,
   currentPhone,
@@ -251,7 +296,10 @@ export const buildRazorpayLineItems = (
       variant_id: `reminder-${reminder.product_id}`,
       name: "Daily WhatsApp Reminder",
       description: "Daily WhatsApp Reminder",
-      image_url: "https://breefit.in/images/daily-whatsapp-reminder.png",
+      // FIX (Medium #29 — Phase 3): was hardcoded regardless of
+      // FRONTEND_URL, matching the env-driven-with-fallback pattern
+      // orderEmailService.js's getFrontendUrl() already uses.
+      image_url: `${(process.env.FRONTEND_URL || "https://www.breefit.in").split(",")[0].trim().replace(/\/$/, "")}/images/daily-whatsapp-reminder.png`,
       price: reminderAmountPaise,
       offer_price: reminderAmountPaise,
       quantity: 1,
@@ -266,10 +314,52 @@ const buildLineItemsFromValidatedItems = (
   validatedReminders = [],
 ) => buildRazorpayLineItems(validatedItems, validatedReminders);
 
+// FIX (ISSUE-002 — client-controlled discount): resolves the ONE
+// authoritative discount for an order from a promotion CODE matched
+// server-side against getPromotionCatalog(subtotal) — the same catalog
+// applyPromotions/getPromotions already use for Razorpay's Magic Checkout
+// coupon widget. Deliberately takes no raw amount parameter at all: there
+// is no code path through this function by which a caller-supplied number
+// can become the discount. `subtotal` must be the server-computed
+// subtotal, never a client-supplied one, so a coupon's eligibility
+// (min_order_amount, percentage-of-subtotal, etc.) can't be gamed by lying
+// about the order size either.
+// Returns `{ valid: true, discountAmount, promotion }` (discountAmount in
+// rupees) when no code was given (discount 0) or a real code matched;
+// `{ valid: false }` for an unknown/inapplicable code, so the caller can
+// reject the request outright rather than silently charging full price.
+export const resolveOrderDiscount = ({ promotionCode, subtotal }) => {
+  const normalizedCode = normalizePromotionCode(promotionCode);
+  if (!normalizedCode) {
+    return { valid: true, discountAmount: 0, promotion: null };
+  }
+
+  const applicablePromotions = getPromotionCatalog(subtotal);
+  const matchedPromotion = applicablePromotions.find(
+    (promotion) => normalizePromotionCode(promotion.code) === normalizedCode,
+  );
+
+  if (!matchedPromotion) {
+    return { valid: false, discountAmount: 0, promotion: null };
+  }
+
+  // Catalog discount_amount is denominated in paise (see
+  // getPromotionCatalog) — convert to rupees to match `subtotal`.
+  return {
+    valid: true,
+    discountAmount: Number(matchedPromotion.discount_amount ?? 0) / 100,
+    promotion: matchedPromotion,
+  };
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/create-order
 // ─────────────────────────────────────────────────────────────────────────────
-export const createOrder = async (req, res) => {
+export const createOrder = async (
+  req,
+  res,
+  { queryFn = query, getClientFn = getClient, getRazorpayFn = getRazorpay } = {},
+) => {
   console.info("[CREATE_ORDER] Received request", {
     userId: req.user?.id,
     itemCount: req.body?.items?.length,
@@ -286,14 +376,27 @@ export const createOrder = async (req, res) => {
     addressId,
     line_items,
     reminders,
-    discountAmount,
-    discount_amount,
   } = req.body;
 
-  const parsedDiscountAmount = Math.max(
-    0,
-    Number(discountAmount ?? discount_amount ?? 0),
-  );
+  // FIX (ISSUE-002 — client-controlled discount): a raw `discountAmount`/
+  // `discount_amount` field used to be read straight from the request body
+  // and fed directly into the authoritative Razorpay charge with zero
+  // validation — `POST /api/payment/create-order` is public (optionalAuth,
+  // guest checkout is allowed), so anyone could hand-craft
+  // `discountAmount: 999999` and drive a real order to near-₹0. That field
+  // is no longer read at all; only a promotion CODE (validated below, once
+  // the server-computed subtotal is known, via resolveOrderDiscount) can
+  // ever produce a non-zero discount. The current frontend never sends a
+  // promotion code at all (Checkout.js hardcodes its discount to 0), so
+  // today this always resolves to 0.
+  const promotionCodeInput =
+    req.body.promotion_code ||
+    req.body.promotionCode ||
+    req.body.coupon_code ||
+    req.body.couponCode ||
+    req.body.promo_code ||
+    req.body.promoCode ||
+    req.body.coupon;
 
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ success: false, message: "Cart is empty" });
@@ -320,7 +423,7 @@ export const createOrder = async (req, res) => {
         .json({ success: false, message: "Invalid cart item submitted" });
     }
 
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `SELECT id, name, image, price${shippingSelect}
        FROM products
        WHERE id = ? AND is_active = 1`,
@@ -366,6 +469,22 @@ export const createOrder = async (req, res) => {
     });
   }
 
+  // ── Resolve the authoritative discount (ISSUE-002) ────────────────────────
+  // An unknown/inapplicable code is a hard rejection (400), not a silent
+  // fallback to zero, so a typo'd or expired code never surprises a
+  // customer by charging them full price.
+  const discountResolution = resolveOrderDiscount({
+    promotionCode: promotionCodeInput,
+    subtotal: serverSubtotal,
+  });
+  if (!discountResolution.valid) {
+    return res.status(400).json({
+      success: false,
+      message: "Promotion code is invalid, expired, or not applicable to this order",
+    });
+  }
+  const parsedDiscountAmount = discountResolution.discountAmount;
+
   // ── Validate and process reminders ────────────────────────────────────────
   const validatedReminders = [];
   const ALLOWED_REMINDER_TIMES = ["04:00", "04:30", "05:00", "05:30", "06:00"];
@@ -410,7 +529,7 @@ export const createOrder = async (req, res) => {
       }
 
       // Validate that product exists and has reminder enabled
-      const { rows: productRows } = await query(
+      const { rows: productRows } = await queryFn(
         `SELECT id, daily_reminder_enabled, daily_reminder_price,
                 daily_reminder_original_price, is_recurring_package,
                 package_duration_months, package_fulfillment_interval_days
@@ -548,7 +667,7 @@ export const createOrder = async (req, res) => {
   }
 
   if (req.user?.id && !isMagicCheckout) {
-    const { rows: existingOrders } = await query(
+    const { rows: existingOrders } = await queryFn(
       `SELECT id, razorpay_order_id FROM orders
        WHERE user_id = ? AND payment_status = 'pending'
          AND total = ?
@@ -562,7 +681,7 @@ export const createOrder = async (req, res) => {
 
       let rzpOrderStillValid = false;
       try {
-        const rzp = getRazorpay();
+        const rzp = getRazorpayFn();
         const rzpExisting = await rzp.orders.fetch(existing.razorpay_order_id);
         rzpOrderStillValid = rzpExisting.status === "created";
       } catch (err) {
@@ -601,7 +720,65 @@ export const createOrder = async (req, res) => {
     }
   }
 
-  const client = await getClient();
+  // FIX (Phase 3B — Medium #6): checkout double-submit / duplicate-order
+  // protection. Claimed AFTER all cheap input validation above (safe to
+  // redo on a genuine retry) but BEFORE the transaction/Razorpay call
+  // below — a standalone, fast INSERT via queryFn (not client.query), so
+  // no DB connection is held across it. See
+  // services/checkoutIdempotencyService.js for the full claim state
+  // machine and why idempotency_key is optional (backward compatible with
+  // any caller besides bree-frontend's Checkout.js, which always sends
+  // one — see that file for how the key is generated/scoped).
+  const idempotencyKey =
+    typeof req.body?.idempotency_key === "string" && req.body.idempotency_key.trim()
+      ? req.body.idempotency_key.trim().slice(0, 100)
+      : null;
+
+  if (idempotencyKey) {
+    const claim = await claimCheckoutIdempotencyKey({
+      idempotencyKey,
+      userId: req.user?.id || null,
+      queryFn,
+    });
+
+    if (!claim.claimed) {
+      if (claim.status === "completed" && claim.orderId) {
+        const { rows: replayRows } = await queryFn(
+          "SELECT id, razorpay_order_id, total FROM orders WHERE id = ? LIMIT 1",
+          [claim.orderId],
+        );
+        const replayOrder = replayRows[0];
+        if (replayOrder) {
+          console.info("[CREATE_ORDER] Duplicate submit — returning the original order", {
+            idempotencyKey,
+            orderId: replayOrder.id,
+          });
+          return res.json({
+            success: true,
+            order_id: replayOrder.razorpay_order_id,
+            amount: Math.round(Number(replayOrder.total) * 100),
+            currency: "INR",
+            key_id: process.env.RAZORPAY_KEY_ID,
+            order_db_id: replayOrder.id,
+          });
+        }
+        // Ledger says completed but the order row is somehow missing —
+        // fail safe by refusing rather than silently creating a second one.
+      }
+
+      console.warn("[CREATE_ORDER] Duplicate/concurrent checkout attempt", {
+        idempotencyKey,
+        status: claim.status,
+      });
+      return res.status(409).json({
+        success: false,
+        message:
+          "A checkout for this request is already in progress. Please wait a moment and try again.",
+      });
+    }
+  }
+
+  const client = await getClientFn();
   let orderId;
   let orderNumber;
   let rzpOrder;
@@ -613,7 +790,7 @@ export const createOrder = async (req, res) => {
     orderNumber = await getNextOrderNumber(client);
 
     try {
-      const rzp = getRazorpay();
+      const rzp = getRazorpayFn();
 
       const orderPayload = {
         amount: Math.round(serverTotal * 100), // paise — authoritative final payable amount
@@ -656,6 +833,13 @@ export const createOrder = async (req, res) => {
         "[CREATE_ORDER] Razorpay order creation failed",
         razorpayError,
       );
+      if (idempotencyKey) {
+        await markCheckoutIdempotencyFailed({
+          idempotencyKey,
+          errorMessage: razorpayError?.message || "Razorpay order creation failed",
+          queryFn,
+        }).catch(() => {});
+      }
       return res.status(502).json({
         success: false,
         message: "Failed to create payment order. Please try again.",
@@ -823,6 +1007,20 @@ export const createOrder = async (req, res) => {
       });
     } catch (_) {}
 
+    if (idempotencyKey) {
+      await markCheckoutIdempotencyCompleted({
+        idempotencyKey,
+        orderId,
+        razorpayOrderId: rzpOrder.id,
+        queryFn,
+      }).catch((markErr) =>
+        console.error("[CREATE_ORDER] Failed to record idempotency completion", {
+          idempotencyKey,
+          message: markErr?.message || String(markErr),
+        }),
+      );
+    }
+
     return res.json({
       success: true,
       order_id: rzpOrder.id,
@@ -838,6 +1036,13 @@ export const createOrder = async (req, res) => {
       message: err?.message || String(err),
       stack: err?.stack,
     });
+    if (idempotencyKey) {
+      await markCheckoutIdempotencyFailed({
+        idempotencyKey,
+        errorMessage: err?.message || String(err),
+        queryFn,
+      }).catch(() => {});
+    }
     throw err;
   } finally {
     client.release();
@@ -864,6 +1069,25 @@ export const formatRazorpayShippingAddress = (addr) => {
       .join(", ") || null
   );
 };
+
+// ISSUE-M32 residual fix (address snapshot immutability): merges the
+// structured address Razorpay reports for THIS payment (freshAddress —
+// Razorpay's shipping_address object, shape { line1, line2, city, state,
+// zipcode, country }) with any structured columns the order already has,
+// preferring the fresh values but never overwriting an existing snapshot
+// with nulls when Razorpay didn't report a shipping_address at all (e.g. a
+// subscription renewal charge). Shared by both verifyPayment's direct
+// confirmation path and handleWebhook's server-to-server confirmation path
+// so an order's shipping snapshot is set the same way regardless of which
+// path finalises the payment.
+export const resolveStructuredAddressFields = (freshAddress, existingOrder = {}) => ({
+  line1: freshAddress?.line1 || existingOrder?.shipping_address_line1 || null,
+  line2: freshAddress?.line2 || existingOrder?.shipping_address_line2 || null,
+  city: freshAddress?.city || existingOrder?.shipping_city || null,
+  state: freshAddress?.state || existingOrder?.shipping_state || null,
+  pincode: freshAddress?.zipcode || existingOrder?.shipping_pincode || null,
+  country: freshAddress?.country || existingOrder?.shipping_country || null,
+});
 
 const fetchRazorpayCustomerDetails = async (
   razorpayOrderId,
@@ -1093,28 +1317,6 @@ const syncMissingUserContactFields = async (
   return updates;
 };
 
-export const shouldClaimOrderConfirmation = ({ paymentStatus, sentAt }) =>
-  String(paymentStatus || "")
-    .trim()
-    .toLowerCase() === "paid" && !sentAt;
-
-export const getOrderConfirmationClaimDecision = ({
-  paymentStatus,
-  sentAt,
-  inFlight = false,
-  isOwner = false,
-} = {}) => {
-  const alreadySent = Boolean(sentAt);
-  const competingInFlight = inFlight && !isOwner;
-  return {
-    alreadySent,
-    inFlight: competingInFlight,
-    eligible:
-      shouldClaimOrderConfirmation({ paymentStatus, sentAt }) &&
-      !competingInFlight,
-  };
-};
-
 export const getOrderConfirmationRecipients = (order = {}) => ({
   email: order.contact_email || order.email || null,
   phone: order.contact_phone || order.mobile_number || null,
@@ -1132,118 +1334,31 @@ const maskNotificationPhone = (phone) => {
   return digits ? `***${digits.slice(-4)}` : null;
 };
 
-const claimOrderConfirmationChannel = async (
+// FIX (ISSUE-003 — Order Confirmation notification race): this used to be a
+// plain SELECT-then-UPDATE claim (query eligibility, send, then mark sent),
+// backed only by an in-memory Map for same-process concurrency. That gap
+// between the SELECT and the eventual UPDATE let two real triggers for the
+// same order — verifyPayment and a redelivered payment.captured webhook —
+// both observe "not yet sent" and both send. Now shares the same atomic
+// claim-before-send `order_status_notifications` table (INSERT IGNORE +
+// conditional UPDATE ... WHERE status='pending') that shipping/return/
+// subscription notifications already use, so exactly one of any number of
+// concurrent callers ever sends, across processes as well as requests.
+// `queryExecutor` mirrors the injection pattern already used by
+// sendOrderStatusNotificationOnce/dailyReminderService — defaults to the
+// real pool, overridable in tests against an in-memory fake.
+export const notifyInitialOrderConfirmation = async (
   orderId,
-  channel,
-  { inFlight = false } = {},
+  {
+    queryExecutor = query,
+    // Injectable for tests only — default to the real network-calling
+    // services so production behavior is unchanged.
+    sendConfirmationEmail = sendOrderConfirmationEmail,
+    sendConfirmationWhatsApp = sendOrderConfirmationWhatsApp,
+  } = {},
 ) => {
-  const column =
-    channel === "email"
-      ? "order_confirmation_email_sent_at"
-      : "order_confirmation_whatsapp_sent_at";
-  const { rows } = await query(
-    `SELECT TRIM(LOWER(payment_status)) AS payment_status,
-        ${column} AS sent_at
-     FROM orders WHERE id = ? LIMIT 1`,
-    [orderId],
-  );
-  const state = rows[0] || null;
-  const decision = getOrderConfirmationClaimDecision({
-    paymentStatus: state?.payment_status,
-    sentAt: state?.sent_at,
-    inFlight,
-  });
-  console.info("[ORDER_CONFIRMATION] Claim decision", {
-    orderId,
-    channel,
-    paymentStatus: state?.payment_status ?? null,
-    sentAt: state?.sent_at ?? null,
-    alreadySent: decision.alreadySent,
-    inFlight: decision.inFlight,
-    eligible: decision.eligible,
-  });
-  return decision.eligible;
-};
-
-const markOrderConfirmationSent = async (orderId, channel) => {
-  const column =
-    channel === "email"
-      ? "order_confirmation_email_sent_at"
-      : "order_confirmation_whatsapp_sent_at";
-  await query(
-    `UPDATE orders SET ${column} = NOW(), updated_at = NOW()
-     WHERE id = ? AND payment_status = 'paid' AND ${column} IS NULL`,
-    [orderId],
-  );
-};
-
-const orderConfirmationInFlight = new Map();
-const orderConfirmationClaimLocks = new Map();
-
-const runOrderConfirmationChannel = async (orderId, channel, send) => {
-  const key = `${orderId}:${channel}`;
-  if (orderConfirmationInFlight.has(key)) {
-    return orderConfirmationInFlight.get(key);
-  }
-
-  const existingClaim = orderConfirmationClaimLocks.get(key);
-  if (existingClaim) {
-    await existingClaim;
-    return runOrderConfirmationChannel(orderId, channel, send);
-  }
-
-  let releaseClaim;
-  const claimLock = new Promise((resolve) => {
-    releaseClaim = resolve;
-  });
-  orderConfirmationClaimLocks.set(key, claimLock);
-
-  let eligible;
   try {
-    eligible = await claimOrderConfirmationChannel(orderId, channel, {
-      inFlight: false,
-    });
-  } finally {
-    orderConfirmationClaimLocks.delete(key);
-    releaseClaim();
-  }
-
-  if (!eligible) {
-    console.info(
-      "[ORDER_CONFIRMATION] Notification already sent or not claimable",
-      { orderId, channel },
-    );
-    return false;
-  }
-
-  let resolveOperation;
-  const operation = new Promise((resolve) => {
-    resolveOperation = resolve;
-  });
-  orderConfirmationInFlight.set(key, operation);
-
-  (async () => {
-    try {
-      await send();
-      await markOrderConfirmationSent(orderId, channel);
-      resolveOperation(true);
-    } catch (err) {
-      console.error("[ORDER_CONFIRMATION] Notification failed", {
-        orderId,
-        channel,
-        message: err?.message || String(err),
-      });
-      resolveOperation(false);
-    } finally {
-      orderConfirmationInFlight.delete(key);
-    }
-  })().catch(() => {});
-  return operation;
-};
-
-const notifyInitialOrderConfirmation = async (orderId) => {
-  try {
-    const { rows: orderRows } = await query(
+    const { rows: orderRows } = await queryExecutor(
       `SELECT id, order_number, customer_name, contact_name, email,
               contact_email, mobile_number, contact_phone, total, amount,
               shipping_address, paid_at, payment_status
@@ -1253,7 +1368,7 @@ const notifyInitialOrderConfirmation = async (orderId) => {
     const order = orderRows[0];
     if (!order || order.payment_status !== "paid") return;
 
-    const { rows: itemRows } = await query(
+    const { rows: itemRows } = await queryExecutor(
       `SELECT product_name AS name, quantity, product_price AS price, subtotal
        FROM order_items WHERE order_id = ?`,
       [order.id],
@@ -1264,58 +1379,90 @@ const notifyInitialOrderConfirmation = async (orderId) => {
     const orderNumber = order.order_number || order.id;
 
     if (email) {
-      await runOrderConfirmationChannel(order.id, "email", async () => {
-        console.info("[ORDER_CONFIRMATION] Email send started", {
+      try {
+        await sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: order.id,
+            status: "confirmed",
+            channel: "email",
+          }),
           orderId: order.id,
-          orderNumber,
-          recipient: maskNotificationEmail(email),
-          template: "email-order-confirmation",
+          status: "confirmed",
+          channel: "email",
+          queryExecutor,
+          send: async () => {
+            console.info("[ORDER_CONFIRMATION] Email send started", {
+              orderId: order.id,
+              orderNumber,
+              recipient: maskNotificationEmail(email),
+              template: "email-order-confirmation",
+            });
+            await sendConfirmationEmail({
+              to: email,
+              name,
+              orderId: order.id,
+              amount,
+              items: itemRows,
+              shippingAddress: order.shipping_address,
+            });
+            console.info("[ORDER_CONFIRMATION] Email sent", {
+              orderId: order.id,
+              orderNumber,
+            });
+          },
         });
-        await sendOrderConfirmationEmail({
-          to: email,
-          name,
-          orderId: order.id,
-          amount,
-          items: itemRows,
-          shippingAddress: order.shipping_address,
-        });
-        console.info("[ORDER_CONFIRMATION] Email sent", {
-          orderId: order.id,
-          orderNumber,
-        });
-      });
+      } catch {
+        // Already logged (action:"failed") and recorded in
+        // order_status_notifications by sendOrderStatusNotificationOnce.
+      }
     }
 
     if (phone) {
-      await runOrderConfirmationChannel(order.id, "whatsapp", async () => {
-        console.info("[ORDER_CONFIRMATION] WhatsApp send started", {
-          orderId: order.id,
-          orderNumber,
-          recipient: maskNotificationPhone(phone),
-          template: "order_confirmed",
-        });
-        const result = await safelySendWhatsApp("Order Confirmed", () =>
-          sendOrderConfirmationWhatsApp({
-            mobile: phone,
-            customerName: name,
-            orderNumber,
-            orderAmount: amount,
-            orderDate: new Date(order.paid_at || Date.now()).toLocaleDateString(
-              "en-IN",
-            ),
-            orderUuid: order.id,
+      try {
+        await sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: order.id,
+            status: "confirmed",
+            channel: "whatsapp",
           }),
-        );
-        if (!result.success) {
-          throw (
-            result.error || new Error("WhatsApp provider rejected the message")
-          );
-        }
-        console.info("[ORDER_CONFIRMATION] WhatsApp sent", {
           orderId: order.id,
-          orderNumber,
+          status: "confirmed",
+          channel: "whatsapp",
+          queryExecutor,
+          send: async () => {
+            console.info("[ORDER_CONFIRMATION] WhatsApp send started", {
+              orderId: order.id,
+              orderNumber,
+              recipient: maskNotificationPhone(phone),
+              template: "order_confirmed",
+            });
+            const result = await safelySendWhatsApp("Order Confirmed", () =>
+              sendConfirmationWhatsApp({
+                mobile: phone,
+                customerName: name,
+                orderNumber,
+                orderAmount: amount,
+                orderDate: new Date(
+                  order.paid_at || Date.now(),
+                ).toLocaleDateString("en-IN"),
+                orderUuid: order.id,
+              }),
+            );
+            if (!result.success) {
+              throw (
+                result.error ||
+                new Error("WhatsApp provider rejected the message")
+              );
+            }
+            console.info("[ORDER_CONFIRMATION] WhatsApp sent", {
+              orderId: order.id,
+              orderNumber,
+            });
+          },
         });
-      });
+      } catch {
+        // Already logged and recorded in order_status_notifications.
+      }
     }
   } catch (err) {
     console.error("[ORDER_CONFIRMATION] Notification dispatch failed", {
@@ -1325,9 +1472,22 @@ const notifyInitialOrderConfirmation = async (orderId) => {
   }
 };
 
-const notifyPaidStatusUpdate = async (orderId) => {
+// FIX (ISSUE-004 — Payment Received notification race): previously had no
+// idempotency mechanism whatsoever — verifyPayment and a redelivered
+// payment.captured webhook could both call this for the same order and
+// both send. Now uses the same atomic order_status_notifications claim as
+// notifyInitialOrderConfirmation above, keyed on status "paid" (distinct
+// from "confirmed") so the two notification types never share a claim.
+export const notifyPaidStatusUpdate = async (
+  orderId,
+  {
+    queryExecutor = query,
+    sendPaidEmail = sendOrderStatusUpdateEmail,
+    sendPaidWhatsApp = sendOrderStatusUpdateWhatsApp,
+  } = {},
+) => {
   try {
-    const { rows } = await query(
+    const { rows } = await queryExecutor(
       `SELECT id, order_number, customer_name, contact_name, email,
               contact_email, mobile_number, contact_phone
        FROM orders WHERE id = ? LIMIT 1`,
@@ -1342,12 +1502,24 @@ const notifyPaidStatusUpdate = async (orderId) => {
 
     if (email) {
       try {
-        await sendOrderStatusUpdateEmail({
-          to: email,
-          name,
+        await sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: order.id,
+            status: "paid",
+            channel: "email",
+          }),
           orderId: order.id,
-          orderNumber: order.order_number,
           status: "paid",
+          channel: "email",
+          queryExecutor,
+          send: () =>
+            sendPaidEmail({
+              to: email,
+              name,
+              orderId: order.id,
+              orderNumber: order.order_number,
+              status: "paid",
+            }),
         });
       } catch (error) {
         console.error("Paid order status email failed", { orderId, error });
@@ -1360,12 +1532,24 @@ const notifyPaidStatusUpdate = async (orderId) => {
 
     if (phone) {
       try {
-        await sendOrderStatusUpdateWhatsApp({
-          customerName: name,
-          mobile: phone,
-          orderNumber: order.order_number,
-          orderUuid: order.id,
+        await sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
+            orderId: order.id,
+            status: "paid",
+            channel: "whatsapp",
+          }),
+          orderId: order.id,
           status: "paid",
+          channel: "whatsapp",
+          queryExecutor,
+          send: () =>
+            sendPaidWhatsApp({
+              customerName: name,
+              mobile: phone,
+              orderNumber: order.order_number,
+              orderUuid: order.id,
+              status: "paid",
+            }),
         });
       } catch (error) {
         console.error("Paid order status WhatsApp failed", { orderId, error });
@@ -1503,7 +1687,11 @@ const withTimeout = (promise, ms) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/verify
 // ─────────────────────────────────────────────────────────────────────────────
-export const verifyPayment = async (req, res) => {
+export const verifyPayment = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   const {
     razorpay_order_id,
     razorpay_payment_id,
@@ -1553,7 +1741,7 @@ export const verifyPayment = async (req, res) => {
       .json({ success: false, message: "Invalid payment signature" });
   }
 
-  const { rows: alreadyProcessed } = await query(
+  const { rows: alreadyProcessed } = await queryFn(
     "SELECT id FROM orders WHERE razorpay_payment_id = ?",
     [razorpay_payment_id],
   );
@@ -1579,7 +1767,7 @@ export const verifyPayment = async (req, res) => {
     : "razorpay_order_id";
   const lookupValue = razorpay_subscription_id || razorpay_order_id;
 
-  const { rows: orderRows } = await query(
+  const { rows: orderRows } = await queryFn(
     `SELECT * FROM orders WHERE ${lookupField} = ?`,
     [lookupValue],
   );
@@ -1598,7 +1786,7 @@ export const verifyPayment = async (req, res) => {
 
   if (!isSubscriptionOrder) {
     try {
-      const rzp = getRazorpay();
+      const rzp = getRazorpayFn();
       const rzpPayment = await rzp.payments.fetch(razorpay_payment_id);
       if (Number(rzpPayment.amount) !== Math.round(dbTotal * 100)) {
         console.warn("[VERIFY_PAYMENT] Amount mismatch", {
@@ -1612,10 +1800,28 @@ export const verifyPayment = async (req, res) => {
         });
       }
     } catch (err) {
+      // FIX (Medium #7 — Phase 3): this used to log and fall through,
+      // completing the order on HMAC-signature trust alone whenever the
+      // live Razorpay amount cross-check itself couldn't be performed
+      // (Razorpay API outage/timeout) — the one case this cross-check
+      // exists for (catching a real amount mismatch) was silently
+      // unreachable during exactly the conditions most likely to
+      // accompany real trouble. Fails closed instead: the synchronous
+      // verify request is refused (safe to retry — no order/payment state
+      // is mutated by this branch), while the independent payment.captured
+      // webhook handler (which does its own state-guarded processing) still
+      // completes the order once Razorpay recovers, so a transient outage
+      // delays confirmation rather than either losing it or trusting an
+      // unverified amount.
       console.error(
-        "[VERIFY_PAYMENT] Razorpay payment fetch failed — continuing on HMAC trust",
+        "[VERIFY_PAYMENT] Razorpay amount cross-check unavailable — refusing to verify rather than trusting HMAC alone",
         { orderId: order.id, ...describeRazorpayError(err) },
       );
+      return res.status(502).json({
+        success: false,
+        message:
+          "Unable to confirm your payment with Razorpay right now. Please try again in a moment — your payment is safe and will be confirmed automatically.",
+      });
     }
   }
 
@@ -1834,6 +2040,18 @@ export const verifyPayment = async (req, res) => {
     const newOrderStatus = "paid";
     const newPaymentStatus = "paid";
 
+    // ISSUE-M32 residual fix (address snapshot immutability): persist the
+    // structured address that was actually resolved/confirmed for THIS
+    // payment directly onto the order row, in the same transaction as the
+    // address_id write above. createShipment now prefers these columns over
+    // re-resolving address_id, so a later edit to the customer's saved
+    // address book entry can no longer change what Delhivery receives for
+    // an already-paid order.
+    const resolvedStructuredAddress = resolveStructuredAddressFields(
+      razorpayShippingAddrObj,
+      lockedOrder,
+    );
+
     await client.query(
       `UPDATE orders SET
         payment_status   = ?,
@@ -1843,6 +2061,12 @@ export const verifyPayment = async (req, res) => {
         email            = ?,
         mobile_number    = ?,
         shipping_address = ?,
+        shipping_address_line1 = ?,
+        shipping_address_line2 = ?,
+        shipping_city    = ?,
+        shipping_state   = ?,
+        shipping_pincode = ?,
+        shipping_country = ?,
         contact_name     = ?,
         contact_email    = ?,
         contact_phone    = ?,
@@ -1860,6 +2084,12 @@ export const verifyPayment = async (req, res) => {
         resolvedEmail,
         resolvedPhone,
         resolvedAddress,
+        resolvedStructuredAddress.line1,
+        resolvedStructuredAddress.line2,
+        resolvedStructuredAddress.city,
+        resolvedStructuredAddress.state,
+        resolvedStructuredAddress.pincode,
+        resolvedStructuredAddress.country,
         resolvedName,
         resolvedEmail,
         resolvedPhone,
@@ -2891,7 +3121,7 @@ export const getPaymentStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/webhook — Razorpay async event notifications
 // ─────────────────────────────────────────────────────────────────────────────
-export const handleWebhook = async (req, res) => {
+export const handleWebhook = async (req, res, { queryFn = query } = {}) => {
   const signature = req.headers["x-razorpay-signature"];
   const rawBody =
     req.rawBody ||
@@ -2922,6 +3152,7 @@ export const handleWebhook = async (req, res) => {
 
   const paymentEntity = eventPayload?.payment?.entity;
   const subscriptionEntity = eventPayload?.subscription?.entity;
+  const refundEntity = eventPayload?.refund?.entity;
   const rzpOrderId = paymentEntity?.order_id;
   const rzpSubscriptionId =
     subscriptionEntity?.id || paymentEntity?.subscription_id;
@@ -2937,6 +3168,23 @@ export const handleWebhook = async (req, res) => {
     rzpPaymentId,
   });
 
+  // FIX (Phase 3B — Medium #5): atomic event-id claim, MySQL-backed (safe
+  // across multiple backend instances — see webhookIdempotencyService.js).
+  // A duplicate delivery of an already-completed event, or a delivery that
+  // arrives while a concurrent request is still processing the exact same
+  // event, is acknowledged here WITHOUT running any of the business logic
+  // below — this must happen before any state-changing work, not after.
+  const eventId = createHash("sha256").update(rawBody).digest("hex");
+  const claim = await claimWebhookEvent({ eventId, eventType: event, queryFn });
+  if (!claim.claimed) {
+    console.info("[WEBHOOK] Duplicate or concurrent event — skipping business logic", {
+      event,
+      eventId,
+      alreadyCompleted: claim.alreadyCompleted,
+    });
+    return res.json({ status: "ok", duplicate: true });
+  }
+
   const emitUpdate = (orderId, status) => {
     try {
       req.app?.locals?.io?.emit("order:updated", {
@@ -2946,8 +3194,14 @@ export const handleWebhook = async (req, res) => {
     } catch (_) {}
   };
 
+  // FIX (Phase 3B — Medium #5 test coverage): these three closures used to
+  // call the module-level `query` directly, bypassing the `queryFn` DI
+  // param added above — harmless for real production calls (queryFn
+  // defaults to the same real `query`), but meant a full handleWebhook
+  // test exercising any of the many cases that call them still hit a real
+  // DB connection attempt. No behavior change for any real caller.
   const addHistory = (orderId, prevStatus, newStatus, notes) =>
-    query(
+    queryFn(
       `INSERT INTO order_status_history
          (order_id, previous_status, new_status, changed_by, notes)
        VALUES (?, ?, ?, NULL, ?)`,
@@ -2955,7 +3209,7 @@ export const handleWebhook = async (req, res) => {
     );
 
   const loadBySubscription = async () => {
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `SELECT * FROM orders
        WHERE razorpay_subscription_id = ?
          AND is_renewal_order = 0
@@ -2967,13 +3221,20 @@ export const handleWebhook = async (req, res) => {
   };
 
   const loadByRazorpayOrder = async () => {
-    const { rows } = await query(
+    const { rows } = await queryFn(
       "SELECT * FROM orders WHERE razorpay_order_id = ? LIMIT 1",
       [rzpOrderId],
     );
     return rows[0];
   };
 
+  // FIX (Phase 3B — Medium #5): the entire existing switch below is
+  // UNCHANGED — only wrapped so a thrown error marks this event 'failed'
+  // (retryable on the next Razorpay redelivery) instead of leaving it
+  // stuck 'processing' forever, and so a successful run marks it
+  // 'completed' (never marked before the business operation actually
+  // succeeds).
+  try {
   switch (event) {
     case "payment.captured": {
       let paidStatusTransition = false;
@@ -3097,6 +3358,13 @@ export const handleWebhook = async (req, res) => {
             const webhookShippingAddress = formatRazorpayShippingAddress(
               webhookCustomerDetails?.shipping_address,
             );
+            // ISSUE-M32 residual fix (address snapshot immutability): same
+            // merge helper verifyPayment uses — see its definition/comment
+            // above formatRazorpayShippingAddress.
+            const webhookStructuredAddress = resolveStructuredAddressFields(
+              webhookCustomerDetails?.shipping_address,
+              lockedOrder,
+            );
             const webhookAddressUserId = lockedOrder.user_id || null;
             let webhookAddressId = lockedOrder.address_id || null;
 
@@ -3151,6 +3419,12 @@ export const handleWebhook = async (req, res) => {
                  contact_phone = COALESCE(?, contact_phone),
                  shipping_address = COALESCE(?, shipping_address),
                  address_id = COALESCE(?, address_id),
+                 shipping_address_line1 = COALESCE(?, shipping_address_line1),
+                 shipping_address_line2 = COALESCE(?, shipping_address_line2),
+                 shipping_city = COALESCE(?, shipping_city),
+                 shipping_state = COALESCE(?, shipping_state),
+                 shipping_pincode = COALESCE(?, shipping_pincode),
+                 shipping_country = COALESCE(?, shipping_country),
                  order_confirmation_email_sent_at = CASE WHEN ? = 0 THEN NULL ELSE order_confirmation_email_sent_at END,
                  order_confirmation_whatsapp_sent_at = CASE WHEN ? = 0 THEN NULL ELSE order_confirmation_whatsapp_sent_at END,
                  paid_at = COALESCE(paid_at, NOW()),
@@ -3166,6 +3440,12 @@ export const handleWebhook = async (req, res) => {
                 webhookPhone || null,
                 webhookShippingAddress,
                 webhookAddressId,
+                webhookStructuredAddress.line1,
+                webhookStructuredAddress.line2,
+                webhookStructuredAddress.city,
+                webhookStructuredAddress.state,
+                webhookStructuredAddress.pincode,
+                webhookStructuredAddress.country,
                 wasAlreadyPaid ? 1 : 0,
                 wasAlreadyPaid ? 1 : 0,
                 order.id,
@@ -3235,6 +3515,7 @@ export const handleWebhook = async (req, res) => {
             [order.id],
           );
           if (failureUpdate.rowCount) {
+            await markPaymentRowFailed({ razorpaySubscriptionId: rzpSubscriptionId });
             await addHistory(
               order.id,
               order.order_status,
@@ -3284,6 +3565,7 @@ export const handleWebhook = async (req, res) => {
             `UPDATE orders SET payment_status = 'failed', updated_at = NOW() WHERE id = ?`,
             [order.id],
           );
+          await markPaymentRowFailed({ razorpayOrderId: rzpOrderId });
           await addHistory(
             order.id,
             order.order_status,
@@ -3292,6 +3574,77 @@ export const handleWebhook = async (req, res) => {
           );
           emitUpdate(order.id, "failed");
         }
+      }
+      break;
+    }
+
+    // FIX (Medium #11 — Phase 3): no automated path ever transitioned a
+    // refund from 'initiated' to 'completed' — that only happened when an
+    // admin manually reopened the refund screen and completeRefund's
+    // "recheck" mode ran (admin/returnController.js). A refund could stay
+    // 'initiated' in the DB forever even after Razorpay actually completed
+    // it. These two events fire whenever a refund Razorpay is already
+    // processing (created via completeRefund) changes state — the exact
+    // event this reconciliation gap needed. Looked up by refund_reference
+    // (completeRefund sets orders.refund_reference = razorpayRefund.id),
+    // guarded by a WHERE clause so this can never move a refund BACKWARD
+    // (e.g. re-processing an already-'completed' row) or touch an order
+    // whose refund was never actually initiated through this app — does
+    // not create, call, or retry any Razorpay refund itself, purely
+    // reconciles state Razorpay is reporting on a refund that already
+    // exists.
+    case "refund.processed": {
+      if (!refundEntity?.id) break;
+      const completionUpdate = await queryFn(
+        `UPDATE orders SET
+           refund_status = 'completed',
+           payment_status = 'refunded',
+           refund_completed_at = NOW(),
+           updated_at = NOW()
+         WHERE refund_reference = ?
+           AND refund_status = 'initiated'`,
+        [refundEntity.id],
+      );
+      if (completionUpdate.rowCount) {
+        const { rows } = await queryFn(
+          "SELECT id, order_status FROM orders WHERE refund_reference = ? LIMIT 1",
+          [refundEntity.id],
+        );
+        const order = rows[0];
+        if (order) {
+          console.info("[WEBHOOK] Refund reconciled to completed", {
+            orderId: order.id,
+            razorpayRefundId: refundEntity.id,
+          });
+          await queryFn(
+            `INSERT INTO order_status_history
+               (order_id, previous_status, new_status, changed_by, notes)
+             VALUES (?, ?, ?, NULL, ?)`,
+            [
+              order.id,
+              order.order_status,
+              order.order_status,
+              `Refund ${refundEntity.id} confirmed completed via webhook`,
+            ],
+          );
+        }
+      }
+      break;
+    }
+
+    case "refund.failed": {
+      // A failed refund needs a human to look at it (retry, investigate the
+      // payment method, etc.) — deliberately does NOT change refund_status
+      // automatically (there is no distinct "failed" refund_status value in
+      // this schema, and inventing one here — with no admin UI or reprocess
+      // flow to act on it — would just be a dead state). This makes the
+      // failure immediately visible server-side instead of only being
+      // discovered whenever an admin happens to recheck.
+      if (refundEntity?.id) {
+        console.error("[WEBHOOK] Razorpay refund FAILED — needs manual review", {
+          razorpayRefundId: refundEntity.id,
+          razorpayPaymentId: refundEntity.payment_id,
+        });
       }
       break;
     }
@@ -3739,5 +4092,19 @@ export const handleWebhook = async (req, res) => {
       console.info("[WEBHOOK] Unhandled event:", event);
   }
 
-  return res.json({ status: "ok" });
+    await markWebhookEventCompleted({ eventId, queryFn });
+    return res.json({ status: "ok" });
+  } catch (err) {
+    await markWebhookEventFailed({
+      eventId,
+      queryFn,
+      errorMessage: err?.message || String(err),
+    }).catch((markErr) =>
+      console.error("[WEBHOOK] Failed to record event failure in ledger", {
+        eventId,
+        message: markErr?.message || String(markErr),
+      }),
+    );
+    throw err;
+  }
 };

@@ -18,7 +18,6 @@ import {
   updateProduct,
   deleteProduct,
   setProductRelations,
-  deleteProductRelation,
   getProductRelations,
 } from "../../controllers/admin/productController.js";
 import {
@@ -40,11 +39,11 @@ import {
   getSubscriptionAnalytics,
   getUpcomingRenewals,
   getFailedRenewals,
+  getPackagePurchases,
 } from "../../controllers/admin/subscriptionAdminController.js";
 import adminAuth from "../../middleware/adminAuth.js";
 import { upload } from "../../config/cloudinary.js";
 import bulkRoutes from "../../controllers/admin/bulkRoutes.js";
-import { updateInquiryStatus } from "../../controllers/contactController.js";
 
 import {
   approveReturn,
@@ -130,9 +129,10 @@ router.post("/products", upload.single("image"), createProduct);
 router.put("/products/:id", upload.single("image"), updateProduct);
 router.delete("/products/:id", deleteProduct);
 router.get("/products/:id/relations", getProductRelations);
-// Product relations management
+// Product relations management — whole-set replace only; there is no
+// per-relation delete endpoint because the frontend always replaces the
+// full relation set via setProductRelations (see ProductRelationsModal.js).
 router.post("/products/:id/relations", setProductRelations);
-router.delete("/products/:id/relations/:relId", deleteProductRelation);
 
 // bulk booking routes are in a separate file since they also have non-admin routes and we want to keep the admin router focused on strictly admin-only endpoints.
 router.use("/", bulkRoutes);
@@ -142,6 +142,9 @@ router.get("/subscriptions", getSubscriptions);
 router.get("/subscriptions/analytics", getSubscriptionAnalytics);
 router.get("/subscriptions/upcoming-renewals", getUpcomingRenewals);
 router.get("/subscriptions/failed-renewals", getFailedRenewals);
+// FIX (ISSUE-012): Model B (pay-once packages) visibility — mounted before
+// the `:id` param route below so "packages" is never captured as an id.
+router.get("/subscriptions/packages", getPackagePurchases);
 router.get("/subscriptions/:id", getSubscriptionDetails);
 router.patch("/subscriptions/:id/pause", pauseSubscription);
 router.patch("/subscriptions/:id/resume", resumeSubscription);
@@ -154,7 +157,6 @@ router.get("/customers", getCustomers);
 router.get("/inquiries", getInquiries);
 router.patch("/inquiries/:id/contacted", markContacted);
 router.delete("/inquiries/:id", deleteInquiry);
-router.patch("/inquiries/:id", updateInquiryStatus);
 
 // Testimonials
 router.get("/testimonials", getAdminTestimonials);

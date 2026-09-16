@@ -46,6 +46,19 @@ const reminderMigrationPath = resolve(
   "008_add_daily_reminder_feature.sql",
 );
 const reminderMigration = await fs.readFile(reminderMigrationPath, "utf8");
+// ISSUE-017: mysql-schema.sql's CREATE TABLE already reflects the fixed
+// ON DELETE SET NULL constraint (for a brand-new database), but
+// CREATE TABLE IF NOT EXISTS is a no-op against an existing `orders`
+// table — so an already-provisioned database needs this explicit
+// ALTER TABLE to actually pick up the change.
+const ordersUserFkMigrationPath = resolve(
+  __dirname,
+  "009_orders_user_fk_set_null.sql",
+);
+const ordersUserFkMigration = await fs.readFile(
+  ordersUserFkMigrationPath,
+  "utf8",
+);
 
 const connection = await pool.getConnection();
 try {
@@ -55,6 +68,8 @@ try {
   await connection.query(cleanupMigration);
   console.log(`Executing migration from ${reminderMigrationPath}`);
   await connection.query(reminderMigration);
+  console.log(`Executing migration from ${ordersUserFkMigrationPath}`);
+  await connection.query(ordersUserFkMigration);
   console.log("✅ MySQL schema created successfully");
 } catch (err) {
   console.error("❌ MySQL schema creation failed:", err.message);

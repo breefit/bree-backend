@@ -1,4 +1,4 @@
-import { query } from "../../config/database.js";
+import { query, getClient } from "../../config/database.js";
 import { randomUUID } from "crypto";
 import { cloudinary } from "../../config/cloudinary.js";
 import cache from "../../utils/cache.js";
@@ -790,38 +790,58 @@ export const deleteProduct = async (req, res) => {
 // ============================================================
 // POST /api/admin/products/:id/relations
 // ============================================================
-export const setProductRelations = async (req, res) => {
+export const setProductRelations = async (
+  req,
+  res,
+  { queryFn = query, getClientFn = getClient } = {},
+) => {
   const productId = req.params.id;
   const relations = Array.isArray(req.body.relations) ? req.body.relations : [];
 
-  const { rows: p } = await query(
+  const { rows: p } = await queryFn(
     "SELECT id FROM products WHERE id = ? LIMIT 1",
     [productId],
   );
   if (!p.length) return res.status(404).json({ message: "Product not found" });
 
-  await query("DELETE FROM product_relations WHERE product_id = ?", [
-    productId,
-  ]);
+  // FIX (ISSUE-#27 Medium — Phase 3): this used to run the DELETE and every
+  // INSERT as separate pooled query() calls with no transaction, so a
+  // failure partway through the INSERT batch (e.g. a bad related_product_id)
+  // left the DELETE committed but the new relations only partially written —
+  // the product could end up with zero relations. Wrapped in a single
+  // transaction on one connection (the getClient pattern already used by
+  // admin/returnController.js) so the DELETE and every INSERT commit or roll
+  // back together.
+  const client = await getClientFn();
+  try {
+    await client.query("START TRANSACTION");
 
-  if (relations.length === 0) {
-    invalidateProductCache();
-    return res.json({ message: "Relations cleared" });
+    await client.query("DELETE FROM product_relations WHERE product_id = ?", [
+      productId,
+    ]);
+
+    for (const r of relations) {
+      const relId = r.related_product_id;
+      const type = r.relation_type || "recommend";
+      const weight = parseInt(r.weight || 0);
+      await client.query(
+        `INSERT INTO product_relations (product_id, related_product_id, relation_type, weight) VALUES (?, ?, ?, ?)`,
+        [productId, relId, type, weight],
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
 
-  const inserts = relations.map((r) => {
-    const relId = r.related_product_id;
-    const type = r.relation_type || "recommend";
-    const weight = parseInt(r.weight || 0);
-    return query(
-      `INSERT INTO product_relations (product_id, related_product_id, relation_type, weight) VALUES (?, ?, ?, ?)`,
-      [productId, relId, type, weight],
-    );
-  });
-
-  await Promise.all(inserts);
   invalidateProductCache();
-  res.json({ message: "Relations set" });
+  res.json({
+    message: relations.length === 0 ? "Relations cleared" : "Relations set",
+  });
 };
 
 // ============================================================

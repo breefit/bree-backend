@@ -10,6 +10,19 @@ if (!process.env.DATABASE_URL) {
   throw new Error("DATABASE_URL environment variable is not set");
 }
 
+// LOW-09 fix: this used to silently fall back to a predictable, publicly
+// documented default password ("Change_Me_Strong_Password_123!") whenever
+// ADMIN_PASSWORD was unset. This script is never run automatically (it's a
+// standalone one-time setup step — see the header comment), so failing
+// loudly here can never surprise a running server; it can only stop an
+// operator from accidentally seeding a known, guessable production admin
+// credential. Set ADMIN_PASSWORD in your .env before running `npm run seed`.
+if (!process.env.ADMIN_PASSWORD) {
+  throw new Error(
+    "ADMIN_PASSWORD environment variable is not set. Refusing to seed a predictable default admin password — set ADMIN_PASSWORD in your .env before running this script.",
+  );
+}
+
 const pool = mysql.createPool(process.env.DATABASE_URL);
 
 // ─────────────────────────────────────────────────────────────
@@ -18,7 +31,7 @@ const pool = mysql.createPool(process.env.DATABASE_URL);
 
 const email = process.env.ADMIN_EMAIL || "admin@bree.fit";
 
-const password = process.env.ADMIN_PASSWORD || "Change_Me_Strong_Password_123!";
+const password = process.env.ADMIN_PASSWORD;
 
 const hashedPassword = await bcrypt.hash(password, 12);
 

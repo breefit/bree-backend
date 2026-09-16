@@ -68,7 +68,12 @@ const sendEmail = async ({ to, subject, html }) => {
 export const buildOrderTrackingUrl = (orderId) =>
   `${getFrontendUrl()}/order/${orderId}/tracking`;
 
-const WEBSITE_URL = "https://www.breefit.in/";
+// FIX (Medium #29 — Phase 3): was a bare hardcoded string, ignoring
+// FRONTEND_URL entirely (unlike getFrontendUrl(), used a few lines above
+// for buildOrderTrackingUrl). Reuses that same env-driven helper — and its
+// same breefit.in fallback — so a domain migration only needs FRONTEND_URL
+// updated, not a code change in multiple places in this file.
+const WEBSITE_URL = `${getFrontendUrl()}/`;
 
 // ==================================================
 // BREE brand palette
@@ -91,7 +96,11 @@ const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString()}`;
 // ==================================================
 
 const buildHeader = (frontendUrl) => {
-  const logoUrl = `https://www.breefit.in/images/logo.PNG`;
+  // FIX (Medium #29 — Phase 3): this ignored its own `frontendUrl`
+  // parameter and hardcoded breefit.in regardless of FRONTEND_URL, so any
+  // domain migration would need a code change here even though the
+  // parameter already carries the correct env-driven value.
+  const logoUrl = `${frontendUrl}/images/logo.PNG`;
   return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">
       <tr>

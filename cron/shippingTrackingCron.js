@@ -21,8 +21,52 @@ import {
   buildOrderStatusNotificationKey,
   logNotification,
 } from "../src/services/orderStatusNotificationService.js";
+import { runWithCronLock } from "../src/utils/cronLock.js";
 
 const TERMINAL_STATUSES = ["delivered", "cancelled", "returned"];
+
+// FIX (Medium #17 — Phase 3): a persistently-failing Delhivery tracking API
+// call for a given order used to be only console.error'd and silently
+// retried on the next 30-minute tick, indefinitely, with no counter and no
+// escalation. Extracted as small, independently testable functions (rather
+// than adding broad dependency injection to the large, non-DI
+// syncShippingTracking loop) — called from the per-order try/catch below.
+const TRACKING_FAILURE_ALERT_THRESHOLD = 5; // ~2.5 hours of consecutive failures at the 30-minute cron interval
+
+export const recordTrackingSyncFailure = async (
+  order,
+  { queryFn = query, alertThreshold = TRACKING_FAILURE_ALERT_THRESHOLD } = {},
+) => {
+  await queryFn(
+    `UPDATE orders
+     SET tracking_sync_failure_count = tracking_sync_failure_count + 1,
+         tracking_sync_last_failure_at = NOW()
+     WHERE id = ?`,
+    [order.id],
+  );
+
+  const { rows } = await queryFn(
+    "SELECT tracking_sync_failure_count FROM orders WHERE id = ?",
+    [order.id],
+  );
+  const failureCount = Number(rows?.[0]?.tracking_sync_failure_count || 0);
+
+  if (failureCount >= alertThreshold) {
+    console.error(
+      `[SHIPPING_CRON] ALERT: order ${order.id} (AWB ${order.awb_number}) has failed tracking sync ${failureCount} consecutive times — needs manual investigation`,
+    );
+  }
+
+  return failureCount;
+};
+
+export const resetTrackingSyncFailure = async (order, { queryFn = query } = {}) => {
+  if (!order.tracking_sync_failure_count) return;
+  await queryFn(
+    "UPDATE orders SET tracking_sync_failure_count = 0 WHERE id = ?",
+    [order.id],
+  );
+};
 
 const getAvailableOrderColumns = async () => {
   const { rows } = await query("SHOW COLUMNS FROM orders");
@@ -42,7 +86,8 @@ export const syncShippingTracking = async () => {
   const { rows: orders } = await query(
     `SELECT id, order_number, order_status, awb_number, tracking_status,
             contact_name, customer_name, email, contact_email,
-            mobile_number, contact_phone, tracking_url, courier_name
+            mobile_number, contact_phone, tracking_url, courier_name,
+            tracking_sync_failure_count
      FROM orders
      WHERE awb_number IS NOT NULL
        AND awb_number != ''
@@ -327,10 +372,24 @@ export const syncShippingTracking = async () => {
       console.log(
         `[SHIPPING_CRON] API success for order ${order.id} AWB ${awb}`,
       );
+
+      await resetTrackingSyncFailure(order).catch((err) =>
+        console.error(
+          `[SHIPPING_CRON] Failed to reset tracking_sync_failure_count for order ${order.id}`,
+          err,
+        ),
+      );
     } catch (error) {
       console.error(
         `[SHIPPING_CRON] API failure for order ${order.id} AWB ${awb}`,
         error.message || error,
+      );
+
+      await recordTrackingSyncFailure(order).catch((err) =>
+        console.error(
+          `[SHIPPING_CRON] Failed to record tracking_sync_failure_count for order ${order.id}`,
+          err,
+        ),
       );
     }
   }
@@ -338,10 +397,20 @@ export const syncShippingTracking = async () => {
   console.log("[SHIPPING_CRON] Cron completion");
 };
 
+// FIX (Medium #16 — Phase 3): see utils/cronLock.js — prevents two app
+// instances from both polling every due order every 30 minutes if this app
+// is ever scaled horizontally.
+const SHIPPING_CRON_LOCK_NAME = "bree_shipping_tracking_cron";
+
 export const startShippingTrackingCron = () => {
   const task = cron.schedule("*/30 * * * *", async () => {
     try {
-      await syncShippingTracking();
+      const result = await runWithCronLock(SHIPPING_CRON_LOCK_NAME, syncShippingTracking);
+      if (!result.ran) {
+        console.log(
+          "[SHIPPING_CRON] Another instance already holds the lock — skipping this tick",
+        );
+      }
     } catch (error) {
       console.error("[SHIPPING_CRON] Cron run failed", error);
     }

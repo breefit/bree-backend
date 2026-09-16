@@ -15,7 +15,6 @@ import {
   findRefreshTokenByValue,
   rotateRefreshToken,
   revokeRefreshTokenById,
-  revokeUserRefreshTokens,
   loadUserById,
 } from "../services/authService.js";
 import { ensureUserCustomerNumber } from "../utils/customerNumber.js";
@@ -410,15 +409,20 @@ export const getMe = async (req, res) => {
 };
 
 // POST /api/auth/logout
+//
+// LOW-10 fix: this used to also have `if (req.user?.id) { await
+// revokeUserRefreshTokens(req.user.id); }` here — dead code, confirmed by
+// tracing every path that could populate req.user. This route has no auth
+// middleware attached (see routes/auth.js — unlike /me or
+// /change-password, which do use `auth`), so req.user is always undefined
+// here; that branch could never execute. Removing it changes nothing
+// observable: current logout behavior already was, and remains, "revoke
+// only the current device's refresh token" via the two calls below.
 export const logout = async (req, res) => {
   const refreshToken = req.cookies[REFRESH_COOKIE_NAME];
   if (refreshToken) {
     const stored = await findRefreshTokenByValue(refreshToken);
     if (stored) await revokeRefreshTokenById(stored.id);
-  }
-
-  if (req.user?.id) {
-    await revokeUserRefreshTokens(req.user.id);
   }
 
   res.clearCookie(COOKIE_NAME, { ...COOKIE_OPTIONS, maxAge: 0, path: "/" });

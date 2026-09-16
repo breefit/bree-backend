@@ -163,7 +163,10 @@ test("30-Pack with reminder and free delivery stays at 1048 and never discounts 
       variant_id: "reminder-42",
       name: "Daily WhatsApp Reminder",
       description: "Daily WhatsApp Reminder",
-      image_url: "https://breefit.in/images/daily-whatsapp-reminder.png",
+      // FIX (Medium #29 — Phase 3): this used to hardcode breefit.in
+      // regardless of FRONTEND_URL; now derived the same way the source
+      // does, so this test can't silently drift from real behavior again.
+      image_url: `${(process.env.FRONTEND_URL || "https://www.breefit.in").split(",")[0].trim().replace(/\/$/, "")}/images/daily-whatsapp-reminder.png`,
       price: 4900,
       offer_price: 4900,
       quantity: 1,

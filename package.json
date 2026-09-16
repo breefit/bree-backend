@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "node --test",
+    "test": "NODE_ENV=test node --test",
     "migrate": "node migrations/mysql-migrate.js",
     "seed": "node migrations/seed.js"
   },

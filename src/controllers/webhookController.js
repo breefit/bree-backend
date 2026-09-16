@@ -6,6 +6,56 @@
  * OTP, order, subscription, or WhatsApp notification flows.
  */
 
+import crypto from "crypto";
+
+// FIX (ISSUE-015 — no signature verification): this is a public,
+// unauthenticated POST endpoint. It currently only logs incoming events —
+// no order/subscription/notification state is touched — but it's exactly
+// one careless future edit away from becoming a real spoofing vector (e.g.
+// trusting an "incoming message" body to trigger something), and Meta's
+// own webhook contract signs every delivery with this header regardless of
+// whether the receiver checks it. Verifying it now, while the endpoint is
+// still inert, means that future edit inherits a route that's already
+// safe rather than one that has to remember to add this. Rather than
+// judge from static analysis alone whether Meta is still actively
+// configured to call this URL in production (an external, account-level
+// fact this repo can't confirm), the conservative fix is to make the
+// route safe unconditionally — same posture as every other webhook in
+// this codebase (Razorpay's is HMAC-verified; this now matches).
+//
+// Meta signs the exact raw request body with HMAC-SHA256 using the app
+// secret, sent as `X-Hub-Signature-256: sha256=<hex>`. Mirrors
+// utils/razorpay.js's verifyWebhookSignature: timing-safe compare, no
+// early-return leaking timing information, secret itself never logged.
+export const verifyMetaWebhookSignature = (rawBody, signatureHeader) => {
+  if (!rawBody || !signatureHeader) return false;
+
+  const prefix = "sha256=";
+  if (!signatureHeader.startsWith(prefix)) return false;
+  const providedHex = signatureHeader.slice(prefix.length).trim();
+
+  const appSecret = process.env.META_APP_SECRET;
+  if (!appSecret) return false;
+
+  // A malformed (non-hex, wrong-length) provided value must be rejected,
+  // not thrown on — Buffer.from(..., "hex") silently truncates invalid
+  // input rather than throwing, so length-check against the *string*
+  // first.
+  if (!/^[0-9a-f]+$/i.test(providedHex)) return false;
+
+  const expectedHex = crypto
+    .createHmac("sha256", appSecret)
+    .update(rawBody)
+    .digest("hex");
+
+  const expectedBuffer = Buffer.from(expectedHex, "hex");
+  const providedBuffer = Buffer.from(providedHex, "hex");
+
+  if (expectedBuffer.length !== providedBuffer.length) return false;
+
+  return crypto.timingSafeEqual(expectedBuffer, providedBuffer);
+};
+
 /**
  * GET /api/webhooks/meta
  * Verify the Meta webhook subscription using hub.mode, hub.verify_token, and
@@ -106,10 +156,34 @@ const logIncomingMessage = async (message, metadata) => {
  * POST /api/webhooks/meta
  * Accept incoming Meta webhook payloads. Log the payload and safely ignore
  * unknown or changed payload structures without crashing.
+ *
+ * FIX (ISSUE-015): now verifies Meta's X-Hub-Signature-256 header before
+ * doing anything else — a missing/invalid signature is rejected outright
+ * (403), never logged with its raw value. `req.rawBody` is the raw Buffer
+ * app.js preserves for this exact route (mirroring the Razorpay webhook's
+ * own raw-body-before-json-parsing setup), so the signature is checked
+ * against the exact bytes Meta sent, not a re-serialized copy.
  */
 export const handleMetaWebhook = async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.alloc(0);
+  const signatureHeader = req.headers["x-hub-signature-256"];
+
+  if (!verifyMetaWebhookSignature(rawBody, signatureHeader)) {
+    console.warn("[META WEBHOOK] Signature verification failed", {
+      hasSignatureHeader: Boolean(signatureHeader),
+      bodyLength: rawBody.length,
+    });
+    return res.status(403).json({ message: "Invalid signature" });
+  }
+
   try {
-    const payload = req.body;
+    let payload;
+    try {
+      payload = rawBody.length ? JSON.parse(rawBody.toString("utf8")) : null;
+    } catch {
+      console.warn("[META WEBHOOK] Malformed JSON payload — ignoring");
+      return res.sendStatus(200);
+    }
 
     console.info("[META WEBHOOK] Payload received", {
       payload,
@@ -158,7 +232,7 @@ export const handleMetaWebhook = async (req, res) => {
     }
   } catch (error) {
     console.error("[META WEBHOOK] Processing error", error, {
-      body: req.body,
+      bodyLength: rawBody.length,
     });
   }
 

@@ -66,8 +66,11 @@ const isDuplicateKeyError = (err) =>
  * @param {string} orderId
  * @returns {{ packageId: string, packageNumber: string, totalCycles: number } | null}
  */
-export const createPackagePurchaseFromOrder = async (orderId) => {
-  const { rows: existing } = await query(
+export const createPackagePurchaseFromOrder = async (
+  orderId,
+  { queryFn = query, getClientFn = getClient } = {},
+) => {
+  const { rows: existing } = await queryFn(
     `SELECT id, package_number, total_cycles FROM package_purchases
      WHERE origin_order_id = ? LIMIT 1`,
     [orderId],
@@ -80,7 +83,7 @@ export const createPackagePurchaseFromOrder = async (orderId) => {
     };
   }
 
-  const { rows: packageItems } = await query(
+  const { rows: packageItems } = await queryFn(
     `SELECT oi.product_id, oi.quantity,
             p.package_duration_months, p.package_fulfillment_interval_days
      FROM order_items oi
@@ -115,7 +118,7 @@ export const createPackagePurchaseFromOrder = async (orderId) => {
     );
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -176,7 +179,7 @@ export const createPackagePurchaseFromOrder = async (orderId) => {
   } catch (err) {
     await client.query("ROLLBACK");
     if (isDuplicateKeyError(err)) {
-      const { rows: raced } = await query(
+      const { rows: raced } = await queryFn(
         `SELECT id, package_number, total_cycles FROM package_purchases
          WHERE origin_order_id = ? LIMIT 1`,
         [orderId],
@@ -223,8 +226,11 @@ const findDuePackageIds = async () => {
  *
  * @param {string} packageId
  */
-export const fulfillNextCycle = async (packageId) => {
-  const client = await getClient();
+export const fulfillNextCycle = async (
+  packageId,
+  { getClientFn = getClient } = {},
+) => {
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -359,10 +365,20 @@ export const fulfillNextCycle = async (packageId) => {
     );
 
     const isCompleted = newCycle >= pkg.total_cycles;
+    // FIX (Medium #15 — Phase 3): this used to re-anchor the next due date
+    // off DATE_ADD(NOW(), ...) — the ACTUAL processing time — instead of
+    // the package's own original cadence. A cron tick that ran late (any
+    // downtime, or simply the daily tick landing a few hours after the
+    // "ideal" instant) permanently shifted every subsequent cycle's date
+    // later by that same drift, compounding on every late run. Anchoring
+    // to the row's own (pre-update) next_fulfillment_date — the date that
+    // WAS due — instead of NOW() keeps the schedule locked to the
+    // package's original cadence regardless of when the cron actually
+    // processed it.
     await client.query(
       `UPDATE package_purchases
        SET cycles_created = ?,
-           next_fulfillment_date = ${isCompleted ? "NULL" : "DATE_ADD(NOW(), INTERVAL fulfillment_interval_days DAY)"},
+           next_fulfillment_date = ${isCompleted ? "NULL" : "DATE_ADD(next_fulfillment_date, INTERVAL fulfillment_interval_days DAY)"},
            status = ?,
            updated_at = NOW()
        WHERE id = ?`,
@@ -497,4 +513,81 @@ export const runDuePackageFulfillments = async () => {
   }
 
   return { processed: dueIds.length, created };
+};
+
+// FIX (Medium #14 — Phase 3): createPackagePurchaseFromOrder is called
+// fire-and-forget from both trigger paths (paymentController.js's
+// verifyPayment and its payment.captured webhook handler) — if BOTH calls
+// fail for the same order (a transient DB error at the exact moment, or a
+// webhook misconfiguration alongside the async verify-path call also
+// erroring), no package_purchases row is ever created, and nothing ever
+// re-scanned for a paid order containing an is_recurring_package product
+// with no corresponding package_purchases row. Once a row DOES exist,
+// cycle-2+ creation is already resilient (fulfillNextCycle only advances
+// next_fulfillment_date/cycles_created after a successful commit, so a
+// mid-cycle failure just retries on the next daily tick) — this closes the
+// one real unrecoverable gap: the INITIAL row never existing at all.
+//
+// createPackagePurchaseFromOrder is already idempotent (checks
+// origin_order_id first) — safe to call again for an order that already
+// has a row (a no-op) or one that's missing one (creates it).
+const findOrdersMissingPackagePurchase = async (
+  { graceMinutes = 60 } = {},
+  queryFn = query,
+) => {
+  const { rows } = await queryFn(
+    `SELECT DISTINCT o.id
+     FROM orders o
+     INNER JOIN order_items oi ON oi.order_id = o.id
+     INNER JOIN products p ON p.id = oi.product_id
+     LEFT JOIN package_purchases pp ON pp.origin_order_id = o.id
+     WHERE p.is_recurring_package = 1
+       AND o.payment_status = 'paid'
+       AND o.parent_package_id IS NULL
+       AND pp.id IS NULL
+       AND o.created_at <= DATE_SUB(NOW(), INTERVAL ? MINUTE)`,
+    [graceMinutes],
+  );
+  return rows.map((r) => r.id);
+};
+
+/**
+ * Entry point for a daily reconciliation pass: finds paid orders for a
+ * recurring package product with no package_purchases row at all (both
+ * fire-and-forget trigger paths failed), and creates the missing row. A
+ * grace window (default 60 minutes) avoids racing an order whose
+ * fire-and-forget creation call simply hasn't finished yet.
+ */
+export const reconcileMissingPackagePurchases = async ({
+  queryFn = query,
+  createFn = createPackagePurchaseFromOrder,
+  graceMinutes = 60,
+} = {}) => {
+  const orderIds = await findOrdersMissingPackagePurchase({ graceMinutes }, queryFn);
+  if (!orderIds.length) return { checked: 0, created: 0 };
+
+  console.info(
+    `[PACKAGE_RECONCILE] ${orderIds.length} paid package order(s) missing package_purchases — reconciling`,
+  );
+
+  let created = 0;
+  for (const orderId of orderIds) {
+    try {
+      const result = await createFn(orderId);
+      if (result) {
+        created += 1;
+        console.info("[PACKAGE_RECONCILE] Created missing package_purchases row", {
+          orderId,
+          packageId: result.packageId,
+        });
+      }
+    } catch (err) {
+      console.error("[PACKAGE_RECONCILE] Failed to reconcile order", {
+        orderId,
+        message: err?.message || String(err),
+      });
+    }
+  }
+
+  return { checked: orderIds.length, created };
 };

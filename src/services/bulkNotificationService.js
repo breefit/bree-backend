@@ -53,6 +53,19 @@ const getFromAddress = () =>
   process.env.SMTP_USER ||
   "BREE Wellness <no-reply@breewellness.com>";
 
+// RECONSIDERED (Medium #29 — Phase 3): this was initially changed to derive
+// from FRONTEND_URL, but that's deliberately wrong for THIS file —
+// FRONTEND_URL is a multi-purpose, comma-separated CORS allow-list (see
+// app.js: "Always includes localhost origins for local development"), not
+// a single canonical customer-facing domain. bulkNotification.test.js's
+// "bulk quote review URL is canonical and independent of frontend URL
+// lists" test already asserts, deliberately, that a customer-facing
+// WhatsApp/email link must resolve to the real canonical domain no matter
+// what FRONTEND_URL is set to — so a misconfigured or multi-entry
+// FRONTEND_URL (e.g. including a preview/staging/localhost origin) can
+// never leak into a link sent to a real customer. Left hardcoded on
+// purpose; a genuine domain migration updates these two literals directly
+// rather than trusting an env var whose actual job is unrelated (CORS).
 const WEBSITE_URL = "https://www.breefit.in/";
 
 export const buildBulkOrderQuoteReviewUrl = (bulkOrderId) =>
@@ -107,6 +120,7 @@ const COLORS = {
 // ==================================================
 
 const buildHeader = () => {
+  // Kept hardcoded — same reasoning as WEBSITE_URL above.
   const logoUrl = `https://www.breefit.in/images/logo.PNG`;
   return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">

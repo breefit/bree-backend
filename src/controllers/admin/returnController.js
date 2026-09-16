@@ -1,4 +1,4 @@
-import { getClient } from "../../config/database.js";
+import { getClient, query } from "../../config/database.js";
 import { getRazorpay } from "../../config/razorpay.js";
 import { appendStatusHistory } from "../../models/Order.js";
 import { buildDelhiveryShipmentPayload } from "../../utils/delhiveryPayload.js";
@@ -176,6 +176,57 @@ const isPositiveNumber = (value) =>
   value !== null &&
   Number.isFinite(Number(value)) &&
   Number(value) > 0;
+
+// FIX (ISSUE-011): how long a refund_status='processing' claim is trusted
+// as "genuinely in flight" before a later completeRefund call is allowed to
+// reclaim and retry it. Comfortably longer than any real Razorpay API call
+// should ever take — this only matters for the rare case where the server
+// process died between claiming 'processing' and Phase 3 persisting the
+// real outcome (a normal Razorpay error is reverted immediately, not left
+// to this timeout). Mirrors orderStatusNotificationService's
+// STALE_CLAIM_MINUTES pattern.
+const PROCESSING_CLAIM_STALE_MINUTES = 2;
+const isProcessingClaimStale = (updatedAt) =>
+  Boolean(updatedAt) &&
+  Date.now() - new Date(updatedAt).getTime() >
+    PROCESSING_CLAIM_STALE_MINUTES * 60 * 1000;
+
+// FIX (ISSUE-005 — Approve Refund frontend/backend contract mismatch): the
+// admin "Approve Refund" button is a plain confirm modal with no amount
+// field and always PATCHes an empty body, but the backend used to hard-
+// require a positive `refund_amount`, so every real click 400'd and
+// refunds could never be approved through the UI at all. Extracted as a
+// pure function (not left inline in approveRefund) so the actual decision
+// — what amount gets approved, and when a request is rejected outright —
+// has a real, directly-testable behavioral contract instead of only being
+// provable by reading the source.
+// Returns `{ ok: true, amount }` or `{ ok: false, message }`.
+export const resolveApprovedRefundAmount = ({
+  refundAmountProvided,
+  refundAmount,
+  refundableAmount,
+}) => {
+  if (!isPositiveNumber(refundableAmount)) {
+    return { ok: false, message: "This order has no refundable amount on record." };
+  }
+
+  // No amount in the request (the real, normal admin workflow) — default
+  // to a full refund of whatever was actually paid.
+  const amount = refundAmountProvided ? Number(refundAmount) : refundableAmount;
+
+  if (refundAmountProvided && !isPositiveNumber(refundAmount)) {
+    return { ok: false, message: "refund_amount must be a positive number when provided" };
+  }
+
+  if (amount > refundableAmount) {
+    return {
+      ok: false,
+      message: `refund_amount cannot exceed the refundable amount of ₹${refundableAmount}.`,
+    };
+  }
+
+  return { ok: true, amount };
+};
 
 // ──────────────────────────────────────────────────────────────────────────
 // 48-hour return eligibility — the single shared source of truth for this
@@ -1465,8 +1516,13 @@ export const rejectInspection = async (req, res) => {
  * or the razorpay utils/config), so none is invented here; the admin
  * processes the actual refund separately and records it via completeRefund().
  *
- * @param {import('express').Request} req - Expects `orderId` param and
- * `{ refund_amount }` in the body.
+ * @param {import('express').Request} req - Expects `orderId` param and an
+ * OPTIONAL `{ refund_amount }` in the body — omitted (the normal admin
+ * workflow: a plain confirm click, no amount field in the UI) defaults to
+ * the order's full refundable amount; an explicit value is still accepted
+ * for a genuine partial refund, but is never trusted blindly — it must be
+ * a positive number that does not exceed the refundable amount, exactly
+ * like the default.
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
@@ -1479,10 +1535,19 @@ export const approveRefund = async (req, res) => {
       .status(400)
       .json({ success: false, message: "Order ID is required" });
   }
-  if (!isPositiveNumber(refund_amount)) {
+  // FIX (ISSUE-005 — broken frontend/backend contract): the admin "Approve
+  // Refund" button is a plain confirm modal with no amount field
+  // (Orders.js's own comment: "all irreversible, none need extra input")
+  // and always PATCHes an empty body — so this hard-required check meant
+  // refunds could never be approved through the UI at all, only by a
+  // direct API call. refund_amount is now optional; a request that DOES
+  // supply one is still fully validated below, once the order (and its
+  // refundable amount) is loaded.
+  const refundAmountProvided = refund_amount !== undefined && refund_amount !== null;
+  if (refundAmountProvided && !isPositiveNumber(refund_amount)) {
     return res.status(400).json({
       success: false,
-      message: "refund_amount is required and must be a positive number",
+      message: "refund_amount must be a positive number when provided",
     });
   }
 
@@ -1554,17 +1619,23 @@ export const approveRefund = async (req, res) => {
     }
 
     const refundableAmount = Number(order.total ?? order.amount ?? 0);
-    if (Number(refund_amount) > refundableAmount) {
+    const refundResolution = resolveApprovedRefundAmount({
+      refundAmountProvided,
+      refundAmount: refund_amount,
+      refundableAmount,
+    });
+    if (!refundResolution.ok) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
-        message: `refund_amount cannot exceed the refundable amount of ₹${refundableAmount}.`,
+        message: refundResolution.message,
       });
     }
+    const resolvedRefundAmount = refundResolution.amount;
 
     await client.query(
       `UPDATE orders SET refund_status = 'approved', refund_amount = ?, updated_at = NOW() WHERE id = ?`,
-      [Number(refund_amount), orderId],
+      [resolvedRefundAmount, orderId],
     );
 
     const {
@@ -1621,7 +1692,9 @@ export const approveRefund = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const rejectRefund = async (req, res) => {
+// `getClientFn` injectable only for tests, same pattern as completeRefund
+// above — defaults to the real DB pool.
+export const rejectRefund = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
 
   if (!orderId) {
@@ -1630,7 +1703,7 @@ export const rejectRefund = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -1647,11 +1720,27 @@ export const rejectRefund = async (req, res) => {
 
     const order = rows[0];
 
-    if (order.refund_status === "completed") {
+    // FIX (ISSUE-010): this used to block only 'completed'. Once
+    // completeRefund has actually called razorpay.payments.refund()
+    // (refund_status 'processing' or 'initiated'), there is no Razorpay API
+    // to undo that — the money will very likely still reach the customer —
+    // so allowing rejectRefund to proceed anyway produced a real
+    // contradiction: a "Refund Rejected" notification sent to a customer
+    // whose refund was (or would shortly be) actually processed. Only a
+    // refund that has never touched Razorpay, or was explicitly rejected
+    // already, can be rejected now.
+    if (
+      order.refund_status === "completed" ||
+      order.refund_status === "initiated" ||
+      order.refund_status === "processing"
+    ) {
       await client.query("ROLLBACK");
       return res.status(400).json({
         success: false,
-        message: "A completed refund cannot be rejected.",
+        message:
+          order.refund_status === "processing"
+            ? "This refund is currently being processed with Razorpay and cannot be rejected."
+            : `A refund that has already been ${order.refund_status} with Razorpay cannot be rejected.`,
       });
     }
 
@@ -1731,11 +1820,35 @@ export const rejectRefund = async (req, res) => {
  * confirms — there is no refund-status webhook in this codebase to do that
  * automatically, so a later admin visit is what closes the loop.
  *
+ * FIX (ISSUE-011 — TOCTOU double-refund): "approved" -> "create" used to
+ * transition straight from the locked read to releasing the lock, leaving
+ * a real window where two concurrent requests could both observe
+ * "approved" and both call razorpay.payments.refund() for the same
+ * payment. The "create" path now atomically claims an intermediate
+ * refund_status='processing' before releasing the row lock, so a second
+ * concurrent (or merely fast repeated) request sees 'processing' — not
+ * 'approved' — and is refused outright (409) rather than also creating a
+ * refund. Reverted back to 'approved' if the Razorpay call itself fails,
+ * and reclaimable after a short staleness window if the process ever dies
+ * mid-flight, so a real failure never leaves the order permanently stuck.
+ *
  * @param {import('express').Request} req - Expects `orderId` param.
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const completeRefund = async (req, res) => {
+// `deps` is injectable ONLY for tests (default to the real DB pool/
+// Razorpay client) — lets ISSUE-011's concurrency guarantee be exercised
+// against a fake that faithfully models real MySQL `SELECT ... FOR UPDATE`
+// row-locking (a genuine async mutex per order id), which an unlocked fake
+// cannot prove anything about. Mirrors the queryExecutor-injection pattern
+// already used throughout this codebase (paymentController,
+// orderStatusNotificationService) — production always uses the real
+// defaults.
+export const completeRefund = async (
+  req,
+  res,
+  { getClientFn = getClient, queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   const { orderId } = req.params;
 
   if (!orderId) {
@@ -1745,7 +1858,7 @@ export const completeRefund = async (req, res) => {
   }
 
   // ── Phase 1: lock, validate, decide create vs. recheck vs. already-done.
-  const phase1 = await getClient();
+  const phase1 = await getClientFn();
   let order;
   let mode;
   try {
@@ -1770,7 +1883,11 @@ export const completeRefund = async (req, res) => {
     } else if (order.refund_status === "initiated" && order.refund_reference) {
       await phase1.query("COMMIT");
       mode = "recheck";
-    } else if (order.refund_status === "approved") {
+    } else if (
+      order.refund_status === "approved" ||
+      (order.refund_status === "processing" &&
+        isProcessingClaimStale(order.updated_at))
+    ) {
       if (order.payment_status !== "paid" || !order.razorpay_payment_id) {
         await phase1.query("ROLLBACK");
         return res.status(400).json({
@@ -1785,8 +1902,33 @@ export const completeRefund = async (req, res) => {
           message: "No approved refund amount found for this order.",
         });
       }
+      // FIX (ISSUE-011 — TOCTOU double-refund): this row lock is released
+      // (COMMIT, below) before Phase 2 calls Razorpay — by design, so a
+      // slow Razorpay response never holds a DB connection/row lock open.
+      // That used to leave a real gap: two concurrent completeRefund calls
+      // could both read refund_status='approved' here and both go on to
+      // call razorpay.payments.refund() for the same payment. Claiming
+      // 'processing' atomically INSIDE this still-locked transaction closes
+      // that gap — a second request arriving after this COMMIT sees
+      // 'processing', not 'approved', and is refused (below) rather than
+      // also proceeding to Phase 2. Reverted back to 'approved' on a
+      // Razorpay failure (Phase 2's catch, below) so it stays retryable;
+      // reclaimable after a staleness window if a process death ever
+      // leaves it stuck (same class of recovery as
+      // order_status_notifications' stale 'sending' claims).
+      await phase1.query(
+        `UPDATE orders SET refund_status = 'processing', updated_at = NOW() WHERE id = ?`,
+        [orderId],
+      );
       await phase1.query("COMMIT");
       mode = "create";
+    } else if (order.refund_status === "processing") {
+      await phase1.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        message:
+          "This refund is already being processed. Please try again in a moment.",
+      });
     } else {
       await phase1.query("ROLLBACK");
       return res.status(400).json({
@@ -1817,7 +1959,7 @@ export const completeRefund = async (req, res) => {
   }
 
   // ── Phase 2: talk to Razorpay with no DB transaction open. ──────────────
-  const razorpay = getRazorpay();
+  const razorpay = getRazorpayFn();
   let razorpayRefund;
   try {
     if (mode === "create") {
@@ -1843,6 +1985,27 @@ export const completeRefund = async (req, res) => {
       mode,
       error: error?.message || error,
     });
+    // FIX (ISSUE-011): a "create" attempt claimed refund_status='processing'
+    // in Phase 1 — since Razorpay never actually issued a refund here,
+    // revert that claim back to 'approved' so the admin can retry
+    // immediately rather than waiting out the staleness window. Guarded by
+    // `AND refund_status = 'processing'` so this can never clobber a
+    // different outcome (e.g. a concurrent request's own recovery) that
+    // may have already changed the row.
+    if (mode === "create") {
+      try {
+        await queryFn(
+          `UPDATE orders SET refund_status = 'approved', updated_at = NOW()
+           WHERE id = ? AND refund_status = 'processing'`,
+          [orderId],
+        );
+      } catch (revertErr) {
+        log("error", "return.refund_processing_revert_failed", {
+          orderId,
+          error: revertErr?.message || revertErr,
+        });
+      }
+    }
     return res.status(502).json({
       success: false,
       message: "Unable to initiate refund. Please try again.",
@@ -1852,7 +2015,7 @@ export const completeRefund = async (req, res) => {
   const isProcessed = razorpayRefund?.status === "processed";
 
   // ── Phase 3: short transaction to persist the result. ────────────────────
-  const phase3 = await getClient();
+  const phase3 = await getClientFn();
   let updated;
   let didTransition = false;
   try {
@@ -1872,11 +2035,21 @@ export const completeRefund = async (req, res) => {
       const nextStatus = isProcessed ? "completed" : "initiated";
       didTransition = relocked.refund_status !== nextStatus;
 
+      // FIX (Medium #21 — Phase 3): payment_status='refunded' was a
+      // documented enum value never actually written anywhere — a fully
+      // refunded order's payment_status stayed 'paid' forever, with only
+      // refund_status reflecting the refund. Added to this SAME UPDATE
+      // (same transaction, same statement), conditioned on the identical
+      // `isProcessed` boolean already driving refund_status/
+      // refund_completed_at just below — no change to the existing
+      // ISSUE-010/ISSUE-011 double-refund/reject-after-initiated safety
+      // logic above this block.
       await phase3.query(
         `UPDATE orders
          SET refund_status = ?,
              refund_reference = ?,
              refund_completed_at = ${isProcessed ? "NOW()" : "refund_completed_at"},
+             payment_status = ${isProcessed ? "'refunded'" : "payment_status"},
              updated_at = NOW()
          WHERE id = ?`,
         [nextStatus, razorpayRefund.id, orderId],

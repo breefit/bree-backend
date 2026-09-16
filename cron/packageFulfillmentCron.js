@@ -1,5 +1,8 @@
 import cron from "node-cron";
-import { runDuePackageFulfillments } from "../src/services/packageFulfillmentService.js";
+import {
+  runDuePackageFulfillments,
+  reconcileMissingPackagePurchases,
+} from "../src/services/packageFulfillmentService.js";
 
 // Daily, off-peak (3 AM IST). The interval isn't precision-sensitive — a
 // package's next_fulfillment_date is a day-level target, not a minute-level
@@ -19,6 +22,22 @@ export const startPackageFulfillmentCron = () => {
         }
       } catch (error) {
         console.error("[PACKAGE_CRON] Cron run failed", error);
+      }
+
+      // FIX (Medium #14 — Phase 3): see packageFulfillmentService.js's
+      // reconcileMissingPackagePurchases comment — catches the case where
+      // BOTH fire-and-forget creation triggers (verify + webhook) failed
+      // for the same order, which the due-fulfillment pass above can never
+      // discover (it only looks at packages that already have a row).
+      try {
+        const reconcileResult = await reconcileMissingPackagePurchases();
+        if (reconcileResult.created > 0) {
+          console.log(
+            `[PACKAGE_RECONCILE] Created ${reconcileResult.created} missing package_purchases row(s) out of ${reconcileResult.checked} checked`,
+          );
+        }
+      } catch (error) {
+        console.error("[PACKAGE_RECONCILE] Reconciliation run failed", error);
       }
     },
     { timezone: "Asia/Kolkata" },

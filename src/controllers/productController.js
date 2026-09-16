@@ -367,7 +367,8 @@ export const getHomeData = async (req, res) => {
 //
 // The caller (CartDrawer) further filters products already in the cart.
 
-export const getRecommendations = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getRecommendations = async (req, res, { queryFn = query } = {}) => {
   try {
     const prodId = req.params.id;
     const cacheKey = `products:${prodId}:recommendations`;
@@ -378,7 +379,7 @@ export const getRecommendations = async (req, res) => {
     }
 
     // 1. Fetch the source product
-    const { rows: prodRows } = await query(
+    const { rows: prodRows } = await queryFn(
       `
       SELECT id, name, journey_level, show_recommendations, is_subscription
       FROM products
@@ -404,6 +405,53 @@ export const getRecommendations = async (req, res) => {
     // console.log("Current Product:", product.name);
     // console.log("Journey Level:", product.journey_level);
     // console.log("Is Subscription:", product.is_subscription);
+
+    // FIX (ISSUE-019 — admin-managed recommendations had zero customer
+    // effect): product_relations is fully CRUD'd via the admin UI
+    // (ProductRelationsModal — "Recommend"/"Upsell"/"Alternative") and
+    // looked, to anyone using it, like the real control for this exact
+    // feature — but this function never read it at all, only ever used
+    // journey_level. An admin's explicit configuration for a product now
+    // takes priority over the automatic journey_level rules (below) —
+    // including bypassing show_recommendations/is_subscription/
+    // journey_level guard clauses, since an explicit per-product relation
+    // is a deliberate override, not something those blanket defaults
+    // should be able to silently suppress. Falls through to the existing
+    // journey-level logic only when the admin hasn't configured anything
+    // for this product — a single, clearly-owned system: explicit admin
+    // relations win when present, the automatic rule is the default
+    // otherwise. The frontend (CartDrawer) renders a single flat list and
+    // doesn't discriminate by relation_type, so all types are included
+    // together, ordered by admin-assigned weight.
+    const { rows: relationRows } = await queryFn(
+      `SELECT p.id, p.name, p.slug, p.image, p.price, p.mrp, p.quantity,
+              p.is_subscription, p.journey_level, p.is_free_shipping,
+              p.shipping_charge, p.estimated_delivery
+       FROM product_relations pr
+       JOIN products p ON p.id = pr.related_product_id
+       WHERE pr.product_id = ? AND p.is_active = 1
+       ORDER BY pr.weight DESC, p.name ASC`,
+      [product.id],
+    );
+
+    if (relationRows.length > 0) {
+      const adminRecommendations = relationRows.map((prod) => ({
+        id: prod.id,
+        name: prod.name,
+        slug: prod.slug,
+        image: prod.image,
+        price: parseFloat(prod.price),
+        mrp: parseFloat(prod.mrp),
+        quantity: prod.quantity,
+        is_subscription: prod.is_subscription,
+        journey_level: prod.journey_level,
+        is_free_shipping: prod.is_free_shipping,
+        shipping_charge: prod.shipping_charge,
+        estimated_delivery: prod.estimated_delivery,
+      }));
+      cache.set(cacheKey, adminRecommendations, RECOMMENDATIONS_TTL);
+      return res.json(adminRecommendations);
+    }
 
     // 2. Guard clauses — return early with no recommendations
     if (
@@ -436,7 +484,7 @@ export const getRecommendations = async (req, res) => {
 
     // 4. Fetch matching products — dynamic, no hardcoded IDs
     const placeholders = targetLevels.map(() => "?").join(",");
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `
       SELECT
         id,

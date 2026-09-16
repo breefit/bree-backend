@@ -51,18 +51,45 @@ export const getCustomers = async (req, res) => {
 
 // ─── Inquiries ────────────────────────────────────────────────────────────────
 
-export const getInquiries = async (req, res) => {
-  const { page = 1, limit = 20, contacted = "all" } = req.query;
+// FIX (ISSUE-022 — Contact Inquiries search was a no-op): the frontend has
+// always sent a `search` query param, but it was never read here at all —
+// every request returned the same unfiltered (contacted-filtered only)
+// page regardless of what was typed. Matches name/email/phone/message, the
+// same field set ContactInquiries.js's UI actually displays per row.
+// Also parameterizes the `contacted` filter, which previously built the
+// clause via raw string interpolation (`contacted = ${contacted ===
+// "true"}`) — not attacker-reachable in a dangerous way since it only ever
+// resolves to the literal `true`/`false`, but there's no reason for a
+// value that varies per-request to not go through a placeholder like
+// every other filter in this codebase.
+// `queryFn` injectable only for tests (default to the real pool).
+export const getInquiries = async (req, res, { queryFn = query } = {}) => {
+  const { page = 1, limit = 20, contacted = "all", search = "" } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
-  const where =
-    contacted !== "all" ? `WHERE contacted = ${contacted === "true"}` : "";
+  const trimmedSearch = String(search || "").trim();
+
+  const conditions = [];
+  const whereParams = [];
+
+  if (contacted !== "all") {
+    conditions.push(`contacted = ?`);
+    whereParams.push(contacted === "true" ? 1 : 0);
+  }
+
+  if (trimmedSearch) {
+    conditions.push(`(name LIKE ? OR email LIKE ? OR phone LIKE ? OR message LIKE ?)`);
+    const searchTerm = `%${trimmedSearch}%`;
+    whereParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+  }
+
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const [rows, countRes] = await Promise.all([
-    query(
+    queryFn(
       `SELECT * FROM contact_inquiries ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-      [parseInt(limit), offset],
+      [...whereParams, parseInt(limit), offset],
     ),
-    query(`SELECT COUNT(*) AS total FROM contact_inquiries ${where}`),
+    queryFn(`SELECT COUNT(*) AS total FROM contact_inquiries ${where}`, whereParams),
   ]);
 
   res.json({ inquiries: rows.rows, total: countRes.rows[0].total });
@@ -107,14 +134,27 @@ import {
   deleteTestimonialById,
 } from "../../services/testimonialService.js";
 
-export const getAdminTestimonials = async (req, res) => {
+// FIX (ISSUE-023 — capped at 20, no pagination): used to return a bare
+// array with no total count — the admin frontend had no way to build real
+// pagination even if it tried, only ever seeing whatever fit on the first
+// page. Now returns `{ testimonials, total }`, matching the shape
+// Customers/Contact Inquiries already use, plus an optional `search` param
+// (name/role/text).
+export const getAdminTestimonials = async (req, res, { queryFn } = {}) => {
   const status = req.query.status || "all";
   const page = parseInt(req.query.page, 10) || 1;
   const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
   const offset = (page - 1) * limit;
+  const search = req.query.search || "";
 
-  const rows = await fetchAdminTestimonials({ status, limit, offset });
-  res.json(rows);
+  const { rows, total } = await fetchAdminTestimonials({
+    status,
+    limit,
+    offset,
+    search,
+    ...(queryFn ? { queryFn } : {}),
+  });
+  res.json({ testimonials: rows, total });
 };
 
 export const approveTestimonial = async (req, res) => {

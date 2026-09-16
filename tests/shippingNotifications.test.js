@@ -749,10 +749,33 @@ test("REGRESSION FIX: admin updateOrderStatus (single order) suppresses BREE Wha
     fnSource,
     /buildOrderStatusNotificationKey\(\{\s*orderId:\s*updated\.id,\s*status,\s*channel:\s*"whatsapp",/,
   );
-  // Email behavior must be completely untouched by this fix.
+  // Email templates themselves are untouched — same functions, same args.
   assert.match(fnSource, /sendOrderDeliveredEmail\(/);
   assert.match(fnSource, /sendOrderCancelledEmail\(/);
   assert.match(fnSource, /sendOrderStatusUpdateEmail\(/);
+});
+
+// FIX (ISSUE-014 — admin order-status EMAIL notifications were unguarded):
+// the WhatsApp channel above already used the atomic
+// order_status_notifications claim; the email channel was a bare
+// fire-and-forget send with no dedupe at all, so a double-click or a
+// retried admin PATCH could send duplicate "Order Delivered"/"Order
+// Cancelled" emails. Now shares the exact same claim mechanism, keyed on
+// channel "email" instead of "whatsapp".
+test("ISSUE-014: admin updateOrderStatus's email channel is now wrapped in the same atomic claim as WhatsApp, keyed on channel \"email\"", () => {
+  const fnSource = adminOrderControllerSource.slice(
+    adminOrderControllerSource.indexOf("export const updateOrderStatus"),
+    adminOrderControllerSource.indexOf("export const bulkUpdateStatus"),
+  );
+  const emailBlock = fnSource.slice(
+    fnSource.indexOf("if (statusChanged && status !== \"pending_payment\" && recipientEmail)"),
+    fnSource.indexOf("// ===== Added: WhatsApp order status notification"),
+  );
+  assert.match(emailBlock, /sendOrderStatusNotificationOnce\(/);
+  assert.match(
+    emailBlock,
+    /buildOrderStatusNotificationKey\(\{\s*orderId:\s*updated\.id,\s*status,\s*channel:\s*"email",/,
+  );
 });
 
 test("REGRESSION FIX: admin bulkUpdateStatus suppresses BREE WhatsApp for shipped/out_for_delivery (per order) and is now idempotent", () => {
@@ -762,6 +785,57 @@ test("REGRESSION FIX: admin bulkUpdateStatus suppresses BREE WhatsApp for shippe
   assert.match(fnSource, /shouldSendBreeStatusWhatsApp\(status\)/);
   assert.match(fnSource, /sendOrderStatusNotificationOnce\(/);
   assert.match(fnSource, /buildOrderStatusNotificationKey\(/);
+});
+
+test("ISSUE-014: admin bulkUpdateStatus's per-order email channel is also wrapped in the same atomic claim, keyed on channel \"email\"", () => {
+  const fnSource = adminOrderControllerSource.slice(
+    adminOrderControllerSource.indexOf("export const bulkUpdateStatus"),
+  );
+  const emailBlock = fnSource.slice(
+    fnSource.indexOf("Send emails (fire-and-forget"),
+    fnSource.indexOf("// ===== Added: WhatsApp order status notifications (bulk)"),
+  );
+  assert.match(emailBlock, /sendOrderStatusNotificationOnce\(/);
+  assert.match(
+    emailBlock,
+    /buildOrderStatusNotificationKey\(\{\s*orderId:\s*orderItem\.id,\s*status,\s*channel:\s*"email",/,
+  );
+});
+
+test("ISSUE-014: the underlying atomic claim (sendOrderStatusNotificationOnce), driven with the exact key shape admin order-status email now uses, sends exactly once under a concurrent double-click/retry", async () => {
+  const { queryExecutor } = createFakeNotificationsTable();
+  const key = buildOrderStatusNotificationKey({
+    orderId: "order-admin-1",
+    status: "delivered",
+    channel: "email",
+  });
+  let emailSendCalls = 0;
+  const send = async () => {
+    emailSendCalls += 1;
+  };
+
+  const [a, b] = await Promise.all([
+    sendOrderStatusNotificationOnce({
+      notificationKey: key,
+      orderId: "order-admin-1",
+      status: "delivered",
+      channel: "email",
+      send,
+      queryExecutor,
+    }),
+    sendOrderStatusNotificationOnce({
+      notificationKey: key,
+      orderId: "order-admin-1",
+      status: "delivered",
+      channel: "email",
+      send,
+      queryExecutor,
+    }),
+  ]);
+
+  const sentCount = [a, b].filter((r) => r.sent).length;
+  assert.equal(sentCount, 1, "a double-click/retried admin PATCH must send exactly one 'Order Delivered' email");
+  assert.equal(emailSendCalls, 1);
 });
 
 test("no remaining bare/unguarded sendOrderStatusUpdateWhatsApp call exists anywhere in admin/orderController.js", () => {
@@ -792,9 +866,16 @@ test("a full-repo audit of every sendOrderStatusUpdateWhatsApp call site account
   for (const source of [shippingControllerSource, shippingCronSource, adminOrderControllerSource]) {
     assert.match(source, /shouldSendBreeStatusWhatsApp/);
   }
-  // Unaffected: paymentController's "paid" status notification.
+  // Unaffected: paymentController's "paid" status notification still
+  // wires the real sendOrderStatusUpdateWhatsApp implementation — now via
+  // an injectable default parameter (`sendPaidWhatsApp =
+  // sendOrderStatusUpdateWhatsApp`) added by the ISSUE-004 fix so
+  // notifyPaidStatusUpdate's atomic-claim behavior is directly testable
+  // (see paymentIdempotency.test.js's concurrency tests) without touching
+  // a real database — production always uses the real import, unchanged.
   assert.match(paymentControllerSource, /status:\s*"paid",/);
-  assert.match(paymentControllerSource, /sendOrderStatusUpdateWhatsApp\(/);
+  assert.match(paymentControllerSource, /sendPaidWhatsApp = sendOrderStatusUpdateWhatsApp/);
+  assert.match(paymentControllerSource, /sendPaidWhatsApp\(\{/);
   // Unaffected: returnController's return/refund event labels (never
   // literally "shipped"/"out_for_delivery"/"delivered").
   assert.match(returnControllerSource, /sendOrderStatusUpdateWhatsApp\(/);

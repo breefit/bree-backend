@@ -214,9 +214,9 @@ export const getCustomerReminders = async (userId) => {
  * @param {string} orderId - Order ID
  * @returns {Promise<Object|null>} Reminder details or null
  */
-export const getOrderReminder = async (orderId) => {
+export const getOrderReminder = async (orderId, { queryFn = query } = {}) => {
   try {
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `
       SELECT
         id, user_id, reminder_enabled, reminder_time, reminder_price_paid,
@@ -240,9 +240,9 @@ export const getOrderReminder = async (orderId) => {
  * @param {string} reminderId - Reminder ID
  * @returns {Promise<{success: boolean, error?: string}>}
  */
-export const disableReminder = async (reminderId) => {
+export const disableReminder = async (reminderId, { queryFn = query } = {}) => {
   try {
-    await query(
+    await queryFn(
       `UPDATE daily_reminders SET status = 'paused', updated_at = NOW() WHERE id = ?`,
       [reminderId],
     );
@@ -261,9 +261,9 @@ export const disableReminder = async (reminderId) => {
  * @param {string} reminderId - Reminder ID
  * @returns {Promise<{success: boolean, error?: string}>}
  */
-export const enableReminder = async (reminderId) => {
+export const enableReminder = async (reminderId, { queryFn = query } = {}) => {
   try {
-    await query(
+    await queryFn(
       `UPDATE daily_reminders SET status = 'active', updated_at = NOW() WHERE id = ?`,
       [reminderId],
     );
@@ -282,9 +282,9 @@ export const enableReminder = async (reminderId) => {
  * @param {string} reminderId - Reminder ID
  * @returns {Promise<{success: boolean, error?: string}>}
  */
-export const endReminder = async (reminderId) => {
+export const endReminder = async (reminderId, { queryFn = query } = {}) => {
   try {
-    await query(
+    await queryFn(
       `UPDATE daily_reminders SET status = 'ended', updated_at = NOW() WHERE id = ?`,
       [reminderId],
     );
@@ -295,6 +295,39 @@ export const endReminder = async (reminderId) => {
     console.error("[Reminder] Error ending reminder:", error);
     return { success: false, error: error.message };
   }
+};
+
+// FIX (Medium #12 — Phase 3): disableReminder/enableReminder/endReminder
+// above always existed, but nothing in the codebase ever called them —
+// pausing, cancelling, or resuming a subscription left its daily WhatsApp
+// reminder (if the order had one) running/stopped independently of the
+// subscription's own state, since cron/dailyReminderCron.js's eligibility
+// query filters purely on daily_reminders.status, with no join back to the
+// order's subscription_status. These three convenience wrappers (order id
+// in, reminder-lookup + status transition done together) are what
+// subscriptionController.js/admin/subscriptionAdminController.js's
+// pause/cancel/resume handlers now call — a no-op (nothing to do, not an
+// error) when the order never had a reminder to begin with.
+export const pauseReminderForOrder = async (orderId, { queryFn = query } = {}) => {
+  const reminder = await getOrderReminder(orderId, { queryFn });
+  if (!reminder) return { success: true, skipped: true };
+  return disableReminder(reminder.id, { queryFn });
+};
+
+export const endReminderForOrder = async (orderId, { queryFn = query } = {}) => {
+  const reminder = await getOrderReminder(orderId, { queryFn });
+  if (!reminder) return { success: true, skipped: true };
+  return endReminder(reminder.id, { queryFn });
+};
+
+export const resumeReminderForOrder = async (orderId, { queryFn = query } = {}) => {
+  const reminder = await getOrderReminder(orderId, { queryFn });
+  if (!reminder) return { success: true, skipped: true };
+  // Only reactivate a PAUSED reminder — never resurrect one already 'ended'
+  // (a cancelled subscription's reminder must stay ended even if somehow
+  // resumed later) or touch one that's already 'active'.
+  if (reminder.status !== "paused") return { success: true, skipped: true };
+  return enableReminder(reminder.id, { queryFn });
 };
 
 /**
@@ -316,4 +349,7 @@ export default {
   disableReminder,
   enableReminder,
   endReminder,
+  pauseReminderForOrder,
+  endReminderForOrder,
+  resumeReminderForOrder,
 };

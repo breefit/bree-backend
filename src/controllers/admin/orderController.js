@@ -5,6 +5,7 @@ import {
   VALID_PAYMENT_STATUSES,
   normalizeOrderStatus,
   DISPATCH_STATUSES,
+  isValidOrderStepTransition,
 } from "../../constants/orderStatus.js";
 import {
   sendOrderStatusUpdateEmail,
@@ -13,6 +14,7 @@ import {
 } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 import { activateReminderFromDelivery } from "../../services/dailyReminderService.js";
+import { invalidateDashboardCache } from "./dashboardController.js";
 import { shouldSendBreeStatusWhatsApp } from "../shippingController.js";
 import {
   sendOrderStatusNotificationOnce,
@@ -448,17 +450,6 @@ export const updateOrderStatus = async (req, res) => {
     const updates = [];
     const params = [];
 
-    const ORDER_STEPS = [
-      "pending_payment",
-      "paid",
-      "processing",
-      "ready_to_ship",
-      "shipped",
-      "out_for_delivery",
-      "delivered",
-    ];
-    const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
-
     if (status) {
       if (!VALID_ORDER_STATUSES.includes(status)) {
         await client.query("ROLLBACK");
@@ -477,29 +468,17 @@ export const updateOrderStatus = async (req, res) => {
       }
       // ===== End Added =====
 
-      const prevIdx = idxOf(prev);
-      const nextIdx = idxOf(next);
-      if (next === "cancelled") {
-        if (prev === "delivered") {
-          await client.query("ROLLBACK");
+      const transition = isValidOrderStepTransition(prev, next);
+      if (!transition.ok) {
+        await client.query("ROLLBACK");
+        if (transition.reason === "cancel_after_delivered") {
           return res
             .status(400)
             .json({ message: "Cannot cancel a delivered order" });
         }
-      } else if (next === "returned") {
-        if (prev !== "delivered" && prev !== "out_for_delivery") {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            message: `Invalid status transition from ${prev} to ${next}`,
-          });
-        }
-      } else {
-        if (!(nextIdx === prevIdx + 1 || nextIdx === prevIdx)) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            message: `Invalid status transition from ${prev} to ${next}`,
-          });
-        }
+        return res.status(400).json({
+          message: `Invalid status transition from ${prev} to ${next}`,
+        });
       }
 
       updates.push(`order_status = ?`);
@@ -566,6 +545,11 @@ export const updateOrderStatus = async (req, res) => {
 
     await client.query("COMMIT");
 
+    // FIX (Medium #20 — Phase 3): dashboard stats cache was never
+    // invalidated on any order mutation — see dashboardController.js's
+    // invalidateDashboardCache comment.
+    invalidateDashboardCache();
+
     const recipientEmail = updated.contact_email || updated.email;
     const recipientName =
       updated.contact_name || updated.customer_name || "Customer";
@@ -573,38 +557,54 @@ export const updateOrderStatus = async (req, res) => {
       status &&
       normalizeOrderStatus(order.order_status) !== normalizeOrderStatus(status),
     );
+    // FIX (ISSUE-014 — admin order-status email unguarded): the WhatsApp
+    // channel below already used sendOrderStatusNotificationOnce's atomic
+    // order_status_notifications claim; this email channel was a bare
+    // fire-and-forget send with no dedupe at all, so a double-click or a
+    // retried admin PATCH could send duplicate "Order Delivered"/"Order
+    // Cancelled" emails. Now shares the exact same claim table, keyed on
+    // channel "email" instead of "whatsapp" — same key shape used by every
+    // other status notification in the codebase.
     if (statusChanged && status !== "pending_payment" && recipientEmail) {
-      const emailPromise = (() => {
-        if (status === "delivered") {
-          return sendOrderDeliveredEmail({
-            to: recipientEmail,
-            name: recipientName,
-            orderId: updated.id,
-            orderNumber: updated.order_number,
-          });
-        }
+      sendOrderStatusNotificationOnce({
+        notificationKey: buildOrderStatusNotificationKey({
+          orderId: updated.id,
+          status,
+          channel: "email",
+        }),
+        orderId: updated.id,
+        status,
+        channel: "email",
+        send: () => {
+          if (status === "delivered") {
+            return sendOrderDeliveredEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: updated.id,
+              orderNumber: updated.order_number,
+            });
+          }
 
-        if (status === "cancelled") {
-          return sendOrderCancelledEmail({
+          if (status === "cancelled") {
+            return sendOrderCancelledEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: updated.id,
+              orderNumber: updated.order_number,
+              notes,
+            });
+          }
+
+          return sendOrderStatusUpdateEmail({
             to: recipientEmail,
             name: recipientName,
             orderId: updated.id,
             orderNumber: updated.order_number,
+            status,
             notes,
           });
-        }
-
-        return sendOrderStatusUpdateEmail({
-          to: recipientEmail,
-          name: recipientName,
-          orderId: updated.id,
-          orderNumber: updated.order_number,
-          status,
-          notes,
-        });
-      })();
-
-      emailPromise.catch((error) => {
+        },
+      }).catch((error) => {
         console.error("Order status email failed", error);
       });
     }
@@ -756,7 +756,6 @@ export const bulkUpdateStatus = async (req, res) => {
       return res.status(404).json({ message: "No matching orders found" });
     }
 
-    // ─── Diagnostic log ───────────────────────────────────────────────────────
     // Both standard orders (is_subscription=0) and subscription orders
     // (is_subscription=1) share the same order_status fulfillment pipeline:
     //   pending_payment → paid → processing → ready_to_ship → shipped →
@@ -765,48 +764,6 @@ export const bulkUpdateStatus = async (req, res) => {
     // Razorpay subscription lifecycle field and is NOT used here.
     // If a dedicated subscription fulfillment pipeline is ever introduced,
     // add branching here and in updateOrderStatus().
-    // console.log(
-    //   `[bulk-status] Requested status: "${status}" | Order count: ${found.length}`,
-    // );
-    for (const o of found) {
-      const orderType =
-        o.is_subscription && Number(o.is_subscription) === 1
-          ? "subscription"
-          : "standard";
-      const prev = normalizeOrderStatus(o.order_status);
-      const next = normalizeOrderStatus(status);
-
-      const ORDER_STEPS = [
-        "pending_payment",
-        "paid",
-        "processing",
-        "ready_to_ship",
-        "shipped",
-        "out_for_delivery",
-        "delivered",
-      ];
-      const idxOf = (s) => ORDER_STEPS.indexOf(s);
-      const prevIdx = idxOf(prev);
-      const nextIdx = idxOf(next);
-
-      let validationResult;
-      if (next === "cancelled") {
-        validationResult =
-          prev === "delivered"
-            ? "REJECTED (delivered cannot be cancelled)"
-            : "OK";
-      } else {
-        validationResult =
-          nextIdx === prevIdx + 1 || nextIdx === prevIdx
-            ? "OK"
-            : `REJECTED (invalid transition ${prev} → ${next})`;
-      }
-
-      // console.log(
-      //   `[bulk-status] id=${o.id} | order_number=${o.order_number} | type=${orderType} | is_subscription=${o.is_subscription} | order_status=${o.order_status} | subscription_status=${o.subscription_status ?? "n/a"} | requested_status=${status} | validation=${validationResult}`,
-      // );
-    }
-    // ─────────────────────────────────────────────────────────────────────────
 
     // Re-fetch full rows for transition checks, emails, and history
     const { rows: foundFull } = await client.query(
@@ -815,17 +772,6 @@ export const bulkUpdateStatus = async (req, res) => {
     );
 
     // Validate status transitions for every order regardless of type
-    const ORDER_STEPS = [
-      "pending_payment",
-      "paid",
-      "processing",
-      "ready_to_ship",
-      "shipped",
-      "out_for_delivery",
-      "delivered",
-    ];
-    const idxOf = (s) => ORDER_STEPS.indexOf(normalizeOrderStatus(s));
-
     for (const o of foundFull) {
       const prev = normalizeOrderStatus(o.order_status);
       const next = normalizeOrderStatus(status);
@@ -842,30 +788,17 @@ export const bulkUpdateStatus = async (req, res) => {
       }
       // ===== End Added =====
 
-      const prevIdx = idxOf(prev);
-      const nextIdx = idxOf(next);
-
-      if (next === "cancelled") {
-        if (prev === "delivered") {
-          await client.query("ROLLBACK");
+      const transition = isValidOrderStepTransition(prev, next);
+      if (!transition.ok) {
+        await client.query("ROLLBACK");
+        if (transition.reason === "cancel_after_delivered") {
           return res.status(400).json({
             message: `Order ${o.order_number || o.id} cannot be cancelled after delivery`,
           });
         }
-      } else if (next === "returned") {
-        if (prev !== "delivered" && prev !== "out_for_delivery") {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            message: `Invalid transition for order ${o.order_number || o.id} from ${prev} to ${next}`,
-          });
-        }
-      } else {
-        if (!(nextIdx === prevIdx + 1 || nextIdx === prevIdx)) {
-          await client.query("ROLLBACK");
-          return res.status(400).json({
-            message: `Invalid transition for order ${o.order_number || o.id} from ${prev} to ${next}`,
-          });
-        }
+        return res.status(400).json({
+          message: `Invalid transition for order ${o.order_number || o.id} from ${prev} to ${next}`,
+        });
       }
     }
 
@@ -918,6 +851,13 @@ export const bulkUpdateStatus = async (req, res) => {
     );
 
     // Send emails (fire-and-forget, never block the response)
+    // FIX (ISSUE-014 — admin order-status email unguarded): same gap as
+    // updateOrderStatus's single-order path — this bulk email send had no
+    // dedupe at all, so a double-submitted bulk action or a retried PATCH
+    // could send duplicate emails for every order in the batch. Now shares
+    // the same atomic order_status_notifications claim already used for
+    // the WhatsApp block below (and the single-order path), keyed per
+    // order id + status + channel "email".
     if (status !== "pending_payment") {
       const emailPromises = updated.map((orderItem) => {
         if (!changedOrderIds.has(String(orderItem.id))) {
@@ -929,30 +869,42 @@ export const bulkUpdateStatus = async (req, res) => {
           orderItem.contact_name || orderItem.customer_name || "Customer";
         if (!recipientEmail) return Promise.resolve();
 
-        if (status === "delivered") {
-          return sendOrderDeliveredEmail({
-            to: recipientEmail,
-            name: recipientName,
+        return sendOrderStatusNotificationOnce({
+          notificationKey: buildOrderStatusNotificationKey({
             orderId: orderItem.id,
-            orderNumber: orderItem.order_number,
-          });
-        }
-
-        if (status === "cancelled") {
-          return sendOrderCancelledEmail({
-            to: recipientEmail,
-            name: recipientName,
-            orderId: orderItem.id,
-            orderNumber: orderItem.order_number,
-          });
-        }
-
-        return sendOrderStatusUpdateEmail({
-          to: recipientEmail,
-          name: recipientName,
+            status,
+            channel: "email",
+          }),
           orderId: orderItem.id,
-          orderNumber: orderItem.order_number,
           status,
+          channel: "email",
+          send: () => {
+            if (status === "delivered") {
+              return sendOrderDeliveredEmail({
+                to: recipientEmail,
+                name: recipientName,
+                orderId: orderItem.id,
+                orderNumber: orderItem.order_number,
+              });
+            }
+
+            if (status === "cancelled") {
+              return sendOrderCancelledEmail({
+                to: recipientEmail,
+                name: recipientName,
+                orderId: orderItem.id,
+                orderNumber: orderItem.order_number,
+              });
+            }
+
+            return sendOrderStatusUpdateEmail({
+              to: recipientEmail,
+              name: recipientName,
+              orderId: orderItem.id,
+              orderNumber: orderItem.order_number,
+              status,
+            });
+          },
         });
       });
 
@@ -1081,6 +1033,9 @@ export const bulkUpdateStatus = async (req, res) => {
     } catch (e) {
       // ignore socket errors
     }
+
+    // FIX (Medium #20 — Phase 3): see updateOrderStatus's matching comment.
+    invalidateDashboardCache();
 
     res.json({
       success: true,

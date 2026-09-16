@@ -13,6 +13,11 @@ import {
   sendSubscriptionStatusWhatsApp,
   maskMobile,
 } from "../../services/whatsappNotificationService.js";
+import {
+  pauseReminderForOrder,
+  endReminderForOrder,
+  resumeReminderForOrder,
+} from "../../services/dailyReminderService.js";
 
 // FIX (admin actions must not bypass customer notification logic): the
 // customer-facing pause/resume/cancel in subscriptionController.js already
@@ -213,6 +218,102 @@ export const getSubscriptions = async (req, res) => {
   } catch (error) {
     console.error("[ADMIN SUBSCRIPTIONS] Failed to load subscriptions", error);
     res.status(500).json({ message: "Failed to fetch subscriptions" });
+  }
+};
+
+// FIX (ISSUE-012 — admin analytics blind to Model B): everything above
+// this point (getSubscriptions, getSubscriptionAnalytics, upcoming/failed
+// renewals, pause/resume/cancel) is Model A only (`orders.is_subscription
+// = 1`, real Razorpay recurring billing) — untouched by this fix. Model B
+// (`package_purchases` — pay-once, ship-monthly packages) is a distinct,
+// intentional business model, NOT converted to recurring billing here,
+// and has no pause/cancel admin actions yet (a separate, narrower gap —
+// out of scope for this fix). This adds read-only admin VISIBILITY for
+// Model B as its own clearly-separated endpoint/section, rather than
+// merging two genuinely different data shapes (fulfillment cycles vs.
+// billing cycles) into one query.
+//
+// `queryFn` injectable only for tests (default to the real pool).
+export const getPackagePurchases = async (req, res, { queryFn = query } = {}) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const offset = (page - 1) * limit;
+    const search = req.query.search?.trim() || "";
+    const status = req.query.status?.trim() || "";
+
+    const conditions = [];
+    const params = [];
+
+    if (search) {
+      conditions.push(
+        `(pp.package_number LIKE ? OR pp.id LIKE ? OR o.contact_name LIKE ? OR o.contact_email LIKE ? OR p.name LIKE ?)`,
+      );
+      const searchTerm = `%${search}%`;
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+
+    if (status && status !== "all") {
+      conditions.push(`pp.status = ?`);
+      params.push(status);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+    const [rowsResult, totalResult] = await Promise.all([
+      queryFn(
+        `SELECT
+           pp.id,
+           pp.package_number,
+           pp.status,
+           pp.total_cycles,
+           pp.cycles_created,
+           pp.fulfillment_interval_days,
+           pp.next_fulfillment_date,
+           pp.created_at,
+           p.name AS product_name,
+           o.contact_name AS customer_name,
+           o.contact_email AS email,
+           o.contact_phone AS phone,
+           o.order_number AS origin_order_number
+         FROM package_purchases pp
+         JOIN products p ON p.id = pp.product_id
+         JOIN orders o ON o.id = pp.origin_order_id
+         ${where}
+         ORDER BY pp.created_at DESC
+         LIMIT ? OFFSET ?`,
+        [...params, limit, offset],
+      ),
+      queryFn(
+        `SELECT COUNT(*) AS total
+         FROM package_purchases pp
+         JOIN products p ON p.id = pp.product_id
+         JOIN orders o ON o.id = pp.origin_order_id
+         ${where}`,
+        params,
+      ),
+    ]);
+
+    const packages = rowsResult.rows.map((row) => ({
+      id: row.id,
+      packageNumber: row.package_number,
+      status: row.status,
+      product: row.product_name,
+      customerName: row.customer_name,
+      email: row.email,
+      phone: row.phone,
+      originOrderNumber: row.origin_order_number,
+      totalCycles: Number(row.total_cycles || 0),
+      cyclesCreated: Number(row.cycles_created || 0),
+      fulfillmentIntervalDays: Number(row.fulfillment_interval_days || 0),
+      nextFulfillmentDate: row.next_fulfillment_date,
+      startDate: row.created_at,
+    }));
+
+    res.json({ packages, total: totalResult.rows[0]?.total || 0 });
+  } catch (error) {
+    console.error("[ADMIN SUBSCRIPTIONS] Failed to load package purchases (Model B)", error);
+    res.status(500).json({ message: "Failed to fetch package purchases" });
   }
 };
 
@@ -480,10 +581,14 @@ const updateSubscriptionOrder = async ({
   return true;
 };
 
-export const pauseSubscription = async (req, res) => {
+export const pauseSubscription = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   try {
     const { id } = req.params;
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `SELECT o.id, o.razorpay_subscription_id, o.subscription_status,
               o.contact_email, o.contact_name, o.contact_phone,
               p.name AS product_name
@@ -508,7 +613,7 @@ export const pauseSubscription = async (req, res) => {
       });
     }
 
-    const rzp = getRazorpay();
+    const rzp = getRazorpayFn();
     const response = await rzp.subscriptions.pause(
       order.razorpay_subscription_id,
       {
@@ -549,6 +654,15 @@ export const pauseSubscription = async (req, res) => {
         customerName: order.contact_name,
         planName: order.product_name,
       });
+
+      // FIX (Medium #12 — Phase 3): admin pause must stop the reminder
+      // too, matching the customer-facing pause path.
+      pauseReminderForOrder(order.id).catch((err) =>
+        console.error("[ADMIN SUBSCRIPTIONS] Failed to pause daily reminder for order", {
+          orderId: order.id,
+          message: err?.message || String(err),
+        }),
+      );
     }
 
     res.json({ success: true, subscription_status: response.status });
@@ -563,11 +677,15 @@ export const pauseSubscription = async (req, res) => {
   }
 };
 
-export const resumeSubscription = async (req, res) => {
+export const resumeSubscription = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   try {
     const { id } = req.params;
-    const { rows } = await query(
-      `SELECT o.id, o.razorpay_subscription_id,
+    const { rows } = await queryFn(
+      `SELECT o.id, o.razorpay_subscription_id, o.subscription_status,
               o.contact_email, o.contact_name, o.contact_phone,
               p.name AS product_name
        FROM orders o
@@ -582,7 +700,20 @@ export const resumeSubscription = async (req, res) => {
     }
 
     const order = rows[0];
-    const rzp = getRazorpay();
+
+    // LOW-08 fix: mirrors the pre-check admin pauseSubscription already has
+    // for "cancelled" — resume previously went straight to Razorpay for any
+    // subscription regardless of its current status. The DB write below is
+    // still the final authority (expectedSubscriptionStatuses: ["paused"]);
+    // this is only a fast, local rejection so an invalid-state request
+    // never reaches the gateway at all.
+    if (order.subscription_status !== "paused") {
+      return res.status(400).json({
+        message: `Subscription cannot be resumed from its current status ("${order.subscription_status || "unknown"}"). Only a paused subscription can be resumed.`,
+      });
+    }
+
+    const rzp = getRazorpayFn();
     const response = await rzp.subscriptions.resume(
       order.razorpay_subscription_id,
       {
@@ -626,6 +757,15 @@ export const resumeSubscription = async (req, res) => {
         customerName: order.contact_name,
         planName: order.product_name,
       });
+
+      // FIX (Medium #12 — Phase 3): admin resume must re-activate the
+      // reminder too, matching the customer-facing resume path.
+      resumeReminderForOrder(order.id).catch((err) =>
+        console.error("[ADMIN SUBSCRIPTIONS] Failed to resume daily reminder for order", {
+          orderId: order.id,
+          message: err?.message || String(err),
+        }),
+      );
     }
 
     res.json({ success: true, subscription_status: response.status });
@@ -635,13 +775,17 @@ export const resumeSubscription = async (req, res) => {
   }
 };
 
-export const cancelSubscription = async (req, res) => {
+export const cancelSubscription = async (
+  req,
+  res,
+  { queryFn = query, getRazorpayFn = getRazorpay } = {},
+) => {
   try {
     const { id } = req.params;
     const { reason } = req.body;
     const admin = req.admin;
 
-    const { rows } = await query(
+    const { rows } = await queryFn(
       `SELECT o.id, o.razorpay_subscription_id, o.contact_email, o.contact_name,
               o.contact_phone, p.name AS product_name
        FROM orders o
@@ -656,7 +800,7 @@ export const cancelSubscription = async (req, res) => {
     }
 
     const order = rows[0];
-    const rzp = getRazorpay();
+    const rzp = getRazorpayFn();
     const response = await rzp.subscriptions.cancel(
       order.razorpay_subscription_id,
       {
@@ -718,6 +862,18 @@ export const cancelSubscription = async (req, res) => {
         customerName: order.contact_name,
         planName: order.product_name,
       });
+
+      // FIX (Medium #12 — Phase 3): admin cancel must stop the reminder
+      // too, matching the customer-facing cancel path. Cancellation is
+      // requested here (cycle-end, per the comment above) but the
+      // customer shouldn't keep getting daily reminders in the meantime —
+      // same reasoning as ending it immediately on the customer path.
+      endReminderForOrder(order.id).catch((err) =>
+        console.error("[ADMIN SUBSCRIPTIONS] Failed to stop daily reminder for order", {
+          orderId: order.id,
+          message: err?.message || String(err),
+        }),
+      );
     }
 
     res.json({ success: true, subscription_status: response.status });

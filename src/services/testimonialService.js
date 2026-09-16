@@ -44,26 +44,53 @@ export const createTestimonial = async ({
   return rows[0];
 };
 
+// FIX (ISSUE-023 — admin Testimonials capped at 20, no pagination): this
+// used to return a bare array with no total count at all, so the admin
+// frontend had no way to build real pagination even if it wanted to —
+// only ever showing whatever fit on the first page. Now returns
+// `{ rows, total }`, matching the shape Customers/Contact Inquiries
+// already use, and accepts an optional `search` (name/role/text) so the
+// admin list can filter server-side instead of only ever seeing the first
+// page's worth of rows.
+// `queryFn` injectable only for tests (default to the real pool).
 export const getAdminTestimonials = async ({
   status = "all",
   limit = 20,
   offset = 0,
+  search = "",
+  queryFn = query,
 }) => {
-  const whereClause = status !== "all" ? `WHERE status = ?` : "";
+  const conditions = [];
+  const params = [];
 
-  const params = status !== "all" ? [status, limit, offset] : [limit, offset];
+  if (status !== "all") {
+    conditions.push(`status = ?`);
+    params.push(status);
+  }
 
-  const { rows } = await query(
-    `SELECT id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at
-     FROM testimonials
-     ${whereClause}
-     ORDER BY created_at DESC
-     LIMIT ?
-     OFFSET ?`,
-    params,
-  );
+  const trimmedSearch = String(search || "").trim();
+  if (trimmedSearch) {
+    conditions.push(`(name LIKE ? OR role LIKE ? OR text LIKE ?)`);
+    const searchTerm = `%${trimmedSearch}%`;
+    params.push(searchTerm, searchTerm, searchTerm);
+  }
 
-  return rows;
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const [{ rows }, { rows: countRows }] = await Promise.all([
+    queryFn(
+      `SELECT id, user_id, name, role, avatar, text, rating, approved, status, created_at, updated_at
+       FROM testimonials
+       ${whereClause}
+       ORDER BY created_at DESC
+       LIMIT ?
+       OFFSET ?`,
+      [...params, limit, offset],
+    ),
+    queryFn(`SELECT COUNT(*) AS total FROM testimonials ${whereClause}`, params),
+  ]);
+
+  return { rows, total: countRows[0]?.total || 0 };
 };
 
 export const updateTestimonialStatus = async (id, approved, status) => {
