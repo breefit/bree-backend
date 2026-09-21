@@ -19,9 +19,24 @@ import {
   maskMobile,
 } from "../src/services/whatsappNotificationService.js";
 import { activateReminderFromDelivery } from "../src/services/dailyReminderService.js";
+import os from "os";
 
 const TIMEZONE = "Asia/Kolkata";
 const TOLERANCE_MINUTES = 5; // Send within 5 minutes of scheduled time
+
+// FIX (live verification — Issue 2, triple scheduler executions): this cron
+// has no distributed lock (unlike shippingTrackingCron.js's
+// runWithCronLock) — a deliberate, already-audited decision (see
+// tests/cronConcurrencyAudit.test.js job 3): every actual SEND is protected
+// at the database level by claimReminderSendSlot's atomic INSERT IGNORE +
+// conditional UPDATE, backed by UNIQUE KEY unique_reminder_send(reminder_id,
+// send_date) — proven safe under real concurrent callers in
+// tests/dailyReminder.test.js. Logging host+PID on every tick is purely
+// diagnostic: it lets a live log grep instantly tell "one process ticking
+// 3x" (a code bug) apart from "3 separate OS processes each ticking once"
+// (an orphaned/duplicate PM2 process from a redeploy) — it does not gate,
+// delay, or skip any run, so it changes no business/timing behavior.
+const INSTANCE_ID = `${os.hostname()}:${process.pid}`;
 
 /**
  * Gets current date in YYYY-MM-DD format (Asia/Kolkata timezone)
@@ -315,7 +330,9 @@ export const runDailyReminderScheduler = async () => {
   const today = getTodayIST();
   const currentTime = getCurrentTimeIST();
 
-  console.log(`[Reminder Scheduler] Running at ${currentTime} IST (${today})`);
+  console.log(
+    `[Reminder Scheduler] Running at ${currentTime} IST (${today}) | instance=${INSTANCE_ID}`,
+  );
 
   try {
     // Heal any reminder stuck on a delivered order before evaluating
@@ -389,10 +406,14 @@ export const runDailyReminderScheduler = async () => {
         if (!claimed) {
           skipped++;
           console.info(
-            `[DAILY_REMINDER] DUPLICATE_SKIPPED | reminderId=${reminderId} | orderId=${reminder.order_id} | channel=whatsapp`,
+            `[DAILY_REMINDER] DUPLICATE_SKIPPED | reminderId=${reminderId} | orderId=${reminder.order_id} | channel=whatsapp | instance=${INSTANCE_ID}`,
           );
           continue;
         }
+
+        console.info(
+          `[DAILY_REMINDER] CLAIMED | reminderId=${reminderId} | orderId=${reminder.order_id} | instance=${INSTANCE_ID}`,
+        );
 
         // NOTE: safelySendWhatsApp resolves { success: true, result } on
         // success but { success: false, error } (not `result`) on failure —

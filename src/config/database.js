@@ -168,7 +168,26 @@ const convertPlaceholders = (text) => {
     .replace(/\bfalse\b/gi, "0");
 };
 
-const runQuery = async (connection, text, params = []) => {
+// FIX (live verification — webhook idempotency logging): every query error
+// used to be logged at the same "❌ Database Query Error" level, including
+// ER_DUP_ENTRY hits that are the EXPECTED, correct outcome of an
+// atomic idempotency claim (e.g. webhookIdempotencyService.claimWebhookEvent
+// racing UNIQUE(provider, event_id) on purpose — see that file's own
+// comment). That made a working idempotency guard look identical in logs to
+// a genuine, unhandled database failure.
+//
+// `isExpectedError` is an opt-in predicate a caller can pass per-query (via
+// the 4th arg on query()/connection.query()) to say "this specific error
+// shape is a known, handled outcome here, not a bug" — it changes ONLY the
+// log level/verbosity for that one call, never the thrown error or any
+// retry/rollback/transaction behavior. Every existing call site that
+// doesn't pass it keeps today's exact behavior (full "❌ Database Query
+// Error" + SQL + params + stack for every failure), so this cannot mask a
+// real bug anywhere else in the app — only a call site that explicitly
+// opts in for a specific, named error shape gets quieter logging, and only
+// when the thrown error actually matches that shape (anything else still
+// logs loudly, e.g. a genuine outage hitting that same query).
+export const runQuery = async (connection, text, params = [], { isExpectedError } = {}) => {
   const sql = convertPlaceholders(text);
 
   if (connection._released) {
@@ -184,10 +203,18 @@ const runQuery = async (connection, text, params = []) => {
 
     return normalizeResult(raw);
   } catch (err) {
-    console.error("❌ Database Query Error");
-    console.error("SQL:", sql);
-    console.error("Params:", params);
-    console.error(err);
+    if (typeof isExpectedError === "function" && isExpectedError(err)) {
+      console.info("[DB] Expected constraint rejection (handled by caller)", {
+        sql,
+        code: err?.code,
+        message: err?.message,
+      });
+    } else {
+      console.error("❌ Database Query Error");
+      console.error("SQL:", sql);
+      console.error("Params:", params);
+      console.error(err);
+    }
     throw err;
   }
 };
@@ -1781,8 +1808,8 @@ if (!isTestEnv) {
   await ensureCheckoutIdempotencyTable().catch(console.error);
 }
 
-export const query = async (text, params = []) => {
-  return runQuery(pool, text, params);
+export const query = async (text, params = [], options = {}) => {
+  return runQuery(pool, text, params, options);
 };
 
 // FIX (ISSUE-007 — process hangs instead of exiting): pool.end() was never
@@ -1817,8 +1844,8 @@ export const getClient = async () => {
     originalRelease();
   };
 
-  connection.query = async (text, params = []) => {
-    return runQuery(connection, text, params);
+  connection.query = async (text, params = [], options = {}) => {
+    return runQuery(connection, text, params, options);
   };
 
   return connection;

@@ -59,10 +59,20 @@ export const claimWebhookEvent = async ({
   queryFn = query,
 }) => {
   try {
+    // FIX (live verification — webhook duplicate logging): ER_DUP_ENTRY on
+    // this exact INSERT is the expected, correct result of the atomic
+    // idempotency claim (see this function's own doc comment) — not a
+    // database problem. `isExpectedError` tells the shared query logger
+    // (config/database.js) to log this specific, already-classified case
+    // quietly instead of as an unhandled-looking "❌ Database Query Error".
+    // Any OTHER error from this same INSERT (bad connection, unknown
+    // column, etc.) still isn't a duplicate-key error, so it still logs at
+    // full severity and still propagates below exactly as before.
     await queryFn(
       `INSERT INTO webhook_events (id, provider, event_id, event_type, status)
        VALUES (?, ?, ?, ?, 'processing')`,
       [randomUUID(), provider, eventId, eventType],
+      { isExpectedError: isDuplicateKeyError },
     );
     return { claimed: true, alreadyCompleted: false };
   } catch (err) {

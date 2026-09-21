@@ -218,11 +218,23 @@ export const isValidPickupRequestId = (pickupRequestId) =>
 export const shouldRequestPickup = (order) =>
   !isValidPickupRequestId(order?.pickup_request_id);
 
+// FIX (live verification — Schedule Pickup false negative): Delhivery's real
+// /api/cmu/create.json success response only ever returns a `waybill` per
+// package — it does NOT return a `shipment_id`/`id` field (confirmed against
+// the actual production response for order 24bbb460-d437-4ab2-bb4e-
+// 449dddc776c1: AWB 58045510000033 persisted, packing-slip download by AWB
+// succeeded, yet order.shipment_id was never populated because
+// extractDelhiveryShipmentDetails() found no such field to extract).
+// createShipment() already reflects this — it only writes shipment_id when
+// the response actually contains one (`if (shipmentId)` guard) — so
+// requiring BOTH awb_number AND shipment_id here made schedulePickup reject
+// every real shipment with "No AWB/shipment found", even though the AWB is
+// the sole identifier Delhivery's pickup, tracking, label, and cancel APIs
+// all key off (see downloadShippingLabel/cancelShipment/trackShipment in
+// this same file — none of them check shipment_id either). shipment_id is
+// optional bookkeeping metadata, not a precondition for scheduling a pickup.
 export const hasPickupShipmentReference = (order) =>
-  Boolean(
-    String(order?.awb_number || "").trim() &&
-    String(order?.shipment_id || "").trim(),
-  );
+  Boolean(String(order?.awb_number || "").trim());
 
 const getPickupResponseMessage = (pickupResponse) => {
   const messages = [];
@@ -1443,7 +1455,11 @@ export const reconcileShipment = async (req, res) => {
 // warehouse as the pickup location. Optional overrides for
 // expected_package_count, pickup_date, pickup_time can be passed in req.body.
 // ─────────────────────────────────────────────────────────────────────────────
-export const schedulePickup = async (req, res) => {
+export const schedulePickup = async (
+  req,
+  res,
+  { getClientFn = getClient, delhiveryServiceFn = delhiveryService } = {},
+) => {
   const { orderId } = req.params;
 
   if (!orderId) {
@@ -1453,7 +1469,7 @@ export const schedulePickup = async (req, res) => {
     });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
 
   try {
     await client.query("BEGIN");
@@ -1483,11 +1499,31 @@ export const schedulePickup = async (req, res) => {
 
     const order = orderRows[0];
 
+    // ── 1a. Diagnostic: exact DB lookup result driving the next decision.
+    // No PII — order id/number and boolean/id existence only. This is what
+    // makes a false "No AWB/shipment found" traceable straight from logs
+    // instead of requiring a guess (see hasPickupShipmentReference's own
+    // comment for why shipment_id can legitimately be absent).
+    console.info("[SCHEDULE_PICKUP] order loaded", {
+      orderId: order.id,
+      orderNumber: order.order_number,
+      orderStatus: order.order_status,
+      hasAwb: Boolean(String(order.awb_number || "").trim()),
+      hasShipmentId: Boolean(String(order.shipment_id || "").trim()),
+      hasPickupRequestId: isValidPickupRequestId(order.pickup_request_id),
+    });
+
     // ── 2. Validate AWB exists (shipment already created) ───────────────────
     if (!hasPickupShipmentReference(order)) {
       await client.query("ROLLBACK");
       console.warn(
         `[SCHEDULE_PICKUP] No AWB/shipment found for order ${orderId}`,
+        {
+          orderId: order.id,
+          orderNumber: order.order_number,
+          hasAwb: Boolean(String(order.awb_number || "").trim()),
+          hasShipmentId: Boolean(String(order.shipment_id || "").trim()),
+        },
       );
       return res.status(400).json({
         success: false,
@@ -1568,7 +1604,7 @@ export const schedulePickup = async (req, res) => {
     let pickupResponse;
     let pickupAlreadyExists = false;
     try {
-      pickupResponse = await delhiveryService.requestPickup(pickupPayload);
+      pickupResponse = await delhiveryServiceFn.requestPickup(pickupPayload);
     } catch (error) {
       if (isExistingPickupResponse(error)) {
         pickupAlreadyExists = true;
@@ -1670,12 +1706,21 @@ export const schedulePickup = async (req, res) => {
     );
 
     // ── 10. Record status transition ─────────────────────────────────────────
+    // FIX (live verification — transaction consistency): this call was
+    // missing `queryExecutor: client.query`, unlike the equivalent calls in
+    // createShipment/cancelShipment in this same file — it was writing the
+    // history row on a separate pooled connection while the order row was
+    // still locked FOR UPDATE on `client`, outside this transaction's
+    // atomicity. A rollback below this point (none currently exist, but a
+    // future one would) could leave a history row for a pickup that was
+    // never actually committed. Aligned with the other two call sites.
     await appendStatusHistory({
       orderId,
       previousStatus: order.order_status,
       newStatus: order.order_status,
       changedBy: null,
       notes: `${pickupAlreadyExists ? "Existing pickup recovered" : "Pickup scheduled"} with Delhivery. Pickup Request ID: ${pickupRequestId}`,
+      queryExecutor: client.query.bind(client),
     });
 
     await client.query("COMMIT");

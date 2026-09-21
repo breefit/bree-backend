@@ -143,7 +143,12 @@ test("does not call the pickup provider when the order is already scheduled", ()
   assert.equal(shouldRequestPickup({ pickup_request_id: null }), true);
 });
 
-test("requires both the existing AWB and shipment reference", () => {
+// FIX (live verification — Schedule Pickup false negative): Delhivery's real
+// create-shipment response has no shipment_id field, so createShipment()
+// legitimately persists awb_number with shipment_id left NULL. Only AWB is
+// required to schedule a pickup — see hasPickupShipmentReference's own
+// comment in shippingController.js for the full root-cause writeup.
+test("only requires the existing AWB — shipment_id is optional metadata Delhivery doesn't always return", () => {
   assert.equal(
     hasPickupShipmentReference({
       awb_number: "58045510000022",
@@ -155,6 +160,20 @@ test("requires both the existing AWB and shipment reference", () => {
     hasPickupShipmentReference({
       awb_number: "58045510000022",
       shipment_id: null,
+    }),
+    true,
+  );
+  assert.equal(
+    hasPickupShipmentReference({
+      awb_number: null,
+      shipment_id: null,
+    }),
+    false,
+  );
+  assert.equal(
+    hasPickupShipmentReference({
+      awb_number: "   ",
+      shipment_id: "UPL123",
     }),
     false,
   );
