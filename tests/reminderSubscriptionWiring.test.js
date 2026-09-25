@@ -34,6 +34,12 @@ const makeFakeReminderDb = (initialReminders = []) => {
       return { rows: match ? [{ ...match }] : [], rowCount: match ? 1 : 0 };
     }
 
+    // resumeReminderForOrder's approved-return guard — no order rows are
+    // modeled here, so every order reads as having no return.
+    if (normalized === "SELECT return_status FROM orders WHERE id = ? LIMIT 1") {
+      return { rows: [], rowCount: 0 };
+    }
+
     if (normalized === "UPDATE daily_reminders SET status = 'paused', updated_at = NOW() WHERE id = ?") {
       const [id] = params;
       const row = rows.get(id);

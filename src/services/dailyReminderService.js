@@ -327,7 +327,75 @@ export const resumeReminderForOrder = async (orderId, { queryFn = query } = {}) 
   // (a cancelled subscription's reminder must stay ended even if somehow
   // resumed later) or touch one that's already 'active'.
   if (reminder.status !== "paused") return { success: true, skipped: true };
+  // A reminder whose order has an approved return must never be resumed —
+  // covers a reminder paused before the return was approved (e.g. legacy
+  // rows from before approveReturn started stopping reminders).
+  const returnStatus = await getOrderReturnStatus(orderId, { queryFn });
+  if (isReminderBlockedByReturnStatus(returnStatus)) {
+    console.warn("[Reminder] Resume blocked because order return is approved", {
+      orderId,
+      reminderId: reminder.id,
+      returnStatus,
+    });
+    return { success: true, skipped: true, blockedByReturn: true };
+  }
   return enableReminder(reminder.id, { queryFn });
+};
+
+// FIX (daily reminder kept sending after return approval): every
+// orders.return_status value that means a return was APPROVED — approved →
+// reverse_shipment_created → pickup_scheduled → returned, per
+// controllers/admin/returnController.js. NULL (no return) and 'rejected'
+// are the only states in which the order's daily reminder may still send.
+export const REMINDER_BLOCKING_RETURN_STATUSES = Object.freeze([
+  "approved",
+  "reverse_shipment_created",
+  "pickup_scheduled",
+  "returned",
+]);
+
+export const isReminderBlockedByReturnStatus = (returnStatus) =>
+  REMINDER_BLOCKING_RETURN_STATUSES.includes(
+    String(returnStatus || "").trim().toLowerCase(),
+  );
+
+export const getOrderReturnStatus = async (orderId, { queryFn = query } = {}) => {
+  const { rows } = await queryFn(
+    `SELECT return_status FROM orders WHERE id = ? LIMIT 1`,
+    [orderId],
+  );
+  return rows.length ? rows[0].return_status : null;
+};
+
+/**
+ * Permanently stops every not-yet-stopped daily reminder on an order whose
+ * return was approved. Called by returnController.approveReturn INSIDE its
+ * transaction (pass the transaction client's query as queryFn), so the
+ * return approval and the reminder stop commit or roll back together.
+ *
+ * Uses the existing canonical "permanently stopped" representation:
+ * status = 'ended' (same value a cancelled subscription uses, which
+ * resumeReminderForOrder never reactivates) AND reminder_enabled = 0 (which
+ * no code path ever sets back to 1, and which the scheduler, the self-heal
+ * activation, the delivery-activation hooks and the customer order view
+ * all already filter on). Paused reminders are stopped too, so a later
+ * subscription resume cannot bring them back. Idempotent: a second run
+ * matches no rows. Errors propagate so the caller's transaction rolls back.
+ *
+ * @returns {Promise<{stopped: number}>} number of reminder rows changed
+ */
+export const stopRemindersForReturnedOrder = async (
+  orderId,
+  { queryFn = query } = {},
+) => {
+  const result = await queryFn(
+    `UPDATE daily_reminders
+     SET reminder_enabled = 0, status = 'ended', updated_at = NOW()
+     WHERE order_id = ?
+       AND (reminder_enabled = 1 OR status IN ('active', 'paused'))`,
+    [orderId],
+  );
+  return { stopped: Number(result?.rowCount || 0) };
 };
 
 /**
@@ -352,4 +420,7 @@ export default {
   pauseReminderForOrder,
   endReminderForOrder,
   resumeReminderForOrder,
+  isReminderBlockedByReturnStatus,
+  getOrderReturnStatus,
+  stopRemindersForReturnedOrder,
 };

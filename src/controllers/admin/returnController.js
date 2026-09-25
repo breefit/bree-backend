@@ -5,6 +5,7 @@ import { buildDelhiveryShipmentPayload } from "../../utils/delhiveryPayload.js";
 import delhiveryService from "../../services/delhiveryService.js";
 import { sendOrderStatusUpdateEmail } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
+import { stopRemindersForReturnedOrder } from "../../services/dailyReminderService.js";
 import {
   sendOrderStatusNotificationOnce,
   buildOrderStatusNotificationKey,
@@ -448,7 +449,11 @@ export const buildReverseShipmentRoles = (customerAddress, warehouse) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const approveReturn = async (req, res) => {
+export const approveReturn = async (
+  req,
+  res,
+  { getClientFn = getClient } = {},
+) => {
   const { orderId } = req.params;
   const { reason, notes } = req.body;
 
@@ -458,7 +463,7 @@ export const approveReturn = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -516,6 +521,20 @@ export const approveReturn = async (req, res) => {
       [reason || null, notes || null, req.admin?.id || null, orderId],
     );
 
+    // FIX (daily reminder kept sending after return approval): nothing used
+    // to touch daily_reminders here, so an order's paid Daily WhatsApp
+    // Reminder kept sending every day after its return was approved.
+    // Stopped in THIS transaction, while the order row is still locked FOR
+    // UPDATE: the approval and the reminder stop commit (or roll back)
+    // together, and cron/dailyReminderCron.js's per-send guard takes a
+    // shared lock on this same order row — so it either sees the approval
+    // committed and refuses to send, or it is mid-send and this approval
+    // waits for that send to finish. See acquireReminderSendGuard there.
+    const { stopped: remindersStopped } = await stopRemindersForReturnedOrder(
+      orderId,
+      { queryFn: (text, params) => client.query(text, params) },
+    );
+
     const {
       rows: [updated],
     } = await client.query("SELECT * FROM orders WHERE id = ? LIMIT 1", [
@@ -523,6 +542,10 @@ export const approveReturn = async (req, res) => {
     ]);
 
     await client.query("COMMIT");
+
+    if (remindersStopped > 0) {
+      log("info", "return.reminders_stopped", { orderId, remindersStopped });
+    }
 
     // order_status is unchanged by design; previous/new status are recorded
     // identically so the event still appears in the timeline, matching the

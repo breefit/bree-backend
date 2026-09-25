@@ -8,17 +8,22 @@
  * - Current date is >= reminder_start_date and <= reminder_end_date
  * - Current time matches the selected reminder time (within a tolerance window)
  * - No reminder has been sent for this reminder on today's date (idempotency)
+ * - The order has no approved return (re-checked under a lock right before
+ *   each send — see acquireReminderSendGuard)
  *
  * Timezone: Asia/Kolkata (IST)
  */
 
-import { query } from "../src/config/database.js";
+import { query, getClient } from "../src/config/database.js";
 import {
   sendDailyWellnessReminder,
   safelySendWhatsApp,
   maskMobile,
 } from "../src/services/whatsappNotificationService.js";
-import { activateReminderFromDelivery } from "../src/services/dailyReminderService.js";
+import {
+  activateReminderFromDelivery,
+  isReminderBlockedByReturnStatus,
+} from "../src/services/dailyReminderService.js";
 import os from "os";
 
 const TIMEZONE = "Asia/Kolkata";
@@ -212,6 +217,122 @@ export const resolveReminderSendFailure = async (
   );
 };
 
+// FIX (daily reminder kept sending after return approval): the eligibility
+// query above only looks at daily_reminders columns, so a reminder left
+// enabled on an order whose return was approved (legacy rows from before
+// approveReturn stopped reminders, or any other stale data) kept sending.
+// This is the final, authoritative check, taken per reminder immediately
+// before claimReminderSendSlot, on a dedicated transaction connection:
+//
+//   1. SELECT orders.return_status ... LOCK IN SHARE MODE — a shared lock on
+//      the order row, taken BEFORE touching daily_reminders, in the same
+//      order approveReturn locks (orders FOR UPDATE, then daily_reminders),
+//      so the two can never deadlock each other.
+//   2. Re-read the reminder's reminder_enabled/status (latest committed).
+//
+// The shared lock is held until release() — i.e. through the claim, the
+// WhatsApp call and its resolve — so approveReturn's SELECT ... FOR UPDATE
+// on the same order waits for an in-flight send to finish. That makes the
+// two strictly ordered: either this guard runs after the approval has
+// committed (sees an approved return_status / disabled reminder → no send),
+// or the approval commits only after this send has completed. No
+// DAILY_REMINDER can be sent after a return approval commits. Cost: an
+// approval that collides with an in-flight send for the same order waits
+// for that one send (normally well under a second; bounded by the WhatsApp
+// client's timeout/retries, and by innodb_lock_wait_timeout, after which
+// the approval fails cleanly and can be retried).
+//
+// Only the order row is locked — daily_reminders is read without a lock, so
+// the claim/resolve writes to daily_reminder_sends (whose FK check takes a
+// shared lock on the daily_reminders row) never queue behind this guard.
+// Fails closed: any error acquiring the guard means no send this tick.
+//
+// While a guard is held, claim/resolve still run on the shared pool exactly
+// as before (claimReminderSendSlot is untouched), so each guarded send needs
+// two pool connections at once. Ticks are fire-and-forget every minute and
+// can overlap when sends are slow, so the number of guards held at once in
+// this process is capped (MAX_CONCURRENT_GUARDED_SENDS) — enough overlapping
+// ticks each holding a guard while waiting for a pool connection would
+// otherwise exhaust the pool (connectionLimit 10) and hang.
+const MAX_CONCURRENT_GUARDED_SENDS = 2;
+let activeGuardedSends = 0;
+const guardedSendWaiters = [];
+
+const acquireGuardedSendPermit = async () => {
+  if (activeGuardedSends < MAX_CONCURRENT_GUARDED_SENDS) {
+    activeGuardedSends++;
+    return;
+  }
+  // The releasing holder hands its permit straight to the next waiter.
+  await new Promise((resolve) => guardedSendWaiters.push(resolve));
+};
+
+const releaseGuardedSendPermit = () => {
+  const next = guardedSendWaiters.shift();
+  if (next) next();
+  else activeGuardedSends--;
+};
+
+export const acquireReminderSendGuard = async (
+  { reminderId, orderId },
+  { getClientFn = getClient } = {},
+) => {
+  const client = await getClientFn();
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    try {
+      await client.query("COMMIT");
+    } catch {
+      await client.query("ROLLBACK").catch(() => {});
+    } finally {
+      client.release();
+    }
+  };
+
+  try {
+    await client.query("BEGIN");
+
+    const { rows: orderRows } = await client.query(
+      `SELECT return_status FROM orders WHERE id = ? LOCK IN SHARE MODE`,
+      [orderId],
+    );
+    const { rows: reminderRows } = await client.query(
+      `SELECT reminder_enabled, status FROM daily_reminders WHERE id = ?`,
+      [reminderId],
+    );
+
+    const returnStatus = orderRows[0]?.return_status ?? null;
+    const reminderRow = reminderRows[0];
+
+    let reason = null;
+    if (!orderRows.length) {
+      reason = "order_not_found";
+    } else if (isReminderBlockedByReturnStatus(returnStatus)) {
+      reason = "return_approved";
+    } else if (
+      !reminderRow ||
+      Number(reminderRow.reminder_enabled) !== 1 ||
+      reminderRow.status !== "active"
+    ) {
+      reason = "reminder_no_longer_active";
+    }
+
+    if (reason) {
+      await release();
+      return { allowed: false, reason, returnStatus, release };
+    }
+
+    return { allowed: true, reason: null, returnStatus, release };
+  } catch (error) {
+    released = true;
+    await client.query("ROLLBACK").catch(() => {});
+    client.release();
+    throw error;
+  }
+};
+
 /**
  * Self-heals reminders stuck without an activation window.
  *
@@ -396,6 +517,44 @@ export const runDailyReminderScheduler = async () => {
         continue;
       }
 
+      // Final eligibility check under a shared lock on the order row, held
+      // through the claim and the send below (see acquireReminderSendGuard).
+      await acquireGuardedSendPermit();
+      let guard;
+      try {
+        guard = await acquireReminderSendGuard({
+          reminderId,
+          orderId: reminder.order_id,
+        });
+      } catch (error) {
+        releaseGuardedSendPermit();
+        failed++;
+        console.error(
+          `[DAILY_REMINDER] GUARD_FAILED | reminderId=${reminderId} | orderId=${reminder.order_id} | error=${error.message}`,
+        );
+        continue;
+      }
+
+      if (!guard.allowed) {
+        releaseGuardedSendPermit();
+        skipped++;
+        if (guard.reason === "return_approved") {
+          console.warn(
+            "[Reminder Scheduler] Reminder blocked because order return is approved",
+            {
+              orderId: reminder.order_id,
+              reminderId,
+              returnStatus: guard.returnStatus,
+            },
+          );
+        } else {
+          console.info(
+            `[Reminder Scheduler] Skipping reminder ${reminderId} for order ${reminder.order_id}: ${guard.reason}`,
+          );
+        }
+        continue;
+      }
+
       try {
         // Send the WhatsApp reminder
         // Claim the send slot BEFORE calling the provider — this is what
@@ -455,6 +614,12 @@ export const runDailyReminderScheduler = async () => {
         console.error(
           `[DAILY_REMINDER] FAILED | reminderId=${reminderId} | orderId=${reminder.order_id} | error=${error.message}`,
         );
+      } finally {
+        try {
+          await guard.release();
+        } finally {
+          releaseGuardedSendPermit();
+        }
       }
     }
 
