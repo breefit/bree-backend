@@ -142,6 +142,30 @@ const pool = mysql.createPool({
   timezone: "+05:30",
 });
 
+// FIX (return timeline dates 5h30 off — mixed-timezone DATETIME writes):
+// `timezone: "+05:30"` above only tells mysql2 how to convert JS Date
+// values to/from DATETIME strings; it never set the MySQL SESSION
+// time_zone. So NOW()/CURRENT_TIMESTAMP in a pooled query() ran in the
+// MySQL server's own zone (UTC on the production host), while getClient()
+// transaction connections below already ran `SET time_zone = '+05:30'` —
+// e.g. delivered_at (written by the tracking cron via query()) held UTC
+// wall-clock time while return_approved_at (written in a getClient()
+// transaction) held IST, and mysql2 then read BOTH back as +05:30. Every
+// new pooled connection now gets the same session zone as getClient(), so
+// every server-side NOW() is IST wall-clock, matching how mysql2 already
+// reads and writes JS Dates. Per-session only — the MySQL server's global
+// time zone is not touched. DATE values written as 'YYYY-MM-DD' strings
+// (e.g. daily_reminder_sends.send_date) are unaffected.
+pool.on("connection", (connection) => {
+  connection.query("SET time_zone = '+05:30'", (error) => {
+    if (error) {
+      console.error("[DB] Failed to set session time_zone on pooled connection", {
+        message: error?.message || String(error),
+      });
+    }
+  });
+});
+
 const normalizeResult = (result) => {
   if (Array.isArray(result)) {
     const [rows] = result;
@@ -998,7 +1022,7 @@ const ensureCheckoutIdempotencyTable = async () => {
 // alike) failed with "Unknown column" until this ran, and Bulk → Order
 // creation itself failed the same way. Added alongside the pre-existing two
 // so the columns those two statements already depend on actually exist.
-const ensureOrderBulkColumns = async () => {
+export const ensureOrderBulkColumns = async () => {
   try {
     const [dbRows] = await pool.query("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;
@@ -1139,7 +1163,7 @@ const ensureOrderUserIdBackfill = async () => {
 // shippingController.createShipment() reads these only as a fallback when
 // address_id resolves to nothing — every existing address_id-driven order
 // is completely unaffected.
-const ensureOrderShippingAddressColumns = async () => {
+export const ensureOrderShippingAddressColumns = async () => {
   try {
     const [dbRows] = await pool.query("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;
@@ -1252,19 +1276,23 @@ const ensureOrderConfirmationNotificationColumns = async () => {
 // Same idempotent information_schema pattern as every other ensure*()
 // helper in this file — safe to run on every boot, no manual migration
 // step, nothing existing touched or removed.
-const ensureOrderReturnColumns = async () => {
+export const ensureOrderReturnColumns = async () => {
   try {
     const [dbRows] = await pool.query("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;
     if (!currentDb) return;
 
     const [cols] = await pool.query(
-      `SELECT column_name FROM information_schema.columns
+      `SELECT COLUMN_NAME AS column_name FROM information_schema.columns
        WHERE table_schema = ? AND table_name = 'orders'`,
       [currentDb],
     );
 
-    const existing = new Set(cols.map((c) => c.column_name));
+    // MySQL 8+ returns an unaliased information_schema column as
+    // COLUMN_NAME; without the alias above, `existing` came back empty there,
+    // every column was re-added, and the whole ALTER failed with "Duplicate
+    // column" — so no new column could ever be added on MySQL 8+.
+    const existing = new Set(cols.map((c) => c.column_name ?? c.COLUMN_NAME));
     const additions = [];
 
     // The actual delivered timestamp — see ensureDeliveredAtBackfill() below
@@ -1355,6 +1383,36 @@ const ensureOrderReturnColumns = async () => {
       );
     }
 
+    // FIX (return timeline not synchronized with Delhivery): reverse
+    // shipment tracking state, kept entirely separate from the forward
+    // shipment's tracking_status / delhivery_response / order_status — see
+    // services/reverseShipmentTracking.js. reverse_shipment_type is 'rvp'
+    // only for shipments created with Delhivery's documented reverse-pickup
+    // contract (payment_mode "Pickup"); NULL = legacy return shipment
+    // created before that fix (a forward Prepaid shipment), whose tracking
+    // is recorded but never allowed to drive return_status.
+    const reverseTrackingColumns = [
+      ["reverse_shipment_type", "VARCHAR(20) NULL DEFAULT NULL"],
+      ["reverse_shipment_reference", "VARCHAR(100) NULL DEFAULT NULL"],
+      ["reverse_tracking_status", "VARCHAR(40) NULL DEFAULT NULL"],
+      ["reverse_tracking_raw_status", "VARCHAR(120) NULL DEFAULT NULL"],
+      ["reverse_tracking_updated_at", "DATETIME NULL DEFAULT NULL"],
+      ["reverse_pickup_scheduled_at", "DATETIME NULL DEFAULT NULL"],
+      ["reverse_picked_up_at", "DATETIME NULL DEFAULT NULL"],
+      ["reverse_delivered_at", "DATETIME NULL DEFAULT NULL"],
+      ["reverse_delhivery_response", "LONGTEXT NULL DEFAULT NULL"],
+      ["reverse_tracking_failure_count", "INT NOT NULL DEFAULT 0"],
+      // 'delhivery' (DL/DTO reported) | 'manual_override' (admin, with reason)
+      ["returned_source", "VARCHAR(30) NULL DEFAULT NULL"],
+      ["inspection_completed_at", "DATETIME NULL DEFAULT NULL"],
+      ["refund_approved_at", "DATETIME NULL DEFAULT NULL"],
+    ];
+    for (const [column, definition] of reverseTrackingColumns) {
+      if (!existing.has(column)) {
+        additions.push(`ADD COLUMN ${column} ${definition}`);
+      }
+    }
+
     if (additions.length) {
       await pool.query(`ALTER TABLE orders ${additions.join(", ")}`);
       // console.log("✅ Added missing orders return/refund columns");
@@ -1376,7 +1434,7 @@ const ensureOrderReturnColumns = async () => {
 // referencing these columns would fail with "Unknown column" against a
 // database built from mysql-schema.sql + the ensure* chain alone. Same
 // idempotent information_schema pattern as every other ensure* helper.
-const ensureOrderShipmentColumns = async () => {
+export const ensureOrderShipmentColumns = async () => {
   try {
     const [dbRows] = await pool.query("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;
@@ -1579,7 +1637,7 @@ const ensureDeliveredAtBackfill = async () => {
 // hardcoded to 3/6/12). package_fulfillment_interval_days is the gap between
 // cycles (default 30, not hardcoded either). Both are NULL/inert for every
 // normal product. Idempotent information_schema pattern, safe on every boot.
-const ensurePackageProductColumns = async () => {
+export const ensurePackageProductColumns = async () => {
   try {
     const [dbRows] = await pool.query("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;
@@ -1633,7 +1691,7 @@ const ensurePackageProductColumns = async () => {
 // permits unlimited rows with NULL in a unique index, so ordinary orders
 // (parent_package_id IS NULL) never collide with each other or with this
 // constraint.
-const ensurePackageOrderColumns = async () => {
+export const ensurePackageOrderColumns = async () => {
   try {
     const [dbRows] = await pool.query("SELECT DATABASE() AS db");
     const currentDb = dbRows?.[0]?.db;

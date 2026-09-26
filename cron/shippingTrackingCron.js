@@ -22,6 +22,7 @@ import {
   logNotification,
 } from "../src/services/orderStatusNotificationService.js";
 import { runWithCronLock } from "../src/utils/cronLock.js";
+import { syncReverseShipmentTracking } from "../src/services/reverseShipmentTracking.js";
 
 const TERMINAL_STATUSES = ["delivered", "cancelled", "returned"];
 
@@ -402,6 +403,31 @@ export const syncShippingTracking = async () => {
 // is ever scaled horizontally.
 const SHIPPING_CRON_LOCK_NAME = "bree_shipping_tracking_cron";
 
+// FIX (return timeline not synchronized with Delhivery): reverse (return)
+// shipments are tracked by a separate pass with its own logic and its own
+// columns (services/reverseShipmentTracking.js) — the forward pass above
+// only ever selects awb_number and never sees a reverse AWB. Same
+// distributed-lock architecture, separate lock name, so either pass
+// failing or being held elsewhere never blocks the other.
+const REVERSE_TRACKING_CRON_LOCK_NAME = "bree_reverse_tracking_cron";
+
+export const runReverseTrackingTick = async ({ runWithLock = runWithCronLock } = {}) => {
+  try {
+    const result = await runWithLock(REVERSE_TRACKING_CRON_LOCK_NAME, () =>
+      syncReverseShipmentTracking(),
+    );
+    if (!result.ran) {
+      console.log(
+        "[REVERSE_TRACKING] Another instance already holds the lock — skipping this tick",
+      );
+    }
+    return result;
+  } catch (error) {
+    console.error("[REVERSE_TRACKING] Cron run failed", error);
+    return { ran: false, reason: "error" };
+  }
+};
+
 export const startShippingTrackingCron = () => {
   const task = cron.schedule("*/30 * * * *", async () => {
     try {
@@ -414,6 +440,8 @@ export const startShippingTrackingCron = () => {
     } catch (error) {
       console.error("[SHIPPING_CRON] Cron run failed", error);
     }
+
+    await runReverseTrackingTick();
   });
 
   return task;

@@ -1,7 +1,13 @@
 import { getClient, query } from "../../config/database.js";
 import { getRazorpay } from "../../config/razorpay.js";
 import { appendStatusHistory } from "../../models/Order.js";
-import { buildDelhiveryShipmentPayload } from "../../utils/delhiveryPayload.js";
+import { buildDelhiveryReverseShipmentPayload } from "../../utils/delhiveryPayload.js";
+import {
+  RETURN_STATUS,
+  REVERSE_SHIPMENT_TYPE_RVP,
+  REVERSE_TRACKING_STATUS,
+  RETURNED_SOURCE,
+} from "../../constants/returnStatus.js";
 import delhiveryService from "../../services/delhiveryService.js";
 import { sendOrderStatusUpdateEmail } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
@@ -14,7 +20,6 @@ import {
   getWarehouseConfig,
   validateShippingAddress,
   validateWarehouseConfig,
-  buildPickupRequestPayload,
   extractDelhiveryShipmentDetails,
 } from "../shippingController.js";
 
@@ -113,7 +118,7 @@ export const slugifyReturnEventLabel = (label) =>
 // exactly-once guarantee independent of the state-machine guards, and a
 // real "failed" record (with the provider error) instead of only a
 // console log line.
-const notifyReturnEvent = (order, label, notes) => {
+export const notifyReturnEvent = (order, label, notes) => {
   const recipientEmail = order.contact_email || order.email;
   const recipientPhone = order.contact_phone || order.mobile_number;
   const recipientName = order.contact_name || order.customer_name || "Customer";
@@ -384,55 +389,6 @@ export const resolveCustomerAddressWithFallback = async (client, order) => {
   return null;
 };
 
-// ──────────────────────────────────────────────────────────────────────────
-// Maps the customer's address and our warehouse into the *swapped* address
-// roles required to model a reverse-pickup shipment on top of the existing
-// forward-shipment payload builder (buildDelhiveryShipmentPayload).
-//
-// buildDelhiveryShipmentPayload always treats its `shippingAddress` argument
-// as the delivery destination (consignee) and its `warehouse` argument as
-// the origin/seller + RTO-fallback address. A reverse shipment inverts the
-// physical flow — Delhivery picks up FROM the customer and delivers TO our
-// warehouse — so swapping which real-world party is passed into each
-// argument reuses the exact same, already-tested payload construction and
-// the same delhiveryService.createShipment() call, with no new fields.
-//
-// ASSUMPTION FLAGGED: this project has no existing integration with
-// Delhivery's dedicated reverse-pickup contract (e.g. an `is_reversed`
-// flag, a separately registered reverse pickup_location, or reverse-
-// specific invoicing rules) — none of that exists anywhere in this
-// codebase today. This mapping is a best-effort adaptation of the forward
-// flow and should be validated against Delhivery's reverse-logistics
-// docs/sandbox before relying on it in production.
-// ──────────────────────────────────────────────────────────────────────────
-export const buildReverseShipmentRoles = (customerAddress, warehouse) => {
-  const destinationAddress = {
-    full_name: warehouse.name,
-    mobile: warehouse.phone,
-    address_line_1: warehouse.address,
-    address_line_2: "",
-    city: warehouse.city,
-    state: warehouse.state,
-    pincode: warehouse.pincode,
-    country: warehouse.country || "India",
-  };
-
-  const originAsWarehouse = {
-    name: customerAddress.full_name,
-    address: [customerAddress.address_line_1, customerAddress.address_line_2]
-      .filter(Boolean)
-      .join(", "),
-    city: customerAddress.city,
-    state: customerAddress.state,
-    pincode: customerAddress.pincode,
-    country: customerAddress.country || "India",
-    phone: customerAddress.mobile,
-    gst: "",
-  };
-
-  return { destinationAddress, originAsWarehouse };
-};
-
 // ==========================================================================
 // 1. Approve Return
 // ==========================================================================
@@ -701,8 +657,9 @@ export const rejectReturn = async (req, res) => {
  *
  * Creates a reverse-pickup Delhivery shipment for an approved return —
  * pickup at the customer's address, delivery to our warehouse — by reusing
- * delhiveryService.createShipment() and buildDelhiveryShipmentPayload()
- * with swapped address roles (see buildReverseShipmentRoles() above).
+ * delhiveryService.createShipment() with Delhivery's reverse-pickup
+ * ("RVP", payment_mode "Pickup") payload — see
+ * buildDelhiveryReverseShipmentPayload() in utils/delhiveryPayload.js.
  *
  * @param {import('express').Request} req - Expects `orderId` param.
  * @param {import('express').Response} res
@@ -740,8 +697,17 @@ export const createReverseShipment = async (req, res) => {
     // return_status had already moved to "reverse_shipment_created" —
     // confusing, and not what "repeated clicks must not create a duplicate
     // shipment" requires. Recognize this exact case and hand back the
-    // shipment that already exists instead of erroring.
-    if (order.return_status === "reverse_shipment_created") {
+    // shipment that already exists instead of erroring. Covers every later
+    // state too (pickup scheduled / returned by Delhivery tracking) — a
+    // return shipment is created at most once per order.
+    if (
+      order.reverse_awb &&
+      [
+        RETURN_STATUS.REVERSE_SHIPMENT_CREATED,
+        RETURN_STATUS.PICKUP_SCHEDULED,
+        RETURN_STATUS.RETURNED,
+      ].includes(order.return_status)
+    ) {
       await client.query("ROLLBACK");
       return res.status(200).json({
         success: true,
@@ -797,10 +763,15 @@ export const createReverseShipment = async (req, res) => {
       });
     }
 
+    // Same item/pack lookup as the forward shipment (shippingController
+    // createShipment) so the reverse parcel's weight resolves identically.
     const { rows: items } = await client.query(
-      `SELECT id, product_id, product_name, product_price, quantity
-       FROM order_items
-       WHERE order_id = ?`,
+      `SELECT oi.id, oi.product_id, oi.product_name, oi.product_price, oi.quantity,
+              p.quantity AS pack_bottle_count,
+              p.is_recurring_package
+       FROM order_items oi
+       LEFT JOIN products p ON p.id = oi.product_id
+       WHERE oi.order_id = ?`,
       [orderId],
     );
     if (!items.length) {
@@ -820,25 +791,22 @@ export const createReverseShipment = async (req, res) => {
       });
     }
 
-    const { destinationAddress, originAsWarehouse } = buildReverseShipmentRoles(
-      customerAddress,
-      warehouse,
-    );
-    originAsWarehouse.pickupLocation = warehouse.pickupLocation;
-
+    // FIX (return shipment was a BREE → BREE forward shipment): Delhivery
+    // reverse-pickup contract — customer = consignee/pickup point,
+    // payment_mode "Pickup", BREE warehouse = destination, and a
+    // reverse-specific order reference ("<order_number>-RETURN") so it
+    // never collides with the forward shipment's order id. A retry after a
+    // lost response reuses the same reference, which Delhivery rejects as
+    // an already-manifested order instead of creating a second shipment.
     let payload;
+    let reverseReference;
     try {
-      payload = buildDelhiveryShipmentPayload({
-        order: { ...order, payment_method: "Prepaid" }, // reverse shipments are never COD
-        customer: {
-          name: customerAddress.full_name,
-          email: order.contact_email,
-          phone: customerAddress.mobile,
-        },
-        shippingAddress: destinationAddress,
+      ({ payload, reference: reverseReference } = buildDelhiveryReverseShipmentPayload({
+        order,
+        customerAddress,
         items,
-        warehouse: originAsWarehouse,
-      });
+        warehouse,
+      }));
     } catch (error) {
       await client.query("ROLLBACK");
       return res.status(400).json({
@@ -846,18 +814,6 @@ export const createReverseShipment = async (req, res) => {
         message: `Failed to build reverse shipment payload: ${error.message}`,
       });
     }
-
-    // console.log("Warehouse Config:", {
-    //   name: originAsWarehouse.name,
-    //   address: originAsWarehouse.address,
-    //   city: originAsWarehouse.city,
-    //   state: originAsWarehouse.state,
-    //   pincode: originAsWarehouse.pincode,
-    //   phone: originAsWarehouse.phone,
-    //   gst: originAsWarehouse.gst,
-    // });
-    // console.log("Pickup Location Sent:", payload.pickup_location);
-    // console.log("Seller Name Sent:", payload.shipments?.[0]?.seller_name);
 
     let delhiveryResponse;
     try {
@@ -903,10 +859,12 @@ export const createReverseShipment = async (req, res) => {
        SET reverse_awb = ?,
            reverse_tracking_url = ?,
            reverse_shipment_created_at = NOW(),
+           reverse_shipment_type = ?,
+           reverse_shipment_reference = ?,
            return_status = 'reverse_shipment_created',
            updated_at = NOW()
        WHERE id = ?`,
-      [awbNumber, trackingUrl, orderId],
+      [awbNumber, trackingUrl, REVERSE_SHIPMENT_TYPE_RVP, reverseReference, orderId],
     );
 
     const {
@@ -922,7 +880,7 @@ export const createReverseShipment = async (req, res) => {
       previousStatus: order.order_status,
       newStatus: order.order_status,
       changedBy: req.admin?.id || null,
-      notes: `Reverse shipment created with Delhivery. AWB: ${awbNumber}`,
+      notes: `Reverse pickup (customer → BREE) created with Delhivery. AWB: ${awbNumber}. Reference: ${reverseReference}. Delhivery schedules the pickup automatically.`,
     }).catch((error) => {
       log("error", "return.history_failed", {
         orderId,
@@ -960,15 +918,23 @@ export const createReverseShipment = async (req, res) => {
 /**
  * PATCH /api/admin/orders/:orderId/return/schedule-pickup
  *
- * Requests a Delhivery courier pickup run for an already-created reverse
- * shipment, reusing delhiveryService.requestPickup() and
- * buildPickupRequestPayload() exactly as shippingController.schedulePickup()
- * does for forward shipments.
+ * FIX (pickup request was a BREE-warehouse pickup, not a customer pickup):
+ * this used to call Delhivery's pickup-request API (/fm/request/new/) with
+ * BREE's own registered warehouse, a date and a package count — the API
+ * that asks Delhivery to collect FORWARD parcels from BREE. It carried no
+ * AWB and no customer address, so it could never represent CUSTOMER → BREE.
+ * Delhivery's FAQ: "Reverse shipment will be scheduled automatically so
+ * there is no requirement to create pickup requests for those."
  *
- * @param {import('express').Request} req - Expects `orderId` param and
- * optional `{ expected_package_count, pickup_date, pickup_time }` overrides.
+ * It no longer calls Delhivery at all. Pickup scheduling for a return is
+ * now observed from Delhivery's reverse tracking (PP/Scheduled and later —
+ * see services/reverseShipmentTracking.js). Kept as an endpoint so an
+ * older admin page gets a clear answer instead of a 404; an order whose
+ * pickup is already scheduled still gets the idempotent 200.
+ *
+ * @param {import('express').Request} req - Expects `orderId` param.
  * @param {import('express').Response} res
- * @returns {Promise<void>} JSON `{ success, message, order, delhivery }` on success.
+ * @returns {Promise<void>} JSON `{ success, message, order }`.
  */
 export const scheduleReversePickup = async (req, res) => {
   const { orderId } = req.params;
@@ -987,8 +953,8 @@ export const scheduleReversePickup = async (req, res) => {
       "SELECT * FROM orders WHERE id = ? FOR UPDATE",
       [orderId],
     );
+    await client.query("ROLLBACK");
     if (!rows.length) {
-      await client.query("ROLLBACK");
       return res
         .status(404)
         .json({ success: false, message: "Order not found" });
@@ -996,168 +962,37 @@ export const scheduleReversePickup = async (req, res) => {
 
     const order = rows[0];
 
-    // FIX (return flow audit — misleading repeat-click error): the
-    // "already scheduled" branch below this one used to be unreachable in
-    // practice — return_status and reverse_pickup_request_id are always
-    // written together in the same UPDATE (below), so by the time a
-    // repeated click got here, return_status had already moved to
-    // "pickup_scheduled" and always failed the OLD version of this first
-    // guard instead, with the confusing message "A reverse shipment must
-    // exist before scheduling pickup" for a pickup that, in fact, already
-    // exists. Checking the idempotent case first — matching the exact
-    // pattern createReverseShipment() already uses for its own repeat-
-    // click case — makes a second "Schedule Reverse Pickup" click return
-    // the existing pickup request with a 200, not a misleading error.
-    if (order.return_status === "pickup_scheduled") {
-      await client.query("ROLLBACK");
+    if (order.return_status === RETURN_STATUS.PICKUP_SCHEDULED) {
       return res.status(200).json({
         success: true,
         message: "A reverse pickup has already been scheduled for this order.",
         order,
-        delhivery: { pickupRequestId: order.reverse_pickup_request_id },
       });
     }
 
-    if (
-      order.return_status !== "reverse_shipment_created" ||
-      !order.reverse_awb
-    ) {
-      await client.query("ROLLBACK");
+    if (order.return_status !== RETURN_STATUS.REVERSE_SHIPMENT_CREATED || !order.reverse_awb) {
       return res.status(400).json({
         success: false,
-        message: `A reverse shipment must exist before scheduling pickup. Current return status is "${order.return_status || "none"}".`,
+        message: `A reverse shipment must exist before a pickup can be scheduled. Current return status is "${order.return_status || "none"}".`,
       });
     }
 
-    // Defense-in-depth only — return_status and reverse_pickup_request_id
-    // are always written together below, so this should be unreachable
-    // given the guard above, but a stale/manually-edited row shouldn't be
-    // able to trigger a second Delhivery pickup request either way.
-    if (order.reverse_pickup_request_id) {
-      await client.query("ROLLBACK");
-      return res.status(200).json({
-        success: true,
-        message: "A reverse pickup has already been scheduled for this order.",
-        order,
-        delhivery: { pickupRequestId: order.reverse_pickup_request_id },
-      });
-    }
-
-    const { rows: itemCountRows } = await client.query(
-      `SELECT COALESCE(SUM(quantity), 1) AS total_quantity
-       FROM order_items
-       WHERE order_id = ?`,
-      [orderId],
-    );
-    const expectedPackageCount = Number(itemCountRows[0]?.total_quantity) || 1;
-
-    const warehouse = getWarehouseConfig();
-    const pickupPayload = buildPickupRequestPayload(
-      warehouse,
-      {
-        expected_package_count: req.body?.expected_package_count,
-        pickup_date: req.body?.pickup_date,
-        pickup_time: req.body?.pickup_time,
-      },
-      expectedPackageCount,
-    );
-
-    let pickupResponse;
-    try {
-      pickupResponse = await delhiveryService.requestPickup(pickupPayload);
-    } catch (error) {
-      await client.query("ROLLBACK");
-      log("error", "return.pickup_delhivery_error", {
-        orderId,
-        error: error?.message || error,
-      });
-      return res.status(500).json({
-        success: false,
-        message: "Failed to schedule reverse pickup with Delhivery",
-        error: error.message || error,
-      });
-    }
-
-    if (!pickupResponse || pickupResponse.success === false) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        success: false,
-        message: pickupResponse?.message || "Delhivery API returned an error",
-        delhiveryError: pickupResponse,
-      });
-    }
-
-    // Same extraction shape as shippingController.schedulePickup() — not
-    // factored into a shared helper there, so duplicated here.
-    const pickupRequestId =
-      pickupResponse.pickup_id ||
-      pickupResponse.request_id ||
-      pickupResponse.pickup_request_id ||
-      pickupResponse.pickup_request_ids?.[0] ||
-      pickupResponse.data?.pickup_id ||
-      pickupResponse.data?.request_id ||
-      pickupResponse.data?.pickup_request_id ||
-      pickupResponse.data?.pickup_request_ids?.[0] ||
-      null;
-
-    if (!pickupRequestId) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        success: false,
-        message: "Delhivery response did not include a pickup request ID",
-        delhiveryResponse: pickupResponse,
-      });
-    }
-
-    await client.query(
-      `UPDATE orders
-       SET reverse_pickup_request_id = ?,
-           return_status = 'pickup_scheduled',
-           updated_at = NOW()
-       WHERE id = ?`,
-      [pickupRequestId, orderId],
-    );
-
-    const {
-      rows: [updated],
-    } = await client.query("SELECT * FROM orders WHERE id = ? LIMIT 1", [
-      orderId,
-    ]);
-
-    await client.query("COMMIT");
-
-    appendStatusHistory({
-      orderId,
-      previousStatus: order.order_status,
-      newStatus: order.order_status,
-      changedBy: req.admin?.id || null,
-      notes: `Reverse pickup scheduled with Delhivery. Pickup Request ID: ${pickupRequestId}`,
-    }).catch((error) => {
-      log("error", "return.history_failed", {
-        orderId,
-        error: error?.message || error,
-      });
-    });
-
-    emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Pickup Scheduled", null);
-
-    log("info", "return.pickup_scheduled", { orderId, pickupRequestId });
-    res.json({
-      success: true,
-      message: "Reverse pickup scheduled successfully",
-      order: updated,
-      delhivery: { pickupRequestId },
+    return res.status(409).json({
+      success: false,
+      code: "REVERSE_PICKUP_AUTO_SCHEDULED",
+      message:
+        "Delhivery schedules reverse pickups automatically once the return shipment is created — no pickup request is sent. Pickup progress updates from Delhivery tracking.",
+      order,
     });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK").catch(() => {});
     log("error", "return.schedule_pickup_failed", {
       orderId,
       error: err?.message || err,
     });
     res
       .status(500)
-      .json({ success: false, message: "Failed to schedule reverse pickup" });
+      .json({ success: false, message: "Failed to check reverse pickup" });
   } finally {
     client.release();
   }
@@ -1171,14 +1006,26 @@ export const scheduleReversePickup = async (req, res) => {
  *
  * Marks a return as physically received back at the warehouse.
  *
+ * FIX (Mark Returned bypassed Delhivery entirely): normally a return
+ * becomes "returned" automatically when Delhivery reports the reverse
+ * pickup DL/DTO ("accepted by client and POD is received") — see
+ * services/reverseShipmentTracking.js. This endpoint now only succeeds
+ * without further input when Delhivery has already confirmed that for an
+ * RVP shipment. Otherwise it is an explicit, audited MANUAL OVERRIDE and
+ * requires `{ override: true, reason, notes }`; the override and the
+ * Delhivery status at that moment are recorded in order_status_history
+ * and orders.returned_source = 'manual_override'. Reverse tracking keeps
+ * running afterwards (so a later DL/DTO is still recorded), and nothing
+ * here touches the stored Delhivery tracking state.
+ *
  * @param {import('express').Request} req - Expects `orderId` param and
- * optional `{ notes }` in the body.
+ * `{ notes }`, or `{ override: true, reason, notes }` for a manual override.
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
 export const markReturned = async (req, res) => {
   const { orderId } = req.params;
-  const { notes } = req.body;
+  const { notes, override, reason } = req.body || {};
 
   if (!orderId) {
     return res
@@ -1230,14 +1077,37 @@ export const markReturned = async (req, res) => {
     // frontend but never written; inspection_status starts "pending" here —
     // this is the point the QC step becomes available, matching "After:
     // return_status = returned, Admin should see Quality Check".
+    const delhiveryConfirmed =
+      order.reverse_shipment_type === REVERSE_SHIPMENT_TYPE_RVP &&
+      order.reverse_tracking_status === REVERSE_TRACKING_STATUS.DELIVERED_TO_BREE;
+    const isOverride = !delhiveryConfirmed;
+    const overrideReason = typeof reason === "string" ? reason.trim() : "";
+    const overrideNotes = typeof notes === "string" ? notes.trim() : "";
+
+    if (isOverride && (override !== true || !overrideReason || !overrideNotes)) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        success: false,
+        code: "DELHIVERY_RECEIPT_NOT_CONFIRMED",
+        message: `Delhivery has not confirmed that this return reached BREE (current reverse status: ${
+          order.reverse_tracking_raw_status || "not yet reported"
+        }). To record receipt anyway, submit a manual override with a reason and notes.`,
+      });
+    }
+
+    const returnedSource = isOverride
+      ? RETURNED_SOURCE.MANUAL_OVERRIDE
+      : RETURNED_SOURCE.DELHIVERY;
+
     await client.query(
       `UPDATE orders
        SET return_status = 'returned',
            returned_at = NOW(),
+           returned_source = ?,
            inspection_status = 'pending',
            updated_at = NOW()
        WHERE id = ?`,
-      [orderId],
+      [returnedSource, orderId],
     );
 
     const {
@@ -1253,7 +1123,11 @@ export const markReturned = async (req, res) => {
       previousStatus: order.order_status,
       newStatus: order.order_status,
       changedBy: req.admin?.id || null,
-      notes: notes || "Returned item received at warehouse.",
+      notes: isOverride
+        ? `MANUAL OVERRIDE — marked returned without Delhivery delivery confirmation. Reason: ${overrideReason}. Notes: ${overrideNotes}. Delhivery reverse status at override: ${
+            order.reverse_tracking_raw_status || "not reported"
+          }.`
+        : overrideNotes || "Returned item received at warehouse (Delhivery DL/DTO confirmed).",
     }).catch((error) => {
       log("error", "return.history_failed", {
         orderId,
@@ -1264,7 +1138,11 @@ export const markReturned = async (req, res) => {
     emitOrderUpdated(req, updated);
     notifyReturnEvent(updated, "Return Received", notes);
 
-    log("info", "return.marked_returned", { orderId });
+    log("info", "return.marked_returned", {
+      orderId,
+      returnedSource,
+      delhiveryStatus: order.reverse_tracking_raw_status || null,
+    });
     res.json({
       success: true,
       message: "Order marked as returned",
@@ -1362,7 +1240,7 @@ export const approveInspection = async (req, res) => {
     }
 
     await client.query(
-      `UPDATE orders SET inspection_status = 'approved', updated_at = NOW() WHERE id = ?`,
+      `UPDATE orders SET inspection_status = 'approved', inspection_completed_at = NOW(), updated_at = NOW() WHERE id = ?`,
       [orderId],
     );
 
@@ -1475,7 +1353,7 @@ export const rejectInspection = async (req, res) => {
 
     await client.query(
       `UPDATE orders
-       SET inspection_status = 'rejected', updated_at = NOW()
+       SET inspection_status = 'rejected', inspection_completed_at = NOW(), updated_at = NOW()
        WHERE id = ?`,
       [orderId],
     );
@@ -1657,7 +1535,7 @@ export const approveRefund = async (req, res) => {
     const resolvedRefundAmount = refundResolution.amount;
 
     await client.query(
-      `UPDATE orders SET refund_status = 'approved', refund_amount = ?, updated_at = NOW() WHERE id = ?`,
+      `UPDATE orders SET refund_status = 'approved', refund_amount = ?, refund_approved_at = NOW(), updated_at = NOW() WHERE id = ?`,
       [resolvedRefundAmount, orderId],
     );
 

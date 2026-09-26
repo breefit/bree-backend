@@ -520,11 +520,11 @@ test("scheduler: a claim still fresh (well within the staleness window) is NOT r
   assert.equal(claim.claimed, false);
 });
 
-test("isWithinReminderTimeWindow: matches within tolerance, rejects outside it", () => {
+test("isWithinReminderTimeWindow: due from the configured minute up to 5 min late, never early", () => {
   assert.equal(isWithinReminderTimeWindow("05:30", "05:30"), true);
-  assert.equal(isWithinReminderTimeWindow("05:30", "05:34"), true); // 4 min, within 5
-  assert.equal(isWithinReminderTimeWindow("05:30", "05:26"), true); // 4 min early
-  assert.equal(isWithinReminderTimeWindow("05:30", "05:36"), false); // 6 min, outside
+  assert.equal(isWithinReminderTimeWindow("05:30", "05:34"), true); // 4 min late, within late tolerance
+  assert.equal(isWithinReminderTimeWindow("05:30", "05:26"), false); // 4 min early — previously (wrongly) true
+  assert.equal(isWithinReminderTimeWindow("05:30", "05:36"), false); // 6 min late, outside
   assert.equal(isWithinReminderTimeWindow("05:30", "05:24"), false);
 });
 

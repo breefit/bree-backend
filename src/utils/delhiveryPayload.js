@@ -221,3 +221,83 @@ export const buildDelhiveryShipmentPayload = ({
 
   return payload;
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reverse pickup (return) shipment — Delhivery "RVP"
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX (return shipment was a BREE → BREE forward shipment): returns used to
+// be built with buildDelhiveryShipmentPayload() plus swapped address roles —
+// consignee = BREE warehouse, pickup_location = BREE's registered
+// warehouse, payment_mode "Prepaid", customer only in seller_/return_
+// fields. To Delhivery that is an ordinary forward parcel from BREE's
+// warehouse to BREE's warehouse; no courier is ever sent to the customer.
+//
+// Delhivery's documented reverse-flow contract (Package Order Creation API,
+// https://delhivery-express-api-doc.readme.io/reference/order-creation-api):
+//   - "Order creation for reverse flow (customer to client warehouse)"
+//   - "payment_mode= Pickup (whereas it is prepaid and COD for forwarding
+//     shipment)"
+//   - "If you are passing the return keys then shipment will be delivered
+//     to return address. If you are not passing the return keys then
+//     shipment will be delivered to the warehouse address."
+//   - pickup_location "needs to be exactly the same as the name of the
+//     warehouse registered"
+//   - "Order ID should be unique for every new order manifested in our
+//     system" (when Delhivery generates the waybill)
+// and its FAQ: "Reverse shipment will be scheduled automatically so there
+// is no requirement to create pickup requests for those."
+//
+// So: consignee fields (name/add/pin/city/state/phone) = the CUSTOMER (the
+// pickup point, where the courier goes), payment_mode = "Pickup",
+// cod_amount 0, pickup_location = BREE's registered warehouse and the
+// return_* keys = BREE's warehouse (both resolve to BREE, the
+// destination), and a reverse-specific order reference so it never
+// collides with the forward shipment's order id.
+//
+// NEEDS SANDBOX/ACCOUNT CONFIRMATION (not stated verbatim in the docs):
+// that the consignee fields are read as the pickup address for
+// payment_mode "Pickup" (the docs imply it — "shipment needs to be pick
+// from the customer" + consignee "name, phone and address" are mandatory),
+// and that reverse pickups are enabled on BREE's Delhivery account.
+export const REVERSE_SHIPMENT_REFERENCE_SUFFIX = "-RETURN";
+
+export const buildReverseShipmentReference = (orderNumber) =>
+  `${String(orderNumber || "").trim()}${REVERSE_SHIPMENT_REFERENCE_SUFFIX}`;
+
+export const buildDelhiveryReverseShipmentPayload = ({
+  order,
+  customerAddress,
+  items,
+  warehouse,
+  bottleWeightKg,
+}) => {
+  if (!order?.order_number) throw new Error("Order number is required");
+  if (!customerAddress) throw new Error("Customer pickup address is required");
+
+  const reference = buildReverseShipmentReference(order.order_number);
+
+  // Reuse the forward builder for everything that is genuinely shared
+  // (weight, dimensions, dates, invoice, validation, seller/return =
+  // BREE warehouse, pickup_location = BREE's registered warehouse), with
+  // the customer as the consignee.
+  const payload = buildDelhiveryShipmentPayload({
+    order: { ...order, payment_method: "Prepaid" },
+    customer: {
+      name: customerAddress.full_name,
+      phone: customerAddress.mobile,
+    },
+    shippingAddress: customerAddress,
+    items,
+    warehouse,
+    ...(bottleWeightKg === undefined ? {} : { bottleWeightKg }),
+  });
+
+  const [shipment] = payload.shipments;
+  shipment.payment_mode = "Pickup";
+  shipment.cod_amount = "0";
+  shipment.order = reference;
+  // A reverse pickup never carries a pre-assigned forward waybill.
+  shipment.waybill = "";
+
+  return { payload, reference };
+};

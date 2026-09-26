@@ -6,7 +6,7 @@ import { Server } from "socket.io";
 import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
-import { runDailyReminderScheduler } from "../cron/dailyReminderCron.js";
+import { startDailyReminderCron } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 import { getSafeRazorpayConfig } from "./config/razorpay.js";
 import { validateWhatsAppConfiguration } from "./services/whatsappNotificationService.js";
@@ -95,15 +95,9 @@ const startServer = async () => {
       // Recurring package fulfillment cron (creates cycle 2+ orders)
       cronTasks.push(startPackageFulfillmentCron());
 
-      // Daily wellness reminder cron (runs every minute to check for reminders)
-      cronTasks.push(
-        cron.schedule("* * * * *", () => {
-          runDailyReminderScheduler().catch((err) => {
-            console.error("[dailyReminderCron] Scheduler error:", err);
-          });
-        }),
-      );
-      console.log("💬 Daily reminder cron started (runs every minute)");
+      // Daily wellness reminder cron (runs every minute to check for
+      // reminders). Idempotent per process — see startDailyReminderCron.
+      cronTasks.push(startDailyReminderCron());
 
       // OTP cleanup cron (runs every hour)
       cronTasks.push(

@@ -208,7 +208,7 @@ test("INCIDENT REPRO: delivered Sep 24 13:30 IST, no scheduler alive 04:55–05:
   assert.deepEqual(await sends(r.reminderId), []); // == production: zero rows
 });
 
-test("same reminder, same data: had ANY scheduler tick run between 04:55 and 05:05 IST on Sep 25, it would have been claimed and sent exactly once", { skip }, async () => {
+test("same reminder, same data: had ANY scheduler tick run between 05:00 and 05:05 IST on Sep 25, it would have been claimed and sent exactly once", { skip }, async () => {
   const r = await seedReminder();
   at("2026-09-24 13:30");
   await deliverNow(r);
@@ -217,7 +217,9 @@ test("same reminder, same data: had ANY scheduler tick run between 04:55 and 05:
 
   const sentTicks = results.filter((x) => x.sent === 1);
   assert.equal(sentTicks.length, 1);
-  assert.equal(results.find((x) => x.sent === 1), results[5]); // 04:55 — earliest in-tolerance tick
+  // 05:00 — the configured minute. The window no longer opens early (it
+  // used to send at 04:55, the first tick of a symmetric ±5 window).
+  assert.equal(results.find((x) => x.sent === 1), results[10]);
   assert.equal(waplify.requests.length, 1);
   assert.deepEqual(await sends(r.reminderId), [
     { send_date: "2026-09-25", status: "success", waplify_message_id: "wamid-1", error_message: null },

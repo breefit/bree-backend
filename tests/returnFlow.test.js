@@ -7,9 +7,12 @@ import {
   isReturnWindowOpen,
   slugifyReturnEventLabel,
   resolveCustomerAddressWithFallback,
-  buildReverseShipmentRoles,
   resolveApprovedRefundAmount,
 } from "../src/controllers/admin/returnController.js";
+import {
+  buildDelhiveryShipmentPayload,
+  buildDelhiveryReverseShipmentPayload,
+} from "../src/utils/delhiveryPayload.js";
 import {
   sendOrderStatusNotificationOnce,
   buildOrderStatusNotificationKey,
@@ -190,39 +193,102 @@ test("resolveCustomerAddressWithFallback: an address_id that resolves to nothing
   assert.equal(resolved, null);
 });
 
-// ── 11: Reverse-shipment address-role swap ─────────────────────────────────
+// ── 11: Reverse shipment = Delhivery reverse pickup (customer → BREE) ────
+// The old role-swap produced consignee = BREE warehouse, pickup_location =
+// BREE warehouse, payment_mode "Prepaid" — a BREE → BREE forward parcel.
+// Delhivery's reverse-flow contract: payment_mode "Pickup", customer as the
+// consignee/pickup point, delivered to the registered warehouse / return
+// address, unique order id.
 
-test("buildReverseShipmentRoles: customer becomes the pickup origin, warehouse becomes the delivery destination", () => {
-  const customerAddress = {
-    full_name: "Asha",
-    mobile: "9876543210",
-    address_line_1: "12 MG Road",
-    address_line_2: "Flat 3",
-    city: "Bengaluru",
-    state: "KA",
-    pincode: "560001",
-    country: "India",
-  };
-  const warehouse = {
-    name: "BREE Warehouse",
-    phone: "9000000000",
-    address: "Industrial Area",
-    city: "Chennai",
-    state: "TN",
-    pincode: "600001",
-    country: "India",
-  };
-  const { destinationAddress, originAsWarehouse } = buildReverseShipmentRoles(
+const customerAddress = {
+  full_name: "Asha",
+  mobile: "+91 98765 43210",
+  address_line_1: "12 MG Road",
+  address_line_2: "Flat 3",
+  city: "Bengaluru",
+  state: "KA",
+  pincode: "560001",
+  country: "India",
+};
+const warehouse = {
+  name: "BREE Warehouse",
+  pickupLocation: "BREE-REGISTERED-WH",
+  phone: "9000000000",
+  address: "Industrial Area",
+  city: "Chennai",
+  state: "TN",
+  pincode: "600001",
+  country: "India",
+};
+const reverseOrder = {
+  id: "order-1",
+  order_number: "BREE-100018",
+  total: 950,
+  total_amount: 950,
+  payment_method: "COD", // a forward COD order must still produce a Pickup (no COD) reverse shipment
+  created_at: "2026-09-20T10:00:00Z",
+};
+const reverseItems = [{ product_name: "Amla Shots", product_price: 950, quantity: 1, pack_bottle_count: 7 }];
+
+test("C/D: reverse shipment payload — customer is the pickup point (consignee), BREE warehouse is the destination, payment_mode Pickup", () => {
+  const { payload, reference } = buildDelhiveryReverseShipmentPayload({
+    order: reverseOrder,
     customerAddress,
+    items: reverseItems,
     warehouse,
+    bottleWeightKg: 0.02,
+  });
+  const [shipment] = payload.shipments;
+
+  // Pickup point = the customer.
+  assert.equal(shipment.name, "Asha");
+  assert.equal(shipment.add, "12 MG Road");
+  assert.equal(shipment.add2, "Flat 3");
+  assert.equal(shipment.city, "Bengaluru");
+  assert.equal(shipment.pin, "560001");
+  assert.equal(shipment.phone, "9876543210");
+
+  // Destination = BREE: registered warehouse + return keys.
+  assert.deepEqual(payload.pickup_location, { name: "BREE-REGISTERED-WH" });
+  assert.equal(shipment.return_add, "Industrial Area");
+  assert.equal(shipment.return_city, "Chennai");
+  assert.equal(shipment.return_pin, "600001");
+  assert.equal(shipment.seller_name, "BREE Warehouse");
+
+  // Reverse-pickup contract.
+  assert.equal(shipment.payment_mode, "Pickup");
+  assert.equal(shipment.cod_amount, "0");
+  assert.equal(shipment.waybill, "");
+
+  // Distinct Delhivery reference; the customer is never the warehouse.
+  assert.equal(reference, "BREE-100018-RETURN");
+  assert.equal(shipment.order, "BREE-100018-RETURN");
+  assert.notEqual(shipment.name, warehouse.name);
+  assert.notEqual(payload.pickup_location.name, customerAddress.full_name);
+});
+
+test("forward shipment payload is unchanged by the reverse builder (Prepaid/COD, forward order_number)", () => {
+  const forward = buildDelhiveryShipmentPayload({
+    order: { ...reverseOrder, payment_method: "Prepaid" },
+    customer: { name: "Asha" },
+    shippingAddress: customerAddress,
+    items: reverseItems,
+    warehouse,
+    bottleWeightKg: 0.02,
+  });
+  assert.equal(forward.shipments[0].payment_mode, "Prepaid");
+  assert.equal(forward.shipments[0].order, "BREE-100018");
+});
+
+test("reverse shipment payload refuses an order with no order number or no customer address", () => {
+  assert.throws(
+    () => buildDelhiveryReverseShipmentPayload({ order: {}, customerAddress, items: reverseItems, warehouse }),
+    /Order number is required/,
   );
-  // Destination (where Delhivery delivers the reverse shipment) is BREE.
-  assert.equal(destinationAddress.full_name, "BREE Warehouse");
-  assert.equal(destinationAddress.city, "Chennai");
-  // Origin (where Delhivery picks up) is the customer.
-  assert.equal(originAsWarehouse.name, "Asha");
-  assert.equal(originAsWarehouse.city, "Bengaluru");
-  assert.match(originAsWarehouse.address, /12 MG Road, Flat 3/);
+  assert.throws(
+    () => buildDelhiveryReverseShipmentPayload({ order: reverseOrder, customerAddress: null, items: reverseItems, warehouse }),
+    /Customer pickup address is required/,
+  );
 });
 
 // ── 12-15: Return/refund notification idempotency (REGRESSION FIX) ────────
@@ -386,7 +452,6 @@ test("all notifying return/refund endpoints still call notifyReturnEvent (unchan
     "Return Approved",
     "Return Rejected",
     "Return Shipment Created",
-    "Return Pickup Scheduled",
     "Return Received",
     "Return Inspection Approved",
     "Return Quality Check Failed",
@@ -402,6 +467,13 @@ test("all notifying return/refund endpoints still call notifyReturnEvent (unchan
       `expected a notifyReturnEvent call site passing "${label}"`,
     );
   }
+  // "Return Pickup Scheduled" (and the automatic "Return Received") now
+  // come from Delhivery reverse tracking, through the same
+  // notifyReturnEvent — see services/reverseShipmentTracking.js.
+  const reverseTrackingSource = read("../src/services/reverseShipmentTracking.js");
+  assert.match(reverseTrackingSource, /"Return Pickup Scheduled"/);
+  assert.match(reverseTrackingSource, /"Return Received"/);
+  assert.match(reverseTrackingSource, /notify = notifyReturnEvent/);
   // approveRefund still sends NO notification — audited and confirmed
   // intentional (see the dedicated CONCLUSION test below), to avoid a
   // redundant duplicate immediately before Refund Initiated.
@@ -444,23 +516,19 @@ test("REGRESSION FIX: 'Return Quality Check Failed' has its own dedicated WhatsA
 // ── REGRESSION FIX: scheduleReversePickup repeat-click no longer returns a
 //    misleading error ──────────────────────────────────────────────────────
 
-test("REGRESSION FIX: scheduleReversePickup returns an idempotent 200 (not a misleading 400) when a reverse pickup already exists", () => {
+test("scheduleReversePickup never calls Delhivery (reverse pickups are auto-scheduled); already-scheduled stays an idempotent 200", () => {
   const fnSource = returnControllerSource.slice(
     returnControllerSource.indexOf("export const scheduleReversePickup"),
     returnControllerSource.indexOf("export const markReturned"),
   );
-  // The idempotent branch must come BEFORE the generic "must exist" guard,
-  // and must return success:true with a 200, not the old confusing error.
-  const idempotentBranchIndex = fnSource.indexOf('order.return_status === "pickup_scheduled"');
-  const genericGuardIndex = fnSource.indexOf("A reverse shipment must exist before scheduling pickup");
-  assert.ok(idempotentBranchIndex !== -1, "expected the pickup_scheduled idempotent check to exist");
-  assert.ok(
-    idempotentBranchIndex < genericGuardIndex,
-    "the idempotent short-circuit must be checked before the generic status guard",
-  );
+  assert.doesNotMatch(fnSource, /delhiveryService\./);
+  assert.doesNotMatch(fnSource, /requestPickup|buildPickupRequestPayload/);
+  const idempotentBranchIndex = fnSource.indexOf("order.return_status === RETURN_STATUS.PICKUP_SCHEDULED");
+  const genericGuardIndex = fnSource.indexOf("A reverse shipment must exist before a pickup can be scheduled");
+  assert.ok(idempotentBranchIndex !== -1 && idempotentBranchIndex < genericGuardIndex);
   const idempotentBlock = fnSource.slice(idempotentBranchIndex, genericGuardIndex);
   assert.match(idempotentBlock, /status\(200\)/);
-  assert.match(idempotentBlock, /success:\s*true/);
+  assert.match(fnSource, /REVERSE_PICKUP_AUTO_SCHEDULED/);
 });
 
 // ── Regression protection: the existing, already-correct state-machine
@@ -481,7 +549,7 @@ test("createReverseShipment has an idempotent short-circuit for an already-creat
     returnControllerSource.indexOf("export const createReverseShipment"),
     returnControllerSource.indexOf("export const scheduleReversePickup"),
   );
-  assert.match(fnSource, /order\.return_status === "reverse_shipment_created"/);
+  assert.match(fnSource, /RETURN_STATUS\.REVERSE_SHIPMENT_CREATED,\s*RETURN_STATUS\.PICKUP_SCHEDULED,\s*RETURN_STATUS\.RETURNED/);
   assert.match(fnSource, /Return shipment already exists for this order/);
   assert.match(fnSource, /status\(200\)/);
 });

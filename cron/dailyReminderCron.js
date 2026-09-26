@@ -6,7 +6,9 @@
  * - The reminder is enabled and active
  * - The order/package has been delivered
  * - Current date is >= reminder_start_date and <= reminder_end_date
- * - Current time matches the selected reminder time (within a tolerance window)
+ * - Current IST minute is AT or AFTER the selected reminder time, at most
+ *   LATE_TOLERANCE_MINUTES late — never before it (see
+ *   isWithinReminderTimeWindow)
  * - No reminder has been sent for this reminder on today's date (idempotency)
  * - The order has no approved return (re-checked under a lock right before
  *   each send — see acquireReminderSendGuard)
@@ -14,6 +16,7 @@
  * Timezone: Asia/Kolkata (IST)
  */
 
+import cron from "node-cron";
 import { query, getClient } from "../src/config/database.js";
 import {
   sendDailyWellnessReminder,
@@ -27,7 +30,16 @@ import {
 import os from "os";
 
 const TIMEZONE = "Asia/Kolkata";
-const TOLERANCE_MINUTES = 5; // Send within 5 minutes of scheduled time
+// FIX (reminder sent at 04:55 for a 05:00 reminder): the window used to be
+// symmetric (|current - scheduled| <= 5), so with a tick every minute the
+// FIRST in-window tick — 5 minutes EARLY — always won the once-per-day
+// claim. The window now opens exactly at the configured minute and only
+// extends forward: LATE_TOLERANCE_MINUTES covers a delayed/missed tick, a
+// process that comes up a few minutes late, and the existing same-day retry
+// of a 'failed' send (reclaimable on the next in-window tick) — the same 5
+// minutes of lateness that was already allowed before. The once-per-day
+// claim (claimReminderSendSlot) still guarantees a single send inside it.
+const LATE_TOLERANCE_MINUTES = 5;
 
 // FIX (live verification — Issue 2, triple scheduler executions): this cron
 // has no distributed lock (unlike shippingTrackingCron.js's
@@ -44,44 +56,44 @@ const TOLERANCE_MINUTES = 5; // Send within 5 minutes of scheduled time
 const INSTANCE_ID = `${os.hostname()}:${process.pid}`;
 
 /**
- * Gets current date in YYYY-MM-DD format (Asia/Kolkata timezone)
+ * IST (Asia/Kolkata) calendar date (YYYY-MM-DD) and wall-clock time (HH:MM)
+ * for ONE instant — independent of the process TZ. Date and time come from
+ * the same instant so a tick straddling midnight can't pair one day's date
+ * with the other day's time. Same conversion the scheduler always used.
  */
-const getTodayIST = () => {
-  const now = new Date();
+export const getISTClock = (now = new Date()) => {
   const istTime = new Date(now.toLocaleString("en-US", { timeZone: TIMEZONE }));
   const yyyy = istTime.getFullYear();
   const mm = String(istTime.getMonth() + 1).padStart(2, "0");
   const dd = String(istTime.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-};
-
-/**
- * Gets current time in HH:MM format (Asia/Kolkata timezone)
- */
-const getCurrentTimeIST = () => {
-  const now = new Date();
-  const istTime = new Date(now.toLocaleString("en-US", { timeZone: TIMEZONE }));
   const hours = String(istTime.getHours()).padStart(2, "0");
   const minutes = String(istTime.getMinutes()).padStart(2, "0");
-  return `${hours}:${minutes}`;
+  return { date: `${yyyy}-${mm}-${dd}`, time: `${hours}:${minutes}` };
 };
 
 /**
- * Checks if current time is within tolerance of the scheduled reminder time
+ * Is the reminder due in the current IST minute?
+ *
+ * Due from the configured minute (05:00 → 05:00:00–05:00:59 is the first
+ * due tick) up to LATE_TOLERANCE_MINUTES after it (05:05 inclusive) —
+ * never before it (04:55–04:59 → not due). Both arguments are IST wall-clock
+ * "HH:MM" (a "HH:MM:SS" TIME value is accepted; seconds are ignored). The
+ * window does not wrap past midnight: a late tick after 00:00 belongs to the
+ * next IST day's send_date, so it must not count as the previous day's send.
  */
 export const isWithinReminderTimeWindow = (
   scheduledTime,
   currentTime,
-  toleranceMinutes = TOLERANCE_MINUTES,
+  lateToleranceMinutes = LATE_TOLERANCE_MINUTES,
 ) => {
-  const [scheduledHour, scheduledMinute] = scheduledTime.split(":").map(Number);
-  const [currentHour, currentMinute] = currentTime.split(":").map(Number);
+  const [scheduledHour, scheduledMinute] = String(scheduledTime).split(":").map(Number);
+  const [currentHour, currentMinute] = String(currentTime).split(":").map(Number);
 
   const scheduledTotalMinutes = scheduledHour * 60 + scheduledMinute;
   const currentTotalMinutes = currentHour * 60 + currentMinute;
 
-  const diff = Math.abs(currentTotalMinutes - scheduledTotalMinutes);
-  return diff <= toleranceMinutes;
+  const minutesLate = currentTotalMinutes - scheduledTotalMinutes;
+  return minutesLate >= 0 && minutesLate <= lateToleranceMinutes;
 };
 
 /**
@@ -448,8 +460,7 @@ const logSkippedReminders = async (today) => {
  * and sends reminders if eligible
  */
 export const runDailyReminderScheduler = async () => {
-  const today = getTodayIST();
-  const currentTime = getCurrentTimeIST();
+  const { date: today, time: currentTime } = getISTClock();
 
   console.log(
     `[Reminder Scheduler] Running at ${currentTime} IST (${today}) | instance=${INSTANCE_ID}`,
@@ -508,11 +519,13 @@ export const runDailyReminderScheduler = async () => {
         `[Reminder Scheduler] Eligible reminder ${reminderId} for order ${reminder.order_id} | enabled=${Boolean(reminder.reminder_enabled)} | window=${reminder_start_date}..${reminder_end_date} | scheduled=${reminder_time} | current=${currentTime}`,
       );
 
-      // Check if current time is within tolerance of scheduled time
+      // Due only from the configured minute onward (never early).
       if (!isWithinReminderTimeWindow(reminder_time, currentTime)) {
         skipped++;
+        const notYetDue =
+          String(currentTime) < String(reminder_time).slice(0, 5);
         console.info(
-          `[Reminder Scheduler] Skipping reminder ${reminderId} for order ${reminder.order_id}: outside time window`,
+          `[Reminder Scheduler] Skipping reminder ${reminderId} for order ${reminder.order_id}: outside time window (${notYetDue ? "not_yet_due" : "window_passed"})`,
         );
         continue;
       }
@@ -639,6 +652,44 @@ export const runDailyReminderScheduler = async () => {
   }
 };
 
+// FIX (two scheduler instances in production): the reminder cron used to be
+// registered inline in server.js. It was still registered exactly once per
+// process (server.js is the only caller and ES modules evaluate once), so
+// this does NOT stop two separate OS processes from each running it — that
+// is a hosting/process-manager concern, and claimReminderSendSlot's
+// DB-level claim is what keeps two processes from double-sending. This just
+// makes the registration itself idempotent within a process: a second call
+// returns the already-registered task instead of scheduling a second
+// every-minute job.
+let reminderCronTask = null;
+
+export const startDailyReminderCron = ({ cronLib = cron } = {}) => {
+  if (reminderCronTask) {
+    console.warn(
+      `[Reminder Scheduler] startDailyReminderCron called again — already registered in this process, not registering a second job | instance=${INSTANCE_ID}`,
+    );
+    return reminderCronTask;
+  }
+
+  reminderCronTask = cronLib.schedule("* * * * *", () => {
+    runDailyReminderScheduler().catch((err) => {
+      console.error("[dailyReminderCron] Scheduler error:", err);
+    });
+  });
+  console.log(
+    `💬 Daily reminder cron started (runs every minute) | instance=${INSTANCE_ID}`,
+  );
+  return reminderCronTask;
+};
+
+export const stopDailyReminderCron = () => {
+  if (!reminderCronTask) return;
+  reminderCronTask.stop();
+  reminderCronTask = null;
+};
+
 export default {
   runDailyReminderScheduler,
+  startDailyReminderCron,
+  stopDailyReminderCron,
 };

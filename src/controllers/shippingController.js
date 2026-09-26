@@ -611,9 +611,16 @@ export const extractDelhiveryTrackingDetails = (trackingResponse) => {
     shipment?.id ||
     null;
 
+  // Delhivery's StatusType (UD/DL/RT/PP/PU/CN) — needed to tell a reverse
+  // pickup's DL/"DTO" apart from other states that share a Status string.
+  // Additive only: the forward tracking path never reads it.
+  const statusType =
+    shipment?.Status?.StatusType || shipment?.status?.status_type || null;
+
   return {
     success: true,
     trackingStatus: String(rawStatus).trim(),
+    statusType: statusType ? String(statusType).trim() : null,
     currentLocation: currentLocation || null,
     lastUpdate: lastUpdate || null,
     expectedDelivery: expectedDelivery || null,
