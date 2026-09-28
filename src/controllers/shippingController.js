@@ -326,15 +326,15 @@ export const formatDelhiveryPickupError = (error) => ({
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Returns the base URL used to build Delhivery tracking links.
-// Configurable via DELHIVERY_TRACKING_URL; falls back to the existing
-// hardcoded URL if the env variable is missing, so behaviour is unchanged
-// for deployments that don't set it.
+// Configurable via DELHIVERY_TRACKING_URL; falls back to Delhivery's public
+// tracking page. (The previous default, tracking.delhivery.com, has no DNS
+// record — every link built from it was dead.)
 // ─────────────────────────────────────────────────────────────────────────────
-const getTrackingBaseUrl = () => {
-  return (
-    process.env.DELHIVERY_TRACKING_URL ||
-    "https://tracking.delhivery.com/track/shipment/"
-  );
+export const DEFAULT_DELHIVERY_TRACKING_URL =
+  "https://www.delhivery.com/track-v2/package/";
+
+export const getTrackingBaseUrl = () => {
+  return process.env.DELHIVERY_TRACKING_URL || DEFAULT_DELHIVERY_TRACKING_URL;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
