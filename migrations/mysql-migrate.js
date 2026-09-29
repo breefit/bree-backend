@@ -60,6 +60,15 @@ const ordersUserFkMigration = await fs.readFile(
   "utf8",
 );
 
+const productVisibilityMigrationPath = resolve(
+  __dirname,
+  "010_add_product_visibility.sql",
+);
+const productVisibilityMigration = await fs.readFile(
+  productVisibilityMigrationPath,
+  "utf8",
+);
+
 const connection = await pool.getConnection();
 try {
   console.log(`Executing MySQL schema from ${schemaPath}`);
@@ -70,6 +79,8 @@ try {
   await connection.query(reminderMigration);
   console.log(`Executing migration from ${ordersUserFkMigrationPath}`);
   await connection.query(ordersUserFkMigration);
+  console.log(`Executing migration from ${productVisibilityMigrationPath}`);
+  await connection.query(productVisibilityMigration);
   console.log("✅ MySQL schema created successfully");
 } catch (err) {
   console.error("❌ MySQL schema creation failed:", err.message);

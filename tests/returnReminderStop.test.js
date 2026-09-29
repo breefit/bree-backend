@@ -162,7 +162,7 @@ const reminder = (id, orderId, extra = {}) => ({
 });
 
 // ── Fake guard connection (orders.return_status + daily_reminders row) ──────
-const makeGuardDb = ({ returnStatus = null, orderExists = true, reminderRow, failOn } = {}) => {
+const makeGuardDb = ({ returnStatus = null, orderStatus = "delivered", orderExists = true, reminderRow, failOn } = {}) => {
   const log = [];
   const stats = { released: 0 };
   const client = {
@@ -171,9 +171,9 @@ const makeGuardDb = ({ returnStatus = null, orderExists = true, reminderRow, fai
       log.push(q);
       if (failOn && q.startsWith(failOn)) throw new Error("simulated DB failure");
       if (q === "BEGIN" || q === "COMMIT" || q === "ROLLBACK") return { rows: [], rowCount: 0 };
-      if (q === "SELECT return_status FROM orders WHERE id = ? LOCK IN SHARE MODE") {
+      if (q === "SELECT return_status, order_status FROM orders WHERE id = ? LOCK IN SHARE MODE") {
         return orderExists
-          ? { rows: [{ return_status: returnStatus }], rowCount: 1 }
+          ? { rows: [{ return_status: returnStatus, order_status: orderStatus }], rowCount: 1 }
           : { rows: [], rowCount: 0 };
       }
       if (q === "SELECT reminder_enabled, status FROM daily_reminders WHERE id = ?") {
@@ -288,7 +288,7 @@ test("guard reads the order under a shared lock BEFORE the reminder row (same lo
   await guard.release();
   assert.deepEqual(db.log, [
     "BEGIN",
-    "SELECT return_status FROM orders WHERE id = ? LOCK IN SHARE MODE",
+    "SELECT return_status, order_status FROM orders WHERE id = ? LOCK IN SHARE MODE",
     "SELECT reminder_enabled, status FROM daily_reminders WHERE id = ?",
     "COMMIT",
   ]);
@@ -457,4 +457,12 @@ test("no code path re-enables reminder_enabled after creation, and only approveR
   );
   assert.equal((returnSource.match(/stopRemindersForReturnedOrder\(/g) || []).length, 1);
   assert.doesNotMatch(returnSource, /enableReminder|resumeReminderForOrder|UPDATE\s+daily_reminders/);
+});
+
+test("audit: an order manually set to order_status 'returned' (no approveReturn) is refused by the guard — no reminder for a returned product", async () => {
+  const db = makeGuardDb({ returnStatus: null, orderStatus: "returned" });
+  const guard = await guardFor(db);
+  assert.equal(guard.allowed, false);
+  assert.equal(guard.reason, "order_returned");
+  assert.equal(db.stats.released, 1);
 });

@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import { cloudinary } from "../../config/cloudinary.js";
 import cache from "../../utils/cache.js";
 import { getRazorpay } from "../../config/razorpay.js";
+import { publishProductEvent } from "../../services/orderRealtime.js";
 
 const slugify = (name) =>
   name
@@ -118,22 +119,19 @@ const invalidateProductCache = () => {
   cache.del("home:data");
 };
 
-const emitProductEvent = (req, eventType, product) => {
-  try {
-    const io = req.app.locals.io;
-    if (io) {
-      io.emit(`product:${eventType}`, product);
-      // console.log(`📡 Emitted: product:${eventType}`);
-    }
-  } catch (err) {
-    console.warn("Socket.IO emit failed (non-critical):", err.message);
-  }
-};
+// product:* events reach every connected socket (Shop/Home refetch on
+// them). FIX (Socket.IO security audit): only `{ id }` is sent now — even a
+// visible product's full row carried admin-only columns (razorpay_plan_id,
+// is_active, display_order, discount, recommended_product_ids) that the
+// public catalog API does not expose. See services/orderRealtime.js.
+const emitProductEvent = (req, eventType, product) =>
+  publishProductEvent(req.app?.locals?.io, eventType, product);
 
 // ============================================================
 // GET /api/admin/products
 // ============================================================
-export const getProducts = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getProducts = async (req, res, { queryFn = query } = {}) => {
   const { page = 1, limit = 20, search = "" } = req.query;
   const offset = (parseInt(page) - 1) * parseInt(limit);
 
@@ -143,10 +141,10 @@ export const getProducts = async (req, res) => {
     : [parseInt(limit), offset];
 
   const [productsRes, countRes] = await Promise.all([
-    query(
+    queryFn(
       `SELECT id, name, slug, category, description, price, mrp,
               quantity, image, features, popular, display_order,
-              is_active, is_subscription,
+              is_active, is_visible, is_subscription,
               journey_level, show_recommendations,
               is_free_shipping, shipping_charge, estimated_delivery,
               is_recurring_package, package_duration_months,
@@ -157,7 +155,7 @@ export const getProducts = async (req, res) => {
        LIMIT ? OFFSET ?`,
       params,
     ),
-    query(
+    queryFn(
       `SELECT COUNT(*) AS total FROM products ${where}`,
       search ? [`%${search}%`] : [],
     ),
@@ -754,6 +752,64 @@ export const updateProduct = async (req, res) => {
       message: err?.message || "Unable to update product",
     });
   }
+};
+
+// ============================================================
+// PATCH /api/admin/products/:id/visibility
+// ============================================================
+// "Show in User UI" toggle. Body: { "is_visible": true | false }.
+// Updates ONLY is_visible (+ updated_at) — no other product field can
+// change through this endpoint. Mounted behind adminAuth. The client sends
+// the desired final state (not "toggle"), so repeated/rapid requests are
+// idempotent and the last write wins; the response is authoritative.
+// `queryFn` injectable only for tests (default to the real pool).
+export const setProductVisibility = async (
+  req,
+  res,
+  { queryFn = query } = {},
+) => {
+  const { is_visible: isVisible } = req.body || {};
+
+  if (typeof isVisible !== "boolean") {
+    return res.status(400).json({
+      success: false,
+      message: "is_visible must be a boolean (true or false).",
+    });
+  }
+
+  const { rows: existing } = await queryFn(
+    "SELECT id, name, is_visible FROM products WHERE id = ? LIMIT 1",
+    [req.params.id],
+  );
+  if (!existing.length) {
+    return res
+      .status(404)
+      .json({ success: false, message: "Product not found" });
+  }
+
+  await queryFn(
+    "UPDATE products SET is_visible = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    [isVisible ? 1 : 0, req.params.id],
+  );
+
+  const { rows } = await queryFn(
+    "SELECT * FROM products WHERE id = ? LIMIT 1",
+    [req.params.id],
+  );
+  const product = rows[0];
+
+  // No admin audit table exists in this codebase; log who changed what so
+  // the change is at least traceable in server logs.
+  console.info("[PRODUCT_VISIBILITY] updated", {
+    productId: req.params.id,
+    from: Number(existing[0].is_visible) === 1,
+    to: isVisible,
+    adminId: req.admin?.id || null,
+  });
+
+  invalidateProductCache();
+  emitProductEvent(req, "updated", product);
+  res.json(product);
 };
 
 // ============================================================

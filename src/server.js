@@ -10,6 +10,7 @@ import { startDailyReminderCron } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 import { getSafeRazorpayConfig } from "./config/razorpay.js";
 import { validateWhatsAppConfiguration } from "./services/whatsappNotificationService.js";
+import { registerSocketSecurity } from "./services/socketAuth.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -137,6 +138,7 @@ const startServer = async () => {
       cors: {
         origin: allowedOrigins,
         methods: ["GET", "POST"],
+        credentials: true,
       },
     });
 
@@ -163,12 +165,12 @@ const startServer = async () => {
       process.exit(1);
     });
 
-    io.on("connection", (socket) => {
-      // console.log(`✅ Client connected: ${socket.id}`);
-      socket.on("disconnect", () => {
-        // console.log(`❌ Client disconnected: ${socket.id}`);
-      });
-    });
+    // FIX (Socket.IO security audit): the server used to accept every
+    // socket anonymously while controllers broadcast order data to all of
+    // them. Handshakes are now authenticated with the existing admin/
+    // customer JWTs and each socket is placed in the rooms it is entitled
+    // to — see services/socketAuth.js and services/orderRealtime.js.
+    registerSocketSecurity(io, { allowedOrigins });
 
     // FIX (ISSUE-025 — no graceful shutdown): every deploy/restart (PM2
     // restart, container stop, platform redeploy) used to kill the
@@ -206,6 +208,29 @@ const startServer = async () => {
       }
       console.log("✅ Cron jobs stopped");
 
+      // FIX (Socket.IO runtime audit): server.close() waits for EVERY open
+      // connection — including Socket.IO WebSockets, which io.close() below
+      // only closes afterwards. With any browser connected, shutdown hung
+      // for the full timeout and force-exited (code 1) on every restart/
+      // deploy, while clients sat on the dying process missing realtime
+      // updates. Close them first at the TRANSPORT level (what io.close()
+      // itself does): clients see "transport close" and auto-reconnect to
+      // the replacement process. (io.disconnectSockets() would instead be a
+      // server-initiated disconnect, after which Socket.IO clients never
+      // reconnect on their own.)
+      io.engine.close();
+
+      // FIX (Socket.IO runtime audit): browsers keep "preconnect" sockets
+      // open that never send a request; server.close() neither treats them
+      // as idle nor closes them, so it waited for the force-exit timeout
+      // (exit code 1) on every real-world restart. In-flight requests get a
+      // bounded drain window, then whatever is still open is closed.
+      const HTTP_DRAIN_TIMEOUT_MS = 5000;
+      const drainTimer = setTimeout(() => {
+        server.closeAllConnections?.();
+      }, HTTP_DRAIN_TIMEOUT_MS);
+      drainTimer.unref();
+
       await new Promise((resolve) => {
         server.close((err) => {
           if (err) console.error("Error closing HTTP server:", err);
@@ -213,6 +238,7 @@ const startServer = async () => {
           resolve();
         });
       });
+      clearTimeout(drainTimer);
 
       await new Promise((resolve) => {
         io.close(() => {

@@ -81,11 +81,13 @@ const createFakeNotificationsTable = () => {
       return { rows: [], rowCount: 1 };
     }
 
-    if (normalized.includes("SET status = 'failed'")) {
-      const [errorMessage, notificationKey] = params;
+    // Failure resolve: status is 'failed' (known) or 'unknown' (WhatsApp
+    // outcome uncertain) — bound as the first parameter.
+    if (normalized.includes("SET status = ?, last_error = ?")) {
+      const [outcome, errorMessage, notificationKey] = params;
       const row = rows.get(notificationKey);
       if (!row || row.status !== "sending") return { rows: [], rowCount: 0 };
-      row.status = "failed";
+      row.status = outcome;
       row.last_error = errorMessage;
       return { rows: [], rowCount: 1 };
     }

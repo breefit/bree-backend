@@ -973,6 +973,32 @@ const ensureWebhookEventsTable = async () => {
   }
 };
 
+// FIX (Socket.IO admin session revocation): admin JWTs are stateless, so
+// logging out only cleared the cookie — the token itself stayed valid and a
+// socket could re-join the admin room with it. One row per logged-out
+// session token (SHA-256 of the token, never the token), kept until the
+// token would have expired anyway. Read by services/socketAuth.js at every
+// handshake and by its periodic re-validation — in MySQL (not in memory)
+// so every backend process sees it without Redis.
+export const ensureAdminSessionRevocationsTable = async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS admin_session_revocations (
+        token_hash  CHAR(64)  NOT NULL PRIMARY KEY,
+        admin_id    CHAR(36)  NOT NULL,
+        expires_at  DATETIME  NOT NULL,
+        created_at  DATETIME  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_admin_session_revocations_expires (expires_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure admin_session_revocations table exists:",
+      err?.message || err,
+    );
+  }
+};
+
 // FIX (Phase 3B — Medium #6): checkout double-submit / duplicate-order
 // protection. See services/checkoutIdempotencyService.js for the full
 // claim/complete/fail state machine and the reasoning behind the
@@ -1406,6 +1432,16 @@ export const ensureOrderReturnColumns = async () => {
       ["returned_source", "VARCHAR(30) NULL DEFAULT NULL"],
       ["inspection_completed_at", "DATETIME NULL DEFAULT NULL"],
       ["refund_approved_at", "DATETIME NULL DEFAULT NULL"],
+      // Reverse-shipment creation diagnostics (see createReverseShipment).
+      // 'uncertain' = Delhivery may have created the shipment but BREE has
+      // no AWB saved (timeout / reset / 5xx / malformed 200 / "Duplicate
+      // order id" / DB failure after the AWB arrived) — blocks automatic
+      // re-creation. 'failed' = Delhivery confirmed it created nothing.
+      ["reverse_shipment_create_status", "VARCHAR(20) NULL DEFAULT NULL"],
+      ["reverse_shipment_create_attempted_at", "DATETIME NULL DEFAULT NULL"],
+      ["reverse_shipment_create_error", "VARCHAR(500) NULL DEFAULT NULL"],
+      // An AWB Delhivery returned that could not be saved as reverse_awb.
+      ["reverse_shipment_unconfirmed_awb", "VARCHAR(255) NULL DEFAULT NULL"],
     ];
     for (const [column, definition] of reverseTrackingColumns) {
       if (!existing.has(column)) {
@@ -1680,6 +1716,50 @@ export const ensurePackageProductColumns = async () => {
   }
 };
 
+// Product visibility ("Show in User UI"): products gains is_visible, the
+// admin toggle that hides a product from customers without deleting it.
+// Separate from is_active, which is the soft-delete flag. NOT NULL DEFAULT 1
+// so every existing product stays visible. Additive, idempotent
+// information_schema pattern (same as ensurePackageProductColumns) — safe on
+// every boot. Mirrors migrations/010_add_product_visibility.sql.
+export const ensureProductVisibilityColumn = async () => {
+  try {
+    const [dbRows] = await pool.query("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'products'
+         AND column_name = 'is_visible'`,
+      [currentDb],
+    );
+    if (!cols.length) {
+      await pool.query(
+        "ALTER TABLE products ADD COLUMN is_visible TINYINT(1) NOT NULL DEFAULT 1",
+      );
+    }
+
+    const [idx] = await pool.query(
+      `SELECT index_name FROM information_schema.statistics
+       WHERE table_schema = ? AND table_name = 'products'
+         AND index_name = 'idx_products_visible'
+       LIMIT 1`,
+      [currentDb],
+    );
+    if (!idx.length) {
+      await pool.query(
+        "CREATE INDEX idx_products_visible ON products(is_visible)",
+      );
+    }
+  } catch (err) {
+    console.error(
+      "❌ Could not ensure products.is_visible column exists:",
+      err?.message || err,
+    );
+  }
+};
+
 // orders gains parent_package_id / fulfillment_cycle so a fulfillment order
 // (cycle 2+) is a completely normal `orders` row — same order_number,
 // status machine, Delhivery flow, tracking, notifications, admin/customer
@@ -1859,10 +1939,12 @@ if (!isTestEnv) {
   await ensureOrderReturnColumns().catch(console.error);
   await ensureDeliveredAtBackfill().catch(console.error);
   await ensurePackageProductColumns().catch(console.error);
+  await ensureProductVisibilityColumn().catch(console.error);
   await ensurePackageOrderColumns().catch(console.error);
   await ensurePackagePurchasesTable().catch(console.error);
   await ensurePackageNumberSchema().catch(console.error);
   await ensureWebhookEventsTable().catch(console.error);
+  await ensureAdminSessionRevocationsTable().catch(console.error);
   await ensureCheckoutIdempotencyTable().catch(console.error);
 }
 

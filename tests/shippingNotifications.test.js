@@ -317,11 +317,13 @@ const createFakeNotificationsTable = () => {
       return { rows: [], rowCount: 1 };
     }
 
-    if (normalized.includes("SET status = 'failed'")) {
-      const [errorMessage, key] = params;
+    // Failure resolve: 'failed' (known) or 'unknown' (uncertain WhatsApp
+    // outcome), bound as the first parameter.
+    if (normalized.includes("SET status = ?, last_error = ?")) {
+      const [outcome, errorMessage, key] = params;
       const row = rows.get(key);
       if (!row || row.status !== "sending") return { rows: [], rowCount: 0 };
-      row.status = "failed";
+      row.status = outcome;
       row.last_error = errorMessage;
       return { rows: [], rowCount: 1 };
     }

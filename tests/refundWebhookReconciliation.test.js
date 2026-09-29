@@ -65,6 +65,7 @@ const refundFailedPayload = (refundId, paymentId = "pay_abc123") => ({
 const makeFakeOrdersDb = (initialOrder) => {
   const orders = new Map([[initialOrder.id, { ...initialOrder }]]);
   const historyInserts = [];
+  const paymentUpdates = [];
   // Phase 3B — every handleWebhook call now claims an event id first (see
   // webhookIdempotencyService.js); model that same ledger table here so
   // these pre-existing ISSUE-011 tests keep exercising the real function
@@ -116,18 +117,41 @@ const makeFakeOrdersDb = (initialOrder) => {
       return { rows: [], rowCount: row ? 1 : 0 };
     }
 
+    if (normalized.startsWith("SELECT * FROM orders WHERE refund_reference = ? OR (refund_reference IS NULL")) {
+      const [refundReference, paymentId] = params;
+      const matches = [...orders.values()].filter(
+        (r) =>
+          r.refund_reference === refundReference ||
+          (r.refund_reference == null && r.refund_status === "processing" && r.razorpay_payment_id === paymentId),
+      );
+      return { rows: matches.map((r) => ({ ...r })) };
+    }
+
     if (normalized.startsWith("UPDATE orders SET refund_status = 'completed'")) {
-      const [refundReference] = params;
-      let count = 0;
-      for (const row of orders.values()) {
-        if (row.refund_reference === refundReference && row.refund_status === "initiated") {
-          row.refund_status = "completed";
-          row.payment_status = "refunded";
-          row.refund_completed_at = new Date();
-          count += 1;
-        }
+      const [refundReference, id, guardReference] = params;
+      const row = orders.get(id);
+      if (
+        row &&
+        ["initiated", "processing"].includes(row.refund_status) &&
+        (row.refund_reference === guardReference || row.refund_reference == null)
+      ) {
+        row.refund_status = "completed";
+        row.payment_status = "refunded";
+        row.refund_reference = row.refund_reference ?? refundReference;
+        row.refund_completed_at = new Date();
+        return { rows: [], rowCount: 1 };
       }
-      return { rows: [], rowCount: count };
+      return { rows: [], rowCount: 0 };
+    }
+
+    if (normalized.startsWith("UPDATE payments SET refund_id = ?")) {
+      paymentUpdates.push(params);
+      return { rows: [], rowCount: 1 };
+    }
+
+    if (normalized === "SELECT * FROM orders WHERE id = ? LIMIT 1") {
+      const row = orders.get(params[0]);
+      return { rows: row ? [{ ...row }] : [] };
     }
 
     if (normalized === "SELECT id, order_status FROM orders WHERE refund_reference = ? LIMIT 1") {
@@ -144,7 +168,7 @@ const makeFakeOrdersDb = (initialOrder) => {
     throw new Error(`Unhandled fake SQL in refundWebhookReconciliation test: ${normalized}`);
   };
 
-  return { queryFn, orders, historyInserts };
+  return { queryFn, orders, historyInserts, paymentUpdates };
 };
 
 test("ISSUE-011 (Medium): refund.processed webhook reconciles an 'initiated' refund to 'completed', and sets payment_status='refunded'", async () => {
@@ -239,4 +263,100 @@ test("ISSUE-011 (Medium) regression: an invalid webhook signature is still rejec
   });
 
   assert.equal(res.statusCode, 400);
+});
+
+// ── Return/refund E2E audit regressions ─────────────────────────────────────
+const refundPayloadWithNotes = (event, refundId, paymentId, orderId) => ({
+  event,
+  payload: {
+    refund: {
+      entity: {
+        id: refundId,
+        payment_id: paymentId,
+        status: event === "refund.failed" ? "failed" : "processed",
+        notes: { order_id: orderId, order_number: "BREE-100900" },
+      },
+    },
+  },
+});
+
+test("audit: refund.processed completing an 'initiated' refund sends 'Refund Completed' exactly once, even when the webhook is delivered twice", async () => {
+  const db = makeFakeOrdersDb({
+    id: "order-1",
+    order_status: "delivered",
+    refund_status: "initiated",
+    refund_reference: "rfnd_test1",
+    payment_status: "paid",
+    razorpay_payment_id: "pay_abc123",
+  });
+  const notified = [];
+  const notifyRefundEvent = (order, label) => notified.push([order.id, label, order.refund_status]);
+
+  const payload = refundProcessedPayload("rfnd_test1");
+  await handleWebhook(buildSignedRequest(payload), makeRes(), { queryFn: db.queryFn, notifyRefundEvent });
+  const dup = makeRes();
+  await handleWebhook(buildSignedRequest(payload), dup, { queryFn: db.queryFn, notifyRefundEvent });
+
+  assert.deepEqual(notified, [["order-1", "Refund Completed", "completed"]]);
+  assert.equal(dup.body.duplicate, true);
+  assert.equal(db.historyInserts.length, 1);
+});
+
+test("audit: a refund.processed that arrives while completeRefund is still 'processing' (no refund_reference saved yet) completes the refund and records the refund id instead of being dropped", async () => {
+  const db = makeFakeOrdersDb({
+    id: "order-1",
+    order_status: "delivered",
+    refund_status: "processing",
+    refund_reference: null,
+    payment_status: "paid",
+    razorpay_payment_id: "pay_abc123",
+  });
+  const notified = [];
+
+  await handleWebhook(
+    buildSignedRequest(refundPayloadWithNotes("refund.processed", "rfnd_race1", "pay_abc123", "order-1")),
+    makeRes(),
+    { queryFn: db.queryFn, notifyRefundEvent: (o, label) => notified.push(label) },
+  );
+
+  const order = db.orders.get("order-1");
+  assert.equal(order.refund_status, "completed");
+  assert.equal(order.refund_reference, "rfnd_race1");
+  assert.equal(order.payment_status, "refunded");
+  assert.deepEqual(notified, ["Refund Completed"]);
+});
+
+test("audit: a 'processing' order on the same payment is NOT completed by a refund whose notes name a different order (or no order)", async () => {
+  for (const notedOrder of ["order-OTHER", undefined]) {
+    const db = makeFakeOrdersDb({
+      id: "order-1",
+      order_status: "delivered",
+      refund_status: "processing",
+      refund_reference: null,
+      payment_status: "paid",
+      razorpay_payment_id: "pay_abc123",
+    });
+    const payload = refundPayloadWithNotes("refund.processed", "rfnd_dash", "pay_abc123", notedOrder);
+    if (!notedOrder) delete payload.payload.refund.entity.notes;
+    await handleWebhook(buildSignedRequest(payload), makeRes(), {
+      queryFn: db.queryFn,
+      notifyRefundEvent: () => assert.fail("must not notify"),
+    });
+    assert.equal(db.orders.get("order-1").refund_status, "processing");
+    assert.equal(db.orders.get("order-1").refund_reference, null);
+  }
+});
+
+test("audit: refund.failed leaves refund state unchanged but records an admin history row", async () => {
+  const db = makeFakeOrdersDb({
+    id: "order-1",
+    order_status: "delivered",
+    refund_status: "initiated",
+    refund_reference: "rfnd_test1",
+    payment_status: "paid",
+  });
+  await handleWebhook(buildSignedRequest(refundFailedPayload("rfnd_test1")), makeRes(), { queryFn: db.queryFn });
+  assert.equal(db.orders.get("order-1").refund_status, "initiated");
+  assert.equal(db.historyInserts.length, 1);
+  assert.match(db.historyInserts[0][3], /FAILED — needs manual review/);
 });

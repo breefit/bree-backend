@@ -332,9 +332,9 @@ const createFakeNotificationsTable = () => {
       rows.get(key).status = "sent";
       return { rowCount: 1 };
     }
-    if (normalized.includes("SET status = 'failed'")) {
-      const [, key] = params;
-      rows.get(key).status = "failed";
+    if (normalized.includes("SET status = ?, last_error = ?")) {
+      const [outcome, , key] = params;
+      rows.get(key).status = outcome;
       return { rowCount: 1 };
     }
     throw new Error(`Unhandled fake order_status_notifications query: ${normalized}`);

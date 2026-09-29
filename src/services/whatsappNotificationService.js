@@ -25,7 +25,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 |
 */
 
-const REQUEST_TIMEOUT_MS = 10000;
+const REQUEST_TIMEOUT_MS = Number(process.env.WAPLIFY_REQUEST_TIMEOUT_MS) || 10000;
 
 const MAX_RETRIES = 3;
 
@@ -33,17 +33,55 @@ const BASE_RETRY_DELAY_MS = 1000;
 
 const MAX_RETRY_DELAY_MS = 8000;
 
-const RETRYABLE_STATUS_CODES = [429, 500, 502, 503, 504];
+// FIX (WhatsApp retry idempotency audit): Waplify's send API has no
+// idempotency key, client reference or dedupe, and no endpoint to look a
+// message up afterwards (docs.waplify.io — Send Template Message / API
+// reference). So a request is only ever re-sent automatically when it
+// provably was NOT accepted. Everything else is a single attempt:
+//
+//   sent     2xx                                   → success
+//   failed   4xx (except 429)                      → known failure, never accepted
+//   (retry)  429 rate limit, or the TCP connection  → provably not accepted;
+//            was never established                   retried with backoff, and
+//                                                     'failed' if still refused
+//   unknown  5xx, timeout, connection reset, any    → Waplify may have accepted
+//            other error after the request left       and sent it; NOT retried
+//
+// Previously 500/502/503/504 and every network error (including a 10s
+// timeout of a request Waplify had already accepted) were re-POSTed up to
+// 3 times — a duplicate WhatsApp message to the customer each time.
+const NOT_ACCEPTED_STATUS_CODES = [429];
 
-// Axios error codes that indicate a network-level failure (no HTTP
-// response was ever received) and are therefore safe to retry.
-const RETRYABLE_NETWORK_ERROR_CODES = [
-  "ECONNABORTED", // timeout
-  "ECONNRESET",
-  "ETIMEDOUT",
-  "ENOTFOUND",
-  "EAI_AGAIN",
-];
+// No TCP connection was ever made, so the request cannot have reached
+// Waplify. ETIMEDOUT/ECONNRESET are deliberately absent: they can happen
+// after the request body was written.
+const CONNECTION_NEVER_ESTABLISHED_CODES = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"];
+
+export const WHATSAPP_DELIVERY_OUTCOME = Object.freeze({
+  FAILED: "failed",
+  UNKNOWN: "unknown",
+});
+
+/**
+ * Classifies a failed Waplify call.
+ * @returns {{ retrySafe: boolean, outcome: "failed"|"unknown" }}
+ */
+export const classifyWaplifyError = (error) => {
+  const status = error?.response?.status;
+  if (status) {
+    if (NOT_ACCEPTED_STATUS_CODES.includes(status)) {
+      return { retrySafe: true, outcome: WHATSAPP_DELIVERY_OUTCOME.FAILED };
+    }
+    if (status >= 400 && status < 500) {
+      return { retrySafe: false, outcome: WHATSAPP_DELIVERY_OUTCOME.FAILED };
+    }
+    return { retrySafe: false, outcome: WHATSAPP_DELIVERY_OUTCOME.UNKNOWN };
+  }
+  if (CONNECTION_NEVER_ESTABLISHED_CODES.includes(error?.code)) {
+    return { retrySafe: true, outcome: WHATSAPP_DELIVERY_OUTCOME.FAILED };
+  }
+  return { retrySafe: false, outcome: WHATSAPP_DELIVERY_OUTCOME.UNKNOWN };
+};
 
 const DEFAULT_CONTACT_NAME = "BREE Customer";
 
@@ -347,28 +385,10 @@ const formatButtonData = (buttonParameters) => {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Determines whether a failed Waplify API call is safe to retry.
- *
- * Retries are only appropriate for transient failures: network-level
- * errors (no response received — timeout, connection reset, DNS
- * failure, etc.) and rate limit / server errors (HTTP 429, 500, 502,
- * 503, 504). Other client errors (4xx) — invalid template, bad
- * parameters, auth issues, etc. — are never retried since retrying
- * would fail identically every time.
- *
- * @param {Object} error - The Axios error thrown by the failed request.
- * @returns {boolean} `true` if the request should be retried.
+ * Whether a failed Waplify call may be re-sent automatically — only when
+ * it provably was not accepted (see classifyWaplifyError above).
  */
-const isRetryableError = (error) => {
-  if (!error?.response) {
-    // No response at all means a network-level failure. Treat as
-    // retryable by default; RETRYABLE_NETWORK_ERROR_CODES is used only
-    // to make the intent explicit for common cases (timeouts, resets).
-    return true;
-  }
-
-  return RETRYABLE_STATUS_CODES.includes(error.response.status);
-};
+const isRetryableError = (error) => classifyWaplifyError(error).retrySafe;
 
 /**
  * Computes how long to wait before the next retry attempt.
@@ -458,11 +478,13 @@ const buildErrorMessage = (error, templateName) => {
  * compatible — existing callers that only pass `parameters` (body text)
  * continue to work unchanged.
  *
- * Automatically retries transient failures (network errors, HTTP 429,
- * and HTTP 5xx responses) up to `MAX_RETRIES` times, honoring the
- * `Retry-After` header when present and otherwise using exponential
- * backoff. Other client errors (4xx — invalid template/parameters/auth)
- * are not retried.
+ * Automatically retries ONLY failures where Waplify provably did not
+ * accept the request (HTTP 429, or no TCP connection) up to `MAX_RETRIES`
+ * times, honoring `Retry-After` / exponential backoff. A 5xx, timeout or
+ * connection reset is an UNKNOWN outcome (the message may already be on
+ * its way) and is never re-sent — the thrown error carries
+ * `deliveryOutcome: "unknown"` so claim layers record it as such rather
+ * than as a retryable failure. Other 4xx carry `deliveryOutcome: "failed"`.
  *
  * @param {Object} params
  * @param {string|number} params.mobile - Recipient's Indian mobile number
@@ -585,7 +607,16 @@ export const sendTemplateMessage = async ({
           { durationMs, requestId, retryAttempt: attempt },
         );
 
-        throw new Error(buildErrorMessage(error, templateName));
+        const { outcome } = classifyWaplifyError(error);
+        const sendError = new Error(buildErrorMessage(error, templateName));
+        sendError.deliveryOutcome = outcome;
+        sendError.retryAttempts = attempt;
+        if (outcome === WHATSAPP_DELIVERY_OUTCOME.UNKNOWN) {
+          console.error(
+            `[WhatsApp] UNKNOWN_OUTCOME | ${templateName} | ${maskedMobile} | status=${error?.response?.status ?? error?.code ?? "network"} | not retried — Waplify may have accepted it`,
+          );
+        }
+        throw sendError;
       }
 
       const delayMs = getRetryDelayMs(error, attempt);

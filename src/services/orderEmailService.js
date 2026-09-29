@@ -87,7 +87,16 @@ const COLORS = {
   white: "#FFFFFF",
 };
 
-const formatOrderRef = (orderId) => String(orderId).slice(-8).toUpperCase();
+// FIX (return/refund E2E audit): the last-8-characters shortening is meant
+// for UUID fallbacks only — applied to a real order number it mangled
+// "BREE-100018" into "#E-100018" in every email that passed orderNumber.
+const HUMAN_ORDER_NUMBER = /^[A-Z]+-[A-Z0-9-]+$/i;
+export const formatOrderRef = (orderId) => {
+  const ref = String(orderId);
+  return HUMAN_ORDER_NUMBER.test(ref) && ref.length <= 24
+    ? ref.toUpperCase()
+    : ref.slice(-8).toUpperCase();
+};
 
 const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString()}`;
 

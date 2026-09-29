@@ -1,5 +1,6 @@
 import { query } from "../config/database.js";
 import cache from "../utils/cache.js";
+import { customerVisibleWhere } from "../constants/productVisibility.js";
 
 const PRODUCT_LIST_TTL = 300;
 const PRODUCT_DETAIL_TTL = 600;
@@ -33,13 +34,13 @@ const PRODUCT_SELECT = `
   p.daily_reminder_original_price
 `;
 
-const getProductShippingColumnsAvailable = async () => {
+const getProductShippingColumnsAvailable = async (queryFn = query) => {
   if (productShippingColumnsAvailable !== null) {
     return productShippingColumnsAvailable;
   }
 
   try {
-    const { rows } = await query(
+    const { rows } = await queryFn(
       "SHOW COLUMNS FROM products LIKE 'is_free_shipping'",
     );
     productShippingColumnsAvailable = rows.length > 0;
@@ -50,8 +51,8 @@ const getProductShippingColumnsAvailable = async () => {
   return productShippingColumnsAvailable;
 };
 
-const getProductSelectQuery = async () => {
-  const hasShippingColumns = await getProductShippingColumnsAvailable();
+const getProductSelectQuery = async (queryFn = query) => {
+  const hasShippingColumns = await getProductShippingColumnsAvailable(queryFn);
   const shippingColumns = hasShippingColumns
     ? `,
   p.is_free_shipping,
@@ -69,7 +70,8 @@ const getProductSelectQuery = async () => {
 // GET ALL PRODUCTS
 // ============================================================
 
-export const getProducts = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getProducts = async (req, res, { queryFn = query } = {}) => {
   try {
     const category = req.query.category?.trim();
     const cacheKey = category
@@ -82,16 +84,16 @@ export const getProducts = async (req, res) => {
     }
 
     const hasCategory = Boolean(category);
-    const productSelect = await getProductSelectQuery();
+    const productSelect = await getProductSelectQuery(queryFn);
     const queryText = `
       ${productSelect}
-      WHERE p.is_active = 1
+      WHERE ${customerVisibleWhere("p")}
       ${hasCategory ? "AND p.category = ?" : ""}
       ORDER BY p.display_order ASC, p.created_at ASC
     `;
     const params = hasCategory ? [category] : [];
 
-    const { rows } = await query(queryText, params);
+    const { rows } = await queryFn(queryText, params);
     const normalizedRows = rows.map((row) => {
       const isFreeShipping =
         row.is_free_shipping === true ||
@@ -125,7 +127,8 @@ export const getProducts = async (req, res) => {
 // GET SINGLE PRODUCT
 // ============================================================
 
-export const getProduct = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getProduct = async (req, res, { queryFn = query } = {}) => {
   try {
     const cacheKey = `products:id:${req.params.id}`;
     const cached = cache.get(cacheKey);
@@ -133,12 +136,12 @@ export const getProduct = async (req, res) => {
       return res.json(cached);
     }
 
-    const productSelect = await getProductSelectQuery();
-    const { rows } = await query(
+    const productSelect = await getProductSelectQuery(queryFn);
+    const { rows } = await queryFn(
       `
       ${productSelect}
       WHERE (p.id = ? OR p.slug = ?)
-      AND p.is_active = 1
+      AND ${customerVisibleWhere("p")}
       LIMIT 1
       `,
       [req.params.id, req.params.id],
@@ -188,7 +191,8 @@ export const getProduct = async (req, res) => {
 // GET HOME PRODUCTS
 // ============================================================
 
-export const getHomeProducts = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getHomeProducts = async (req, res, { queryFn = query } = {}) => {
   try {
     const cacheKey = "products:home";
     const cached = cache.get(cacheKey);
@@ -196,19 +200,19 @@ export const getHomeProducts = async (req, res) => {
       return res.json(cached);
     }
 
-    const productSelect = await getProductSelectQuery();
+    const productSelect = await getProductSelectQuery(queryFn);
 
     // Lead with journey_level=1 product (trial), then popular product
-    const trialRes = await query(`
+    const trialRes = await queryFn(`
       ${productSelect}
-      WHERE p.is_active = 1
+      WHERE ${customerVisibleWhere("p")}
       AND p.journey_level = 1
       LIMIT 1
     `);
 
-    const featuredRes = await query(`
+    const featuredRes = await queryFn(`
       ${productSelect}
-      WHERE p.is_active = 1
+      WHERE ${customerVisibleWhere("p")}
       AND p.popular = 1
       LIMIT 1
     `);
@@ -229,10 +233,10 @@ export const getHomeProducts = async (req, res) => {
     if (results.length < 3) {
       const excludedIds = results.map((r) => r.id);
       const placeholders = excludedIds.map(() => "?").join(", ");
-      const { rows } = await query(
+      const { rows } = await queryFn(
         `
         ${productSelect}
-        WHERE p.is_active = 1
+        WHERE ${customerVisibleWhere("p")}
         ${excludedIds.length ? `AND p.id NOT IN (${placeholders})` : ""}
         ORDER BY p.display_order ASC, p.created_at ASC
         LIMIT ?
@@ -254,7 +258,8 @@ export const getHomeProducts = async (req, res) => {
 // CATEGORIES
 // ============================================================
 
-export const getCategories = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getCategories = async (req, res, { queryFn = query } = {}) => {
   try {
     const cacheKey = "products:categories";
     const cached = cache.get(cacheKey);
@@ -262,8 +267,8 @@ export const getCategories = async (req, res) => {
       return res.json(cached);
     }
 
-    const { rows } = await query(
-      `SELECT DISTINCT category FROM products WHERE is_active = 1 AND category IS NOT NULL ORDER BY category ASC`,
+    const { rows } = await queryFn(
+      `SELECT DISTINCT category FROM products WHERE ${customerVisibleWhere()} AND category IS NOT NULL ORDER BY category ASC`,
     );
 
     const categories = rows.map((row) => row.category).filter(Boolean);
@@ -279,7 +284,8 @@ export const getCategories = async (req, res) => {
 // HOME DATA
 // ============================================================
 
-export const getHomeData = async (req, res) => {
+// `queryFn` injectable only for tests (default to the real pool).
+export const getHomeData = async (req, res, { queryFn = query } = {}) => {
   try {
     const cacheKey = "home:data";
     const cached = cache.get(cacheKey);
@@ -302,26 +308,26 @@ export const getHomeData = async (req, res) => {
       },
     ];
 
-    const productSelect = await getProductSelectQuery();
+    const productSelect = await getProductSelectQuery(queryFn);
 
     const [featuredRes, popularRes, categoriesRes, testimonialsRes] =
       await Promise.all([
-        query(`
+        queryFn(`
           ${productSelect}
-          WHERE p.is_active = 1
+          WHERE ${customerVisibleWhere("p")}
           AND p.journey_level = 1
           LIMIT 1
         `),
-        query(`
+        queryFn(`
           ${productSelect}
-          WHERE p.is_active = 1
+          WHERE ${customerVisibleWhere("p")}
           AND p.popular = 1
           LIMIT 4
         `),
-        query(
-          `SELECT DISTINCT category FROM products WHERE is_active = 1 AND category IS NOT NULL ORDER BY category ASC`,
+        queryFn(
+          `SELECT DISTINCT category FROM products WHERE ${customerVisibleWhere()} AND category IS NOT NULL ORDER BY category ASC`,
         ),
-        query(`
+        queryFn(`
           SELECT id, user_id, name, role, avatar, text, rating, created_at, updated_at
           FROM testimonials
           WHERE status = 'approved'
@@ -362,7 +368,8 @@ export const getHomeData = async (req, res) => {
 //   journey_level = 5+        → return []
 //
 // Filters applied automatically:
-//   - inactive products excluded  (is_active = 1)
+//   - deleted (is_active = 0) and hidden (is_visible = 0) products excluded,
+//     both as the SOURCE product and as any recommended product
 //   - subscription products excluded from upgrade suggestions
 //
 // The caller (CartDrawer) further filters products already in the cart.
@@ -384,7 +391,7 @@ export const getRecommendations = async (req, res, { queryFn = query } = {}) => 
       SELECT id, name, journey_level, show_recommendations, is_subscription
       FROM products
       WHERE (id = ? OR slug = ?)
-        AND is_active = 1
+        AND ${customerVisibleWhere()}
       LIMIT 1
       `,
       [prodId, prodId],
@@ -423,32 +430,55 @@ export const getRecommendations = async (req, res, { queryFn = query } = {}) => 
     // otherwise. The frontend (CartDrawer) renders a single flat list and
     // doesn't discriminate by relation_type, so all types are included
     // together, ordered by admin-assigned weight.
+    //
+    // Product visibility: the INNER JOIN drops relations whose target row no
+    // longer exists, and customerVisibleWhere("p") drops targets that are
+    // deleted (is_active = 0) or hidden (is_visible = 0). Filtering happens
+    // in SQL, so a hidden product never reaches this process as a
+    // recommendation candidate.
     const { rows: relationRows } = await queryFn(
       `SELECT p.id, p.name, p.slug, p.image, p.price, p.mrp, p.quantity,
               p.is_subscription, p.journey_level, p.is_free_shipping,
               p.shipping_charge, p.estimated_delivery
        FROM product_relations pr
        JOIN products p ON p.id = pr.related_product_id
-       WHERE pr.product_id = ? AND p.is_active = 1
+       WHERE pr.product_id = ? AND ${customerVisibleWhere("p")}
        ORDER BY pr.weight DESC, p.name ASC`,
       [product.id],
     );
 
-    if (relationRows.length > 0) {
-      const adminRecommendations = relationRows.map((prod) => ({
-        id: prod.id,
-        name: prod.name,
-        slug: prod.slug,
-        image: prod.image,
-        price: parseFloat(prod.price),
-        mrp: parseFloat(prod.mrp),
-        quantity: prod.quantity,
-        is_subscription: prod.is_subscription,
-        journey_level: prod.journey_level,
-        is_free_shipping: prod.is_free_shipping,
-        shipping_charge: prod.shipping_charge,
-        estimated_delivery: prod.estimated_delivery,
-      }));
+    // An admin who configured relations for this product has made an
+    // explicit choice. If every configured target is now hidden/deleted,
+    // return [] rather than silently substituting journey-level products
+    // the admin never picked. Only a product with NO configured relations
+    // falls through to the automatic journey rule below.
+    let hasConfiguredRelations = relationRows.length > 0;
+    if (!hasConfiguredRelations) {
+      const { rows: configuredRows } = await queryFn(
+        `SELECT 1 AS configured FROM product_relations
+         WHERE product_id = ? LIMIT 1`,
+        [product.id],
+      );
+      hasConfiguredRelations = configuredRows.length > 0;
+    }
+
+    if (hasConfiguredRelations) {
+      const adminRecommendations = relationRows
+        .filter((prod) => prod && prod.id)
+        .map((prod) => ({
+          id: prod.id,
+          name: prod.name,
+          slug: prod.slug,
+          image: prod.image,
+          price: parseFloat(prod.price),
+          mrp: parseFloat(prod.mrp),
+          quantity: prod.quantity,
+          is_subscription: prod.is_subscription,
+          journey_level: prod.journey_level,
+          is_free_shipping: prod.is_free_shipping,
+          shipping_charge: prod.shipping_charge,
+          estimated_delivery: prod.estimated_delivery,
+        }));
       cache.set(cacheKey, adminRecommendations, RECOMMENDATIONS_TTL);
       return res.json(adminRecommendations);
     }
@@ -505,7 +535,7 @@ export const getRecommendations = async (req, res, { queryFn = query } = {}) => 
         estimated_delivery
       FROM products
       WHERE journey_level IN (${placeholders})
-        AND is_active = 1
+        AND ${customerVisibleWhere()}
         AND is_subscription = 0
       ORDER BY journey_level ASC
       `,

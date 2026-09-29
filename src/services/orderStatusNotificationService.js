@@ -140,36 +140,58 @@ export const sendOrderStatusNotificationOnce = async ({
     return { sent: false, duplicate: true };
   }
 
+  let sendResult;
   try {
-    const sendResult = await send();
+    sendResult = await send();
+  } catch (error) {
+    // FIX (WhatsApp retry idempotency audit): a send whose outcome is
+    // unknown (Waplify 5xx / timeout / reset — see classifyWaplifyError)
+    // may already have reached the customer. It is recorded as 'unknown',
+    // which neither retryFailed nor any other path reclaims — re-sending
+    // it could duplicate the message. Only a known failure is 'failed'.
+    const outcome = error?.deliveryOutcome === "unknown" ? "unknown" : "failed";
+    await queryExecutor(
+      `UPDATE order_status_notifications
+       SET status = ?, last_error = ?
+       WHERE notification_key = ? AND status = 'sending'`,
+      [outcome, String(error?.message || error).slice(0, 1000), notificationKey],
+    );
+    logNotification({
+      ...logCtx,
+      action: outcome === "unknown" ? "unknown_outcome" : "failed",
+      result: "failure",
+      error: error?.message || error,
+    });
+    throw error;
+  }
+
+  // FIX (WhatsApp retry idempotency audit): the provider has accepted the
+  // message. A DB error recording that used to fall into the catch above
+  // and mark the row 'failed' — i.e. retryable — for a message the
+  // customer already received. It is logged instead and never re-marked.
+  try {
     await queryExecutor(
       `UPDATE order_status_notifications
        SET status = 'sent', sent_at = NOW(), last_error = NULL
        WHERE notification_key = ? AND status = 'sending'`,
       [notificationKey],
     );
+  } catch (recordError) {
     logNotification({
       ...logCtx,
-      action: "sent",
+      action: "sent_not_recorded",
       result: "success",
-      providerMessageId: extractProviderMessageId(sendResult),
+      error: recordError?.message || recordError,
     });
-    return { sent: true, duplicate: false };
-  } catch (error) {
-    await queryExecutor(
-      `UPDATE order_status_notifications
-       SET status = 'failed', last_error = ?
-       WHERE notification_key = ? AND status = 'sending'`,
-      [String(error?.message || error).slice(0, 1000), notificationKey],
-    );
-    logNotification({
-      ...logCtx,
-      action: "failed",
-      result: "failure",
-      error: error?.message || error,
-    });
-    throw error;
+    return { sent: true, duplicate: false, recorded: false };
   }
+  logNotification({
+    ...logCtx,
+    action: "sent",
+    result: "success",
+    providerMessageId: extractProviderMessageId(sendResult),
+  });
+  return { sent: true, duplicate: false };
 };
 
 export default sendOrderStatusNotificationOnce;

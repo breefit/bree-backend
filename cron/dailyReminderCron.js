@@ -214,18 +214,26 @@ export const resolveReminderSendSuccess = async (
   );
 };
 
-/** Resolves a claimed send slot as failed — reclaimable by the next tick. */
+/**
+ * Resolves a claimed send slot as failed. A known failure ('failed') is
+ * reclaimable by the next tick. FIX (WhatsApp retry idempotency audit): an
+ * UNKNOWN outcome (Waplify 5xx / timeout / reset — the reminder may already
+ * have been delivered) is stored as 'unknown', which the claim never
+ * reclaims — the next tick used to re-send it, duplicating the reminder.
+ */
 export const resolveReminderSendFailure = async (
   reminderId,
   sendDate,
   errorMessage,
   queryExecutor = query,
+  { deliveryOutcome } = {},
 ) => {
+  const outcome = deliveryOutcome === "unknown" ? "unknown" : "failed";
   await queryExecutor(
     `UPDATE daily_reminder_sends
-     SET status = 'failed', error_message = ?
+     SET status = ?, error_message = ?
      WHERE reminder_id = ? AND send_date = ? AND status = 'sending'`,
-    [String(errorMessage || "Unknown error").slice(0, 1000), reminderId, sendDate],
+    [outcome, String(errorMessage || "Unknown error").slice(0, 1000), reminderId, sendDate],
   );
 };
 
@@ -307,7 +315,7 @@ export const acquireReminderSendGuard = async (
     await client.query("BEGIN");
 
     const { rows: orderRows } = await client.query(
-      `SELECT return_status FROM orders WHERE id = ? LOCK IN SHARE MODE`,
+      `SELECT return_status, order_status FROM orders WHERE id = ? LOCK IN SHARE MODE`,
       [orderId],
     );
     const { rows: reminderRows } = await client.query(
@@ -323,6 +331,15 @@ export const acquireReminderSendGuard = async (
       reason = "order_not_found";
     } else if (isReminderBlockedByReturnStatus(returnStatus)) {
       reason = "return_approved";
+    } else if (
+      String(orderRows[0].order_status || "").trim().toLowerCase() === "returned"
+    ) {
+      // FIX (return/refund E2E audit): an order an admin set to
+      // order_status 'returned' directly (the manual status path, open to
+      // orders without a Delhivery AWB) never goes through approveReturn, so
+      // nothing stopped its reminder — the product is back with BREE, yet
+      // the customer kept getting daily reminders.
+      reason = "order_returned";
     } else if (
       !reminderRow ||
       Number(reminderRow.reminder_enabled) !== 1 ||
@@ -568,6 +585,7 @@ export const runDailyReminderScheduler = async () => {
         continue;
       }
 
+      let providerAccepted = false;
       try {
         // Send the WhatsApp reminder
         // Claim the send slot BEFORE calling the provider — this is what
@@ -594,7 +612,7 @@ export const runDailyReminderScheduler = async () => {
         console.info(
           `[DAILY_REMINDER] ATTEMPT | reminderId=${reminderId} | orderId=${reminder.order_id} | channel=whatsapp | phone=${maskMobile(sendMobile)}`,
         );
-        const { success, result, error: sendError } = await safelySendWhatsApp(
+        const sendOutcome = await safelySendWhatsApp(
           `daily-reminder-${reminderId}`,
           () =>
             sendDailyWellnessReminder({
@@ -602,6 +620,8 @@ export const runDailyReminderScheduler = async () => {
               customerName: customer_name,
             }),
         );
+        const { success, result, error: sendError } = sendOutcome;
+        providerAccepted = success;
 
         if (success) {
           const messageId = result?.data?.message_id || null;
@@ -614,7 +634,9 @@ export const runDailyReminderScheduler = async () => {
         } else {
           failed++;
           const errorMessage = sendError?.message || String(sendError || "Unknown error");
-          await resolveReminderSendFailure(reminderId, today, errorMessage);
+          await resolveReminderSendFailure(reminderId, today, errorMessage, undefined, {
+            deliveryOutcome: sendError?.deliveryOutcome,
+          });
 
           console.error(
             `[DAILY_REMINDER] FAILED | reminderId=${reminderId} | orderId=${reminder.order_id} | phone=${maskMobile(sendMobile)} | error=${errorMessage}`,
@@ -622,7 +644,12 @@ export const runDailyReminderScheduler = async () => {
         }
       } catch (error) {
         failed++;
-        await resolveReminderSendFailure(reminderId, today, error.message);
+        // FIX (WhatsApp retry idempotency audit): if Waplify already
+        // accepted the reminder and only recording it failed, the slot must
+        // not become a retryable 'failed' — the next tick would send it again.
+        await resolveReminderSendFailure(reminderId, today, error.message, undefined, {
+          deliveryOutcome: providerAccepted ? "unknown" : undefined,
+        });
 
         console.error(
           `[DAILY_REMINDER] FAILED | reminderId=${reminderId} | orderId=${reminder.order_id} | error=${error.message}`,

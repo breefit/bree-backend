@@ -328,15 +328,19 @@ test("Y: repeat click / retry never creates a second Delhivery reverse shipment"
   await call(returns.approveReturn, lost.id, { reason: "Quality Issue" });
   delhivery.createMode = "manifest_then_500";
   const first = await call(returns.createReverseShipment, lost.id);
-  assert.equal(first.statusCode, 500);
+  // H4: a 5xx after Delhivery manifested it is an UNCERTAIN outcome, not a
+  // failure — recorded, and it blocks any automatic re-creation.
+  assert.equal(first.statusCode, 409);
+  assert.equal(first.body.code, "REVERSE_SHIPMENT_OUTCOME_UNCERTAIN");
   assert.equal((await row(lost.id)).return_status, "approved");
   assert.equal((await row(lost.id)).reverse_awb, null);
+  assert.equal((await row(lost.id)).reverse_shipment_create_status, "uncertain");
 
   delhivery.createMode = "ok";
   const retry = await call(returns.createReverseShipment, lost.id);
-  assert.equal(retry.statusCode, 400, "the same reverse reference is refused by Delhivery instead of manifesting a duplicate");
+  assert.equal(retry.statusCode, 409, "retry refused locally while the outcome is uncertain");
   const references = delhivery.creates.map((p) => p.shipments[0].order).filter((r) => r.startsWith(lost.orderNumber));
-  assert.deepEqual(references, [`${lost.orderNumber}-RETURN`, `${lost.orderNumber}-RETURN`]);
+  assert.deepEqual(references, [`${lost.orderNumber}-RETURN`], "the retry never reached Delhivery");
   assert.equal([...delhivery.manifestedReferences].filter((r) => r.startsWith(lost.orderNumber)).length, 1);
 });
 

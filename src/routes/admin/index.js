@@ -17,6 +17,7 @@ import {
   createProduct,
   updateProduct,
   deleteProduct,
+  setProductVisibility,
   setProductRelations,
   getProductRelations,
 } from "../../controllers/admin/productController.js";
@@ -127,6 +128,7 @@ router.patch("/orders/:orderId/refund/complete", completeRefund);
 router.get("/products", getProducts);
 router.post("/products", upload.single("image"), createProduct);
 router.put("/products/:id", upload.single("image"), updateProduct);
+router.patch("/products/:id/visibility", setProductVisibility);
 router.delete("/products/:id", deleteProduct);
 router.get("/products/:id/relations", getProductRelations);
 // Product relations management — whole-set replace only; there is no

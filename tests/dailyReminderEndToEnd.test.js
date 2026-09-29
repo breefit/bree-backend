@@ -355,27 +355,52 @@ test("Scenario E (after window): a failure on the last in-window tick stays 'fai
   ]);
 });
 
-test("Scenario E (retryable): WAPLIFY 503 is retried inside the same send and succeeds without a duplicate row", { skip }, async () => {
-  const r = await seedReminder();
-  at("2026-09-24 13:30");
-  await deliverNow(r);
-
+// FIX (WhatsApp retry idempotency audit): a 503 used to be re-POSTed inside
+// the same send. Waplify has no idempotency key, and a 5xx does not prove
+// the message was not accepted — so it is now an UNKNOWN outcome: sent at
+// most once, recorded 'unknown', and never re-sent by a later tick.
+const withStatusSequence = async (sequence, fn) => {
   let calls = 0;
   const origStatus = Object.getOwnPropertyDescriptor(waplify, "status");
   Object.defineProperty(waplify, "status", {
     configurable: true,
-    get: () => (++calls === 1 ? 503 : 200),
+    get: () => sequence[Math.min(calls++, sequence.length - 1)],
     set: () => {},
   });
   waplify.retryAfter = 0;
   try {
-    at("2026-09-25 05:00");
-    const result = await cron.runDailyReminderScheduler();
-    assert.equal(result.sent, 1);
+    return await fn();
   } finally {
     Object.defineProperty(waplify, "status", origStatus);
   }
-  assert.equal(waplify.requests.length, 2); // 503 then 200
+};
+
+test("Scenario E (uncertain): WAPLIFY 503 is NOT retried — slot 'unknown', and later in-window ticks never re-send it", { skip }, async () => {
+  const r = await seedReminder();
+  at("2026-09-24 13:30");
+  await deliverNow(r);
+
+  await withStatusSequence([503, 200], async () => {
+    at("2026-09-25 05:00");
+    const result = await cron.runDailyReminderScheduler();
+    assert.deepEqual(result, { processed: 1, sent: 0, skipped: 0, failed: 1 });
+    await tickEveryMinute("2026-09-25", "05:01", "05:05");
+  });
+  assert.equal(waplify.requests.length, 1, "one POST in total — no in-send retry, no next-tick retry");
+  assert.deepEqual((await sends(r.reminderId)).map((s) => s.status), ["unknown"]);
+});
+
+test("Scenario E (rate limited): WAPLIFY 429 (provably not accepted) is still retried inside the same send and succeeds without a duplicate row", { skip }, async () => {
+  const r = await seedReminder();
+  at("2026-09-24 13:30");
+  await deliverNow(r);
+
+  await withStatusSequence([429, 200], async () => {
+    at("2026-09-25 05:00");
+    const result = await cron.runDailyReminderScheduler();
+    assert.equal(result.sent, 1);
+  });
+  assert.equal(waplify.requests.length, 2); // 429 then 200
   assert.deepEqual((await sends(r.reminderId)).map((s) => s.status), ["success"]);
 });
 

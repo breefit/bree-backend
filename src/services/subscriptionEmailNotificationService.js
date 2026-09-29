@@ -76,22 +76,36 @@ export const sendSubscriptionNotificationOnce = async ({
 
   try {
     await send();
+  } catch (error) {
+    // Unknown-outcome WhatsApp sends are never reclaimed (see
+    // orderStatusNotificationService.js for the full rationale).
+    const outcome = error?.deliveryOutcome === "unknown" ? "unknown" : "failed";
+    await queryExecutor(
+      `UPDATE subscription_email_notifications
+       SET status = ?, last_error = ?
+       WHERE notification_key = ? AND status = 'sending'`,
+      [outcome, String(error?.message || error).slice(0, 1000), notificationKey],
+    );
+    throw error;
+  }
+
+  // Sent: a DB error recording it must never turn into a retryable
+  // 'failed' row (see orderStatusNotificationService.js).
+  try {
     await queryExecutor(
       `UPDATE subscription_email_notifications
        SET status = 'sent', sent_at = NOW(), last_error = NULL
        WHERE notification_key = ? AND status = 'sending'`,
       [notificationKey],
     );
-    return { sent: true, duplicate: false };
-  } catch (error) {
-    await queryExecutor(
-      `UPDATE subscription_email_notifications
-       SET status = 'failed', last_error = ?
-       WHERE notification_key = ? AND status = 'sending'`,
-      [String(error?.message || error).slice(0, 1000), notificationKey],
-    );
-    throw error;
+  } catch (recordError) {
+    console.error("[SUBSCRIPTION_NOTIFICATION] sent but not recorded", {
+      notificationKey,
+      error: recordError?.message || String(recordError),
+    });
+    return { sent: true, duplicate: false, recorded: false };
   }
+  return { sent: true, duplicate: false };
 };
 
 // Backward-compatible name — every existing email call site imports this;

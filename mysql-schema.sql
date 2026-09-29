@@ -114,6 +114,9 @@ CREATE TABLE IF NOT EXISTS products (
   featured                TINYINT(1)    NOT NULL DEFAULT 0,
   popular                 TINYINT(1)    NOT NULL DEFAULT 0,
   is_active               TINYINT(1)    NOT NULL DEFAULT 1,
+  -- "Show in User UI" toggle — separate from is_active (soft-delete). See
+  -- src/constants/productVisibility.js.
+  is_visible              TINYINT(1)    NOT NULL DEFAULT 1,
   discount                DECIMAL(6,2)  DEFAULT NULL,
   created_at              DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at              DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -127,6 +130,7 @@ CREATE TABLE IF NOT EXISTS products (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE INDEX idx_products_active        ON products(is_active);
+CREATE INDEX idx_products_visible       ON products(is_visible);
 CREATE INDEX idx_products_featured      ON products(featured);
 CREATE INDEX idx_products_display_order ON products(display_order);
 
@@ -431,6 +435,18 @@ CREATE TABLE IF NOT EXISTS webhook_events (
   created_at     DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
   processed_at   DATETIME      NULL DEFAULT NULL,
   UNIQUE KEY uq_webhook_events_provider_event_id (provider, event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- TABLE: admin_session_revocations  (logged-out admin session tokens; see
+-- src/services/socketAuth.js — SHA-256 of the token, never the token itself)
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS admin_session_revocations (
+  token_hash  CHAR(64)  NOT NULL PRIMARY KEY,
+  admin_id    CHAR(36)  NOT NULL,
+  expires_at  DATETIME  NOT NULL,
+  created_at  DATETIME  NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_admin_session_revocations_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------

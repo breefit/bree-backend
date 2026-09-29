@@ -343,16 +343,21 @@ class DelhiveryService {
       return formatted;
     }
 
+    // `code` (e.g. ECONNABORTED timeout, ECONNRESET, ECONNREFUSED) is kept
+    // so callers can tell "never reached Delhivery" from "sent, but the
+    // response was lost" — see returnController.createReverseShipment.
     if (error.request) {
       return {
         success: false,
         message: "No response received from Delhivery.",
+        code: error.code || null,
       };
     }
 
     return {
       success: false,
       message: error.message,
+      code: error.code || null,
     };
   }
 }

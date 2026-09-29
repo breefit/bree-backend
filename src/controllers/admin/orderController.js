@@ -14,6 +14,7 @@ import {
 } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 import { activateReminderFromDelivery } from "../../services/dailyReminderService.js";
+import { publishOrderUpdateFromRequest } from "../../services/orderRealtime.js";
 import { invalidateDashboardCache } from "./dashboardController.js";
 import { shouldSendBreeStatusWhatsApp } from "../shippingController.js";
 import {
@@ -218,6 +219,10 @@ export const getOrders = async (req, res) => {
               o.reverse_shipment_created_at,
               o.reverse_shipment_type,
               o.reverse_shipment_reference,
+              o.reverse_shipment_create_status,
+              o.reverse_shipment_create_attempted_at,
+              o.reverse_shipment_create_error,
+              o.reverse_shipment_unconfirmed_awb,
               o.reverse_tracking_status,
               o.reverse_tracking_raw_status,
               o.reverse_tracking_updated_at,
@@ -383,6 +388,10 @@ export const getOrder = async (req, res) => {
             o.reverse_shipment_created_at,
             o.reverse_shipment_type,
             o.reverse_shipment_reference,
+            o.reverse_shipment_create_status,
+            o.reverse_shipment_create_attempted_at,
+            o.reverse_shipment_create_error,
+            o.reverse_shipment_unconfirmed_awb,
             o.reverse_tracking_status,
             o.reverse_tracking_raw_status,
             o.reverse_tracking_updated_at,
@@ -735,12 +744,9 @@ export const updateOrderStatus = async (req, res) => {
     }
     // ===== End Added =====
 
-    try {
-      const io = req.app?.locals?.io;
-      if (io) io.emit("order:updated", updated);
-    } catch (e) {
-      // ignore socket errors
-    }
+    // FIX (Socket.IO security audit): this broadcast the full orders row
+    // (customer contact details, address, Razorpay ids) to every socket.
+    publishOrderUpdateFromRequest(req, updated);
 
     res.json({ success: true, message: "Order updated", order: updated });
   } catch (err) {
@@ -1050,15 +1056,9 @@ export const bulkUpdateStatus = async (req, res) => {
     }
     // ===== End Added =====
 
-    // Emit socket events
-    try {
-      const io = req.app?.locals?.io;
-      if (io) {
-        updated.forEach((u) => io.emit("order:updated", u));
-      }
-    } catch (e) {
-      // ignore socket errors
-    }
+    // Emit socket events — see services/orderRealtime.js (safe payload,
+    // admin + owner rooms only; used to broadcast full rows to everyone).
+    updated.forEach((u) => publishOrderUpdateFromRequest(req, u));
 
     // FIX (Medium #20 — Phase 3): see updateOrderStatus's matching comment.
     invalidateDashboardCache();

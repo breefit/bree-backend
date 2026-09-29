@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { customerVisibleWhere } from "../constants/productVisibility.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
 
 import { getRazorpay } from "../config/razorpay.js";
@@ -27,6 +28,7 @@ import {
   sendSubscriptionEmailOnce,
   sendSubscriptionNotificationOnce,
 } from "../services/subscriptionEmailNotificationService.js";
+import { publishOrderUpdateFromRequest } from "../services/orderRealtime.js";
 
 // ── Shared logger ────────────────────────────────────────────────────────────
 // NOTE: No shared logging utility was found/confirmed in this codebase during
@@ -277,7 +279,7 @@ const fetchAndLockProducts = async (productIds) => {
               daily_reminder_original_price, package_duration_months,
               package_fulfillment_interval_days, is_recurring_package
        FROM products
-       WHERE id IN (${placeholders}) AND is_active = 1`,
+       WHERE id IN (${placeholders}) AND ${customerVisibleWhere()}`,
       uniqueIds,
     );
 
@@ -715,16 +717,12 @@ export const createSubscription = async (req, res) => {
 
     await client.query("COMMIT");
 
-    try {
-      const io = req.app?.locals?.io;
-      if (io)
-        io.emit("order:updated", {
-          id: orderId,
-          order_status: SUBSCRIPTION_STATUS.PENDING,
-        });
-    } catch (e) {
-      logger.warn("[SUBSCRIPTION] Socket emit failed", e);
-    }
+    // Admin + owner rooms only (services/orderRealtime.js).
+    publishOrderUpdateFromRequest(
+      req,
+      { id: orderId, order_status: SUBSCRIPTION_STATUS.PENDING },
+      { userId: userId || null },
+    );
 
     // FIX (premature "activated" notification): this used to fire a
     // WhatsApp here, immediately after the pending order row is

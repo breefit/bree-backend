@@ -1,8 +1,15 @@
 import { query } from "../config/database.js";
 
-// POST /api/cart/validate
+// POST /api/orders/validate-cart
 // Body: { items: [{ id, price, quantity }] }
-export const validateCart = async (req, res) => {
+//
+// Product visibility: a product the admin hid (is_visible = 0) is reported
+// exactly like a deactivated one — `available: false` — so the existing
+// cart UI flags it "Unavailable" and checkout blocks it. The customer's
+// cart item is NOT deleted server-side (the cart lives in the browser);
+// the customer removes it. No field distinguishes hidden from deleted.
+// `queryFn` injectable only for tests (default to the real pool).
+export const validateCart = async (req, res, { queryFn = query } = {}) => {
   try {
     const items = req.body.items || req.body.cartItems || [];
     if (!Array.isArray(items) || !items.length) {
@@ -17,8 +24,8 @@ export const validateCart = async (req, res) => {
       const requestedQty = Number(it.quantity || 0);
       const clientPrice = Number(it.price ?? it.unit_price ?? 0);
 
-      const { rows } = await query(
-        `SELECT id, name, image, price AS price, is_active,
+      const { rows } = await queryFn(
+        `SELECT id, name, image, price AS price, is_active, is_visible,
                 is_free_shipping, shipping_charge, estimated_delivery
          FROM products
          WHERE id = ?
@@ -37,7 +44,7 @@ export const validateCart = async (req, res) => {
       }
 
       const p = rows[0];
-      const available = !!p.is_active;
+      const available = !!p.is_active && !!p.is_visible;
       const currentPrice = Number(p.price ?? 0);
       const isFreeShipping =
         p.is_free_shipping === true ||

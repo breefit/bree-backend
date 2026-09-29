@@ -1,8 +1,10 @@
 import crypto from "crypto";
+import { customerVisibleWhere } from "../constants/productVisibility.js";
 import { query, getClient } from "../config/database.js";
 import { getOrderSchemaInfo } from "../utils/orderSchema.js";
 import { getNextOrderNumber } from "../utils/orderNumber.js";
 import { VALID_ORDER_STATUSES, VALID_PAYMENT_STATUSES } from "../constants/orderStatus.js";
+import { publishOrderUpdateFromRequest } from "../services/orderRealtime.js";
 
 // ==========================================================================
 // Constants
@@ -198,10 +200,12 @@ const lockProductsForOrder = async (
     ? ", is_free_shipping, shipping_charge, estimated_delivery"
     : "";
 
+  // Product visibility: hidden/deleted products are absent from the map,
+  // so the caller rejects them as unavailable (new purchases only).
   const { rows } = await client.query(
     `SELECT id, name, image, price${shippingSelect}
      FROM products
-     WHERE id IN (?) AND is_active = 1`,
+     WHERE id IN (?) AND ${customerVisibleWhere()}`,
     [productIds],
   );
 
@@ -336,7 +340,7 @@ export const validateCart = async (req, res) => {
     let productMap = new Map();
     if (productIds.length) {
       const { rows: productRows } = await query(
-        `SELECT id, name, price, is_active
+        `SELECT id, name, price, is_active, is_visible
          FROM products
          WHERE id IN (?)`,
         [productIds],
@@ -351,7 +355,7 @@ export const validateCart = async (req, res) => {
       const product = productMap.get(item.id);
       const requestedQty = Number(item.quantity || 0);
 
-      if (!product || !product.is_active) {
+      if (!product || !product.is_active || !product.is_visible) {
         validationResults.push({
           id: item.id,
           name: product?.name || item.name,
@@ -657,21 +661,13 @@ export const createOrder = async (req, res) => {
     await client.query("COMMIT");
 
     // Socket failures must never fail the order — it already committed.
-    try {
-      const io = req.app?.locals?.io;
-      if (io) {
-        io.emit("order:updated", {
-          id: orderId,
-          order_status: ORDER_STATUS.PENDING_PAYMENT,
-        });
-      }
-    } catch (socketError) {
-      log("error", "order.socket_emit_failed", {
-        requestId,
-        orderId,
-        error: socketError?.message,
-      });
-    }
+    // Admin + owner rooms only (services/orderRealtime.js) — this used to
+    // broadcast the new order's id to every anonymous socket.
+    publishOrderUpdateFromRequest(
+      req,
+      { id: orderId, order_status: ORDER_STATUS.PENDING_PAYMENT },
+      { userId: userId || null },
+    );
 
     log("info", "order.created", {
       requestId,
@@ -1320,8 +1316,15 @@ export const getOrderTracking = async (req, res, { queryFn = query } = {}) => {
         // change) is never read by the frontend timeline — an internal,
         // admin-identifying field with no reason to be in a public,
         // unauthenticated response.
+        //
+        // FIX (return/refund E2E audit — public leak): `notes` removed too.
+        // Return/refund transitions write admin-authored text there — the
+        // return reason, manual-override reason/notes, QC notes — and the
+        // Razorpay refund id, i.e. exactly the return_reason/return_notes/
+        // refund_reference fields this query deliberately excludes above.
+        // The customer timeline only reads new_status/created_at.
         queryFn(
-          `SELECT id, previous_status, new_status, notes, created_at
+          `SELECT id, previous_status, new_status, created_at
            FROM order_status_history
            WHERE order_id = ?
            ORDER BY created_at ASC`,

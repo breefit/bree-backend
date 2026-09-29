@@ -206,11 +206,11 @@ const createFakeOrderDb = ({ order, items = [] }) => {
       return { rows: [], rowCount: 1 };
     }
 
-    if (normalized.includes("SET status = 'failed'")) {
-      const [errorMessage, key] = params;
+    if (normalized.includes("SET status = ?, last_error = ?")) {
+      const [outcome, errorMessage, key] = params;
       const row = notifRows.get(key);
       if (!row || row.status !== "sending") return { rows: [], rowCount: 0 };
-      row.status = "failed";
+      row.status = outcome;
       row.last_error = errorMessage;
       return { rows: [], rowCount: 1 };
     }

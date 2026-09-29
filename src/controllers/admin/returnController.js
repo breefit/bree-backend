@@ -12,6 +12,7 @@ import delhiveryService from "../../services/delhiveryService.js";
 import { sendOrderStatusUpdateEmail } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 import { stopRemindersForReturnedOrder } from "../../services/dailyReminderService.js";
+import { publishOrderUpdateFromRequest } from "../../services/orderRealtime.js";
 import {
   sendOrderStatusNotificationOnce,
   buildOrderStatusNotificationKey,
@@ -69,14 +70,10 @@ const log = (level, event, meta = {}) => {
 // Socket helper — mirrors the try/catch-and-ignore pattern used in
 // admin/orderController.js and shippingController.js.
 // ──────────────────────────────────────────────────────────────────────────
-const emitOrderUpdated = (req, order) => {
-  try {
-    const io = req.app?.locals?.io;
-    if (io) io.emit("order:updated", order);
-  } catch {
-    // Socket failures must never affect the API response.
-  }
-};
+// FIX (Socket.IO security audit): delegates to services/orderRealtime.js —
+// safe whitelisted payload, delivered only to the authenticated admin room
+// and the order owner's room (this used to be a broadcast to every socket).
+const emitOrderUpdated = (req, order) => publishOrderUpdateFromRequest(req, order);
 
 // Builds a stable, slug-shaped notification-key segment from a return
 // event's human-readable label ("Return Approved" -> "return_approved") —
@@ -139,6 +136,10 @@ export const notifyReturnEvent = (order, label, notes) => {
           to: recipientEmail,
           name: recipientName,
           orderId: order.id,
+          // FIX (return/refund E2E audit): omitted before, so every return/
+          // refund email identified the order by a UUID fragment instead of
+          // the BREE order number the WhatsApp message and site use.
+          orderNumber: order.order_number,
           status: label,
           notes,
         }),
@@ -196,6 +197,49 @@ const isProcessingClaimStale = (updatedAt) =>
   Boolean(updatedAt) &&
   Date.now() - new Date(updatedAt).getTime() >
     PROCESSING_CLAIM_STALE_MINUTES * 60 * 1000;
+
+// FIX (return/refund E2E audit — duplicate refund on retry): a stale
+// 'processing' reclaim, and a retry after a Razorpay error/timeout, used to
+// call payments.refund() again without asking Razorpay whether the first
+// call had actually gone through. A timeout AFTER Razorpay accepted the
+// refund, or a DB failure after it (Phase 3), left no local refund id — so
+// the retry issued a second refund (a partial refund would succeed twice; a
+// full one would be refused by Razorpay forever and the order stayed stuck).
+// Every refund this app creates carries notes.order_id (see Phase 2), so
+// the payment's existing refunds identify ours unambiguously. Throws if
+// Razorpay cannot be asked — callers must then NOT create a refund.
+export const findExistingRazorpayRefund = async (razorpay, order) => {
+  const result = await razorpay.payments.fetchMultipleRefund(
+    order.razorpay_payment_id,
+    { count: 100 },
+  );
+  const items = Array.isArray(result?.items) ? result.items : [];
+  return (
+    items.find(
+      (refund) =>
+        refund?.id &&
+        String(refund?.notes?.order_id || "") === String(order.id) &&
+        refund.status !== "failed",
+    ) || null
+  );
+};
+
+// Every order_status_history row a return/refund transition writes goes
+// through here — order_status itself never changes for a return, so
+// previous/new are recorded identically (same trick as approveReturn).
+const appendReturnHistory = (req, order, notes) =>
+  appendStatusHistory({
+    orderId: order.id,
+    previousStatus: order.order_status,
+    newStatus: order.order_status,
+    changedBy: req.admin?.id || null,
+    notes,
+  }).catch((error) => {
+    log("error", "return.history_failed", {
+      orderId: order.id,
+      error: error?.message || error,
+    });
+  });
 
 // FIX (ISSUE-005 — Approve Refund frontend/backend contract mismatch): the
 // admin "Approve Refund" button is a plain confirm modal with no amount
@@ -649,6 +693,89 @@ export const rejectReturn = async (req, res) => {
   }
 };
 
+// ──────────────────────────────────────────────────────────────────────────
+// Reverse-shipment creation outcome (FIX: H4 — lost-response handling,
+// contract-independent part). A create call either CONFIRMS nothing was
+// created ('failed' — safe to fix and retry) or leaves it UNKNOWN whether
+// Delhivery manifested the shipment ('uncertain'). The only contract relied
+// on is Delhivery's documented refusal of a reused order id ("Duplicate
+// order id", FAQ Q.10) — no lookup API is assumed.
+// ──────────────────────────────────────────────────────────────────────────
+export const REVERSE_SHIPMENT_CREATE_STATUS = Object.freeze({
+  UNCERTAIN: "uncertain",
+  FAILED: "failed",
+});
+
+// The TCP connection was never made, so the request cannot have reached
+// Delhivery. Timeouts/resets are deliberately absent: they can happen after
+// the request body was sent.
+const CONNECTION_NEVER_ESTABLISHED = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"];
+
+const remarksOf = (response) => {
+  const packages = Array.isArray(response?.packages) ? response.packages : [];
+  return [
+    ...packages.flatMap((p) => [].concat(p?.remarks || [])),
+    ...[].concat(response?.rmk || []),
+  ]
+    .map((r) => String(r))
+    .join("; ");
+};
+
+/**
+ * Classifies a failed/odd Delhivery create call. Returns null for a
+ * success-shaped response (the caller then parses the AWB).
+ * @returns {null | { outcome: "failed"|"uncertain", reason: string }}
+ */
+export const classifyReverseShipmentCreateOutcome = ({ error, response } = {}) => {
+  const U = REVERSE_SHIPMENT_CREATE_STATUS.UNCERTAIN;
+  const F = REVERSE_SHIPMENT_CREATE_STATUS.FAILED;
+  if (error) {
+    const status = Number(error.status) || null;
+    if (status && status >= 500) return { outcome: U, reason: `Delhivery HTTP ${status}` };
+    if (status) return { outcome: F, reason: `Delhivery HTTP ${status}: ${error.message || "request rejected"}` };
+    if (CONNECTION_NEVER_ESTABLISHED.includes(error.code)) {
+      return { outcome: F, reason: `could not connect to Delhivery (${error.code})` };
+    }
+    return { outcome: U, reason: `no usable response from Delhivery (${error.code || error.message || "network error"})` };
+  }
+  if (!response || typeof response !== "object") {
+    return { outcome: U, reason: "Delhivery returned a malformed (non-JSON) response" };
+  }
+  const remarks = remarksOf(response);
+  if (/duplicate/i.test(remarks)) {
+    return { outcome: U, reason: `Delhivery reports this reference already exists: ${remarks}` };
+  }
+  if (response.success === false) {
+    const packages = Array.isArray(response.packages) ? response.packages : [];
+    const rejected = packages.length > 0 && packages.every((p) => String(p?.status || "").toLowerCase() === "fail");
+    return rejected
+      ? { outcome: F, reason: `Delhivery rejected the shipment: ${remarks || "no remarks"}` }
+      : { outcome: U, reason: `Delhivery reported an error without rejecting the package: ${remarks || response.message || "no details"}` };
+  }
+  return null;
+};
+
+// Records an attempt's outcome on the order row. Called on the SAME
+// transaction that holds the FOR UPDATE lock, before COMMIT — so a
+// concurrent click waiting on that lock always sees it.
+const recordReverseShipmentAttempt = (client, orderId, { outcome, reason, reference, awb = null }) =>
+  client.query(
+    `UPDATE orders
+     SET reverse_shipment_create_status = ?,
+         reverse_shipment_create_attempted_at = NOW(),
+         reverse_shipment_create_error = ?,
+         reverse_shipment_unconfirmed_awb = COALESCE(?, reverse_shipment_unconfirmed_awb),
+         reverse_shipment_reference = COALESCE(reverse_shipment_reference, ?),
+         updated_at = NOW()
+     WHERE id = ?`,
+    [outcome, String(reason || "").slice(0, 500), awb, reference || null, orderId],
+  );
+
+const uncertainMessage = (reference) =>
+  `Unable to confirm whether Delhivery created the return shipment (reference ${reference}). ` +
+  "This is not a confirmed failure — the shipment may already exist. No new shipment will be created " +
+  "automatically. Please check this reference in the Delhivery panel before doing anything else.";
+
 // ==========================================================================
 // 3. Create Reverse Shipment
 // ==========================================================================
@@ -665,8 +792,13 @@ export const rejectReturn = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order, delhivery }` on success.
  */
-export const createReverseShipment = async (req, res) => {
+export const createReverseShipment = async (
+  req,
+  res,
+  { getClientFn = getClient } = {},
+) => {
   const { orderId } = req.params;
+  const { confirmedNotCreated, notes: confirmationNotes } = req.body || {};
 
   if (!orderId) {
     return res
@@ -674,7 +806,11 @@ export const createReverseShipment = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
+  // Set once Delhivery has returned an AWB — the catch below must then
+  // preserve it rather than lose it with the rolled-back transaction.
+  let receivedAwb = null;
+  let reverseReference;
   try {
     await client.query("BEGIN");
 
@@ -726,6 +862,40 @@ export const createReverseShipment = async (req, res) => {
         success: false,
         message: `A reverse shipment can only be created for an approved return. Current return status is "${order.return_status || "none"}".`,
       });
+    }
+
+    // FIX (H4): a previous attempt may have created the shipment at
+    // Delhivery without BREE receiving/saving its AWB. Never call Delhivery
+    // again for this order until someone has checked — the only way past
+    // this is an explicit, audited confirmation that Delhivery has no
+    // shipment for the reference (API-only: { confirmedNotCreated: true,
+    // notes }).
+    if (order.reverse_shipment_create_status === REVERSE_SHIPMENT_CREATE_STATUS.UNCERTAIN) {
+      const reference = order.reverse_shipment_reference || `${order.order_number}-RETURN`;
+      const confirmation = typeof confirmationNotes === "string" ? confirmationNotes.trim() : "";
+      if (confirmedNotCreated !== true || !confirmation) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          success: false,
+          code: "REVERSE_SHIPMENT_OUTCOME_UNCERTAIN",
+          message: uncertainMessage(reference),
+          reverseShipment: {
+            reference,
+            attemptedAt: order.reverse_shipment_create_attempted_at,
+            lastError: order.reverse_shipment_create_error,
+            unconfirmedAwb: order.reverse_shipment_unconfirmed_awb,
+          },
+        });
+      }
+      await client.query(
+        `UPDATE orders SET reverse_shipment_create_status = NULL, updated_at = NOW() WHERE id = ?`,
+        [orderId],
+      );
+      appendReturnHistory(
+        req,
+        order,
+        `Admin confirmed Delhivery has NO shipment for reference ${reference}; reverse shipment creation re-enabled. Notes: ${confirmation}. Previous error: ${order.reverse_shipment_create_error || "n/a"}.`,
+      );
     }
 
     // FIX (Return/Refund audit — 48-hour window): re-verified here too, not
@@ -799,7 +969,6 @@ export const createReverseShipment = async (req, res) => {
     // lost response reuses the same reference, which Delhivery rejects as
     // an already-manifested order instead of creating a second shipment.
     let payload;
-    let reverseReference;
     try {
       ({ payload, reference: reverseReference } = buildDelhiveryReverseShipmentPayload({
         order,
@@ -815,44 +984,70 @@ export const createReverseShipment = async (req, res) => {
       });
     }
 
+    // FIX (H4): every non-success outcome is classified and RECORDED on the
+    // order (same locked transaction, then COMMIT — not ROLLBACK), so the
+    // next click — or a concurrent one already waiting on the row lock —
+    // knows whether it may call Delhivery again.
+    const finishWithoutShipment = async (classification, extra = {}) => {
+      await recordReverseShipmentAttempt(client, orderId, {
+        ...classification,
+        reference: reverseReference,
+      });
+      await client.query("COMMIT");
+      log(
+        classification.outcome === REVERSE_SHIPMENT_CREATE_STATUS.UNCERTAIN ? "error" : "warn",
+        "return.reverse_shipment_create_outcome",
+        { orderId, reference: reverseReference, ...classification },
+      );
+      if (classification.outcome === REVERSE_SHIPMENT_CREATE_STATUS.UNCERTAIN) {
+        return res.status(409).json({
+          success: false,
+          code: "REVERSE_SHIPMENT_OUTCOME_UNCERTAIN",
+          message: uncertainMessage(reverseReference),
+          reverseShipment: { reference: reverseReference, lastError: classification.reason },
+          ...extra,
+        });
+      }
+      return res.status(400).json({
+        success: false,
+        code: "REVERSE_SHIPMENT_REJECTED",
+        message: `Delhivery did not create the return shipment (${classification.reason}). Nothing was created — correct the problem and try again.`,
+        ...extra,
+      });
+    };
+
     let delhiveryResponse;
     try {
       delhiveryResponse = await delhiveryService.createShipment(payload);
     } catch (error) {
-      await client.query("ROLLBACK");
-      log("error", "return.reverse_shipment_delhivery_error", {
-        orderId,
-        error: error?.message || error,
-      });
-      return res.status(500).json({
-        success: false,
-        message: "Unable to create Delhivery reverse shipment.",
-        error: error.message || error,
-      });
+      return await finishWithoutShipment(classifyReverseShipmentCreateOutcome({ error }));
     }
 
-    if (!delhiveryResponse || delhiveryResponse.success === false) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        success: false,
-        message:
-          delhiveryResponse?.message ||
-          "Unable to create Delhivery reverse shipment.",
-        delhiveryError: delhiveryResponse,
-      });
+    const responseOutcome = classifyReverseShipmentCreateOutcome({ response: delhiveryResponse });
+    if (responseOutcome) {
+      return await finishWithoutShipment(responseOutcome, { delhiveryError: delhiveryResponse });
     }
 
     const parsedShipment = extractDelhiveryShipmentDetails(delhiveryResponse);
     if (!parsedShipment.success) {
-      await client.query("ROLLBACK");
-      return res.status(400).json({
-        success: false,
-        message: parsedShipment.message,
-        delhiveryResponse,
+      // A 200 we cannot read an AWB from may still be a created shipment.
+      return await finishWithoutShipment({
+        outcome: REVERSE_SHIPMENT_CREATE_STATUS.UNCERTAIN,
+        reason: `Delhivery response contained no usable AWB: ${parsedShipment.message}`,
       });
     }
 
     const { awbNumber, trackingUrl } = parsedShipment;
+
+    // FIX (H4 — preserve the AWB before any further DB write): if anything
+    // below fails, this log line (and the catch's diagnostic write) is what
+    // lets support attach the shipment instead of it being lost.
+    receivedAwb = awbNumber;
+    log("info", "return.reverse_shipment_awb_received", {
+      orderId,
+      reference: reverseReference,
+      awb: awbNumber,
+    });
 
     await client.query(
       `UPDATE orders
@@ -862,6 +1057,10 @@ export const createReverseShipment = async (req, res) => {
            reverse_shipment_type = ?,
            reverse_shipment_reference = ?,
            return_status = 'reverse_shipment_created',
+           reverse_shipment_create_status = NULL,
+           reverse_shipment_create_attempted_at = NOW(),
+           reverse_shipment_create_error = NULL,
+           reverse_shipment_unconfirmed_awb = NULL,
            updated_at = NOW()
        WHERE id = ?`,
       [awbNumber, trackingUrl, REVERSE_SHIPMENT_TYPE_RVP, reverseReference, orderId],
@@ -899,14 +1098,61 @@ export const createReverseShipment = async (req, res) => {
       delhivery: { awb: awbNumber, trackingUrl },
     });
   } catch (err) {
-    await client.query("ROLLBACK");
     log("error", "return.reverse_shipment_failed", {
       orderId,
+      reference: reverseReference || null,
+      awb: receivedAwb,
       error: err?.message || err,
     });
-    res
-      .status(500)
-      .json({ success: false, message: "Failed to create reverse shipment" });
+
+    if (!receivedAwb) {
+      await client.query("ROLLBACK").catch(() => {});
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to create reverse shipment" });
+    }
+
+    // FIX (H4): Delhivery created the shipment and returned its AWB, but
+    // saving it failed. Record it as uncertain + keep the AWB — on the same
+    // (still locked) transaction if it is usable, otherwise on a fresh
+    // connection — so retries are blocked and support can attach it.
+    const diagnostic = {
+      outcome: REVERSE_SHIPMENT_CREATE_STATUS.UNCERTAIN,
+      reason: `AWB ${receivedAwb} was returned by Delhivery but could not be saved: ${String(err?.message || err).slice(0, 200)}`,
+      reference: reverseReference,
+      awb: receivedAwb,
+    };
+    let recorded = false;
+    try {
+      await recordReverseShipmentAttempt(client, orderId, diagnostic);
+      await client.query("COMMIT");
+      recorded = true;
+    } catch {
+      await client.query("ROLLBACK").catch(() => {});
+      try {
+        await recordReverseShipmentAttempt({ query: (text, params) => query(text, params) }, orderId, diagnostic);
+        recorded = true;
+      } catch (recordErr) {
+        log("error", "return.reverse_shipment_awb_not_recorded", {
+          orderId,
+          reference: reverseReference,
+          awb: receivedAwb,
+          error: recordErr?.message || recordErr,
+        });
+      }
+    }
+
+    return res.status(500).json({
+      success: false,
+      code: "REVERSE_SHIPMENT_AWB_NOT_SAVED",
+      message:
+        `Delhivery created the return shipment (AWB ${receivedAwb}, reference ${reverseReference}) but BREE could not save it. ` +
+        "Do NOT create it again. " +
+        (recorded
+          ? "The AWB has been recorded on the order for recovery — contact support with this AWB."
+          : "Please send this AWB and reference to support."),
+      reverseShipment: { awb: receivedAwb, reference: reverseReference },
+    });
   } finally {
     client.release();
   }
@@ -1136,7 +1382,11 @@ export const markReturned = async (req, res) => {
     });
 
     emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Received", notes);
+    // FIX (return/refund E2E audit): `notes` here is the admin's manual-
+    // override justification (internal audit text) — it used to be emailed
+    // to the customer as the email's "Note". Same message the automatic
+    // Delhivery DL/DTO path sends (no notes), so both share one wording.
+    notifyReturnEvent(updated, "Return Received", null);
 
     log("info", "return.marked_returned", {
       orderId,
@@ -1547,6 +1797,11 @@ export const approveRefund = async (req, res) => {
 
     await client.query("COMMIT");
     emitOrderUpdated(req, updated);
+    appendReturnHistory(
+      req,
+      order,
+      `Refund approved — ₹${resolvedRefundAmount} of ₹${refundableAmount} paid.`,
+    );
 
     // FIX (customer return/refund tracking audit, requirement 17): audited
     // deliberately, not overlooked. approveRefund only records an internal
@@ -1561,7 +1816,10 @@ export const approveRefund = async (req, res) => {
     // duplicate, not a second useful update. rejectRefund is different: it
     // can be the terminal outcome (no further message will ever follow),
     // so it does notify — see its own comment.
-    log("info", "return.refund_approved", { orderId, refund_amount });
+    log("info", "return.refund_approved", {
+      orderId,
+      refund_amount: resolvedRefundAmount,
+    });
     res.json({
       success: true,
       message: "Refund approved successfully.",
@@ -1597,6 +1855,7 @@ export const approveRefund = async (req, res) => {
 // above — defaults to the real DB pool.
 export const rejectRefund = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
+  const { reason, notes } = req.body || {};
 
   if (!orderId) {
     return res
@@ -1645,6 +1904,28 @@ export const rejectRefund = async (req, res, { getClientFn = getClient } = {}) =
       });
     }
 
+    // FIX (return/refund E2E audit — invalid transition + idempotency):
+    // this only ever blocked refunds already sent to Razorpay, so the API
+    // accepted a refund rejection on an order with no return at all, or
+    // before quality check — states in which the admin UI never offers it.
+    // A repeated click re-ran the UPDATE instead of returning current state.
+    if (order.refund_status === "rejected") {
+      await client.query("ROLLBACK");
+      return res.json({
+        success: true,
+        message: "Refund has already been rejected for this order.",
+        order,
+      });
+    }
+
+    if (order.return_status !== "returned" || order.inspection_status !== "approved") {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: `A refund can only be rejected for a received return that passed quality check. Current return status is "${order.return_status || "none"}", inspection status is "${order.inspection_status || "none"}".`,
+      });
+    }
+
     await client.query(
       `UPDATE orders SET refund_status = 'rejected', updated_at = NOW() WHERE id = ?`,
       [orderId],
@@ -1658,6 +1939,13 @@ export const rejectRefund = async (req, res, { getClientFn = getClient } = {}) =
 
     await client.query("COMMIT");
     emitOrderUpdated(req, updated);
+    // FIX (return/refund E2E audit): the admin UI requires a reason and
+    // notes for this action, but both were silently discarded.
+    appendReturnHistory(
+      req,
+      order,
+      `Refund rejected. Reason: ${reason || "N/A"}.${notes ? ` Notes: ${notes}` : ""}`,
+    );
 
     // FIX (customer return/refund tracking — audit finding): this
     // previously sent no customer notification at all, unlike every other
@@ -1862,19 +2150,32 @@ export const completeRefund = async (
   // ── Phase 2: talk to Razorpay with no DB transaction open. ──────────────
   const razorpay = getRazorpayFn();
   let razorpayRefund;
+  let reconciledExisting = false;
   try {
     if (mode === "create") {
-      razorpayRefund = await razorpay.payments.refund(
-        order.razorpay_payment_id,
-        {
-          amount: Math.round(Number(order.refund_amount) * 100),
-          speed: "normal",
-          notes: {
-            order_id: order.id,
-            order_number: order.order_number || "",
+      // FIX (duplicate refund on retry): never create before confirming
+      // Razorpay holds no refund of ours for this payment already — a lookup
+      // failure throws into the catch below, so nothing is created blind.
+      razorpayRefund = await findExistingRazorpayRefund(razorpay, order);
+      if (razorpayRefund) {
+        reconciledExisting = true;
+        log("warn", "return.refund_existing_reconciled", {
+          orderId,
+          razorpayRefundId: razorpayRefund.id,
+        });
+      } else {
+        razorpayRefund = await razorpay.payments.refund(
+          order.razorpay_payment_id,
+          {
+            amount: Math.round(Number(order.refund_amount) * 100),
+            speed: "normal",
+            notes: {
+              order_id: order.id,
+              order_number: order.order_number || "",
+            },
           },
-        },
-      );
+        );
+      }
     } else {
       // mode === "recheck" — check status of the refund already created;
       // never call payments.refund() a second time for the same order.
@@ -1887,29 +2188,68 @@ export const completeRefund = async (
       error: error?.message || error,
     });
     // FIX (ISSUE-011): a "create" attempt claimed refund_status='processing'
-    // in Phase 1 — since Razorpay never actually issued a refund here,
-    // revert that claim back to 'approved' so the admin can retry
-    // immediately rather than waiting out the staleness window. Guarded by
-    // `AND refund_status = 'processing'` so this can never clobber a
-    // different outcome (e.g. a concurrent request's own recovery) that
-    // may have already changed the row.
+    // in Phase 1. FIX (duplicate refund on retry): an error here — above
+    // all a timeout — does not prove Razorpay issued nothing, so the claim
+    // is reverted to 'approved' (immediately retryable) only once Razorpay
+    // confirms it holds no refund of ours. If it does, that refund is
+    // adopted below exactly like a successful create. If Razorpay cannot be
+    // asked, the claim stays 'processing' and the stale-claim reclaim runs
+    // this same check again later. Guarded by `AND refund_status =
+    // 'processing'` so it never clobbers a concurrent outcome.
     if (mode === "create") {
+      let existing = null;
+      let lookupFailed = false;
       try {
-        await queryFn(
-          `UPDATE orders SET refund_status = 'approved', updated_at = NOW()
-           WHERE id = ? AND refund_status = 'processing'`,
-          [orderId],
-        );
-      } catch (revertErr) {
-        log("error", "return.refund_processing_revert_failed", {
+        existing = await findExistingRazorpayRefund(razorpay, order);
+      } catch (lookupErr) {
+        lookupFailed = true;
+        log("error", "return.refund_existing_lookup_failed", {
           orderId,
-          error: revertErr?.message || revertErr,
+          error: lookupErr?.message || lookupErr,
         });
       }
+
+      if (existing) {
+        razorpayRefund = existing;
+        reconciledExisting = true;
+      } else if (!lookupFailed) {
+        try {
+          await queryFn(
+            `UPDATE orders SET refund_status = 'approved', updated_at = NOW()
+             WHERE id = ? AND refund_status = 'processing'`,
+            [orderId],
+          );
+        } catch (revertErr) {
+          log("error", "return.refund_processing_revert_failed", {
+            orderId,
+            error: revertErr?.message || revertErr,
+          });
+        }
+      }
     }
-    return res.status(502).json({
+    if (!razorpayRefund) {
+      return res.status(502).json({
+        success: false,
+        message: "Unable to initiate refund. Please try again.",
+      });
+    }
+  }
+
+  // FIX (return/refund E2E audit): a recheck that finds Razorpay reports
+  // the refund FAILED used to answer "Refund initiated successfully." and
+  // leave it 'initiated' with nothing telling the admin it failed. There is
+  // no 'failed' refund_status (see BUSINESS DECISIONS in the audit), so the
+  // state is left unchanged — but the admin is told, and it is recorded.
+  if (mode === "recheck" && razorpayRefund?.status === "failed") {
+    log("error", "return.refund_failed_at_razorpay", {
+      orderId,
+      razorpayRefundId: razorpayRefund.id,
+    });
+    return res.status(409).json({
       success: false,
-      message: "Unable to initiate refund. Please try again.",
+      code: "RAZORPAY_REFUND_FAILED",
+      message: `Razorpay reports refund ${razorpayRefund.id} as FAILED. It needs manual review in the Razorpay dashboard — no new refund has been created.`,
+      order,
     });
   }
 
@@ -1955,6 +2295,26 @@ export const completeRefund = async (
          WHERE id = ?`,
         [nextStatus, razorpayRefund.id, orderId],
       );
+      // FIX (return/refund E2E audit — contradictory payment state): the
+      // payments row kept status 'captured' and never received the
+      // refund_id/refund_amount columns it has for exactly this, while
+      // orders.payment_status became 'refunded'. Same transaction, so the
+      // two can never disagree. status only flips for a full refund.
+      await phase3.query(
+        `UPDATE payments
+         SET refund_id = ?,
+             refund_amount = ?,
+             status = CASE WHEN ? = 1 AND ? >= amount THEN 'refunded' ELSE status END,
+             updated_at = NOW()
+         WHERE order_id = ?`,
+        [
+          razorpayRefund.id,
+          Number(relocked.refund_amount),
+          isProcessed ? 1 : 0,
+          Number(relocked.refund_amount),
+          orderId,
+        ],
+      );
       await phase3.query("COMMIT");
 
       const {
@@ -1985,6 +2345,18 @@ export const completeRefund = async (
   // refund still pending must not re-send "Refund Initiated" every time an
   // admin revisits the order.
   if (didTransition) {
+    // FIX (return/refund E2E audit): the refund moving money had no
+    // order_status_history row at all. Carries the Razorpay refund id for
+    // the admin; the public tracking endpoint never returns history notes.
+    appendReturnHistory(
+      req,
+      updated,
+      `${isProcessed ? "Refund completed" : "Refund initiated"} with Razorpay — ₹${Number(
+        updated.refund_amount,
+      )}. Refund ID: ${razorpayRefund.id}.${
+        reconciledExisting ? " (Existing Razorpay refund reconciled — no new refund created.)" : ""
+      }`,
+    );
     notifyReturnEvent(
       updated,
       isProcessed ? "Refund Completed" : "Refund Initiated",

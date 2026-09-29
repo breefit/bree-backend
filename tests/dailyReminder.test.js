@@ -404,11 +404,13 @@ const createFakeSendsTable = () => {
       return { rows: [], rowCount: 1 };
     }
 
-    if (normalized.includes("SET status = 'failed'")) {
-      const [errorMessage, reminderId, sendDate] = params;
+    // Failure resolve: 'failed' (reclaimable) or 'unknown' (never
+    // reclaimed), bound as the first parameter.
+    if (normalized.includes("SET status = ?, error_message = ?")) {
+      const [outcome, errorMessage, reminderId, sendDate] = params;
       const row = rows.get(`${reminderId}:${sendDate}`);
       if (!row || row.status !== "sending") return { rows: [], rowCount: 0 };
-      row.status = "failed";
+      row.status = outcome;
       row.error_message = errorMessage;
       return { rows: [], rowCount: 1 };
     }

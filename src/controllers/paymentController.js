@@ -1,4 +1,5 @@
 import { randomUUID, createHash } from "crypto";
+import { customerVisibleWhere } from "../constants/productVisibility.js";
 import { getRazorpay } from "../config/razorpay.js";
 import {
   verifyPaymentSignature,
@@ -51,6 +52,8 @@ import {
   validateMobile,
   maskMobile,
 } from "../services/whatsappNotificationService.js";
+import { notifyReturnEvent } from "./admin/returnController.js";
+import { publishOrderUpdateFromRequest } from "../services/orderRealtime.js";
 
 let productShippingColumnsAvailable = null;
 
@@ -423,10 +426,12 @@ export const createOrder = async (
         .json({ success: false, message: "Invalid cart item submitted" });
     }
 
+    // Product visibility: a hidden (is_visible = 0) or deleted product can
+    // never be newly purchased, even if a client posts its id directly.
     const { rows } = await queryFn(
       `SELECT id, name, image, price${shippingSelect}
        FROM products
-       WHERE id = ? AND is_active = 1`,
+       WHERE id = ? AND ${customerVisibleWhere()}`,
       [productId],
     );
 
@@ -534,7 +539,7 @@ export const createOrder = async (
                 daily_reminder_original_price, is_recurring_package,
                 package_duration_months, package_fulfillment_interval_days
          FROM products
-         WHERE id = ? AND is_active = 1`,
+         WHERE id = ? AND ${customerVisibleWhere()}`,
         [reminderProductId],
       );
 
@@ -1000,12 +1005,12 @@ export const createOrder = async (
       isMagicCheckout,
     });
 
-    try {
-      req.app?.locals?.io?.emit("order:updated", {
-        id: orderId,
-        order_status: "pending",
-      });
-    } catch (_) {}
+    // Admin + owner rooms only — see services/orderRealtime.js.
+    publishOrderUpdateFromRequest(
+      req,
+      { id: orderId, order_status: "pending" },
+      { userId: req.user?.id || null },
+    );
 
     if (idempotencyKey) {
       await markCheckoutIdempotencyCompleted({
@@ -2324,12 +2329,11 @@ export const verifyPayment = async (
       addressId: resolvedAddressId,
     });
 
-    try {
-      req.app?.locals?.io?.emit("order:updated", {
-        id: order.id,
-        order_status: newOrderStatus,
-      });
-    } catch (_) {}
+    publishOrderUpdateFromRequest(req, {
+      id: order.id,
+      user_id: order.user_id,
+      order_status: newOrderStatus,
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("[VERIFY_PAYMENT] Transaction error", {
@@ -3121,7 +3125,11 @@ export const getPaymentStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/webhook — Razorpay async event notifications
 // ─────────────────────────────────────────────────────────────────────────────
-export const handleWebhook = async (req, res, { queryFn = query } = {}) => {
+export const handleWebhook = async (
+  req,
+  res,
+  { queryFn = query, notifyRefundEvent = notifyReturnEvent } = {},
+) => {
   const signature = req.headers["x-razorpay-signature"];
   const rawBody =
     req.rawBody ||
@@ -3185,13 +3193,10 @@ export const handleWebhook = async (req, res, { queryFn = query } = {}) => {
     return res.json({ status: "ok", duplicate: true });
   }
 
+  // Admin + owner rooms only — see services/orderRealtime.js. The owner is
+  // looked up by order id (webhooks carry no session).
   const emitUpdate = (orderId, status) => {
-    try {
-      req.app?.locals?.io?.emit("order:updated", {
-        id: orderId,
-        order_status: status,
-      });
-    } catch (_) {}
+    publishOrderUpdateFromRequest(req, { id: orderId, order_status: status });
   };
 
   // FIX (Phase 3B — Medium #5 test coverage): these three closures used to
@@ -3593,40 +3598,87 @@ export const handleWebhook = async (req, res, { queryFn = query } = {}) => {
     // not create, call, or retry any Razorpay refund itself, purely
     // reconciles state Razorpay is reporting on a refund that already
     // exists.
+    //
+    // FIX (return/refund E2E audit): (1) this completed the refund silently —
+    // when Razorpay answered completeRefund with "pending" (so the customer
+    // got "Refund Initiated"), nobody ever told them it completed. It now
+    // sends "Refund Completed" through the same exactly-once claim
+    // (order:{id}:status:refund_completed:channel:*) completeRefund uses, so
+    // whichever path observes completion first sends it and the other is a
+    // no-op. (2) A webhook that arrived while completeRefund was still
+    // talking to Razorpay (refund_status 'processing', refund_reference not
+    // yet saved) matched nothing and was acknowledged as done — dropped for
+    // good. It is now matched by the payment id plus the order id
+    // completeRefund puts in the refund's notes, and records the refund id.
     case "refund.processed": {
       if (!refundEntity?.id) break;
+      const { rows: refundCandidates } = await queryFn(
+        `SELECT * FROM orders
+         WHERE refund_reference = ?
+            OR (refund_reference IS NULL
+                AND refund_status = 'processing'
+                AND razorpay_payment_id = ?)
+         LIMIT 5`,
+        [refundEntity.id, refundEntity.payment_id || ""],
+      );
+      const notedOrderId = refundEntity.notes?.order_id
+        ? String(refundEntity.notes.order_id)
+        : null;
+      const refundOrder =
+        refundCandidates.find((o) => o.refund_reference === refundEntity.id) ||
+        refundCandidates.find((o) => notedOrderId && String(o.id) === notedOrderId);
+      if (!refundOrder) break;
+
       const completionUpdate = await queryFn(
         `UPDATE orders SET
            refund_status = 'completed',
            payment_status = 'refunded',
+           refund_reference = COALESCE(refund_reference, ?),
            refund_completed_at = NOW(),
            updated_at = NOW()
-         WHERE refund_reference = ?
-           AND refund_status = 'initiated'`,
-        [refundEntity.id],
+         WHERE id = ?
+           AND refund_status IN ('initiated', 'processing')
+           AND (refund_reference = ? OR refund_reference IS NULL)`,
+        [refundEntity.id, refundOrder.id, refundEntity.id],
       );
       if (completionUpdate.rowCount) {
-        const { rows } = await queryFn(
-          "SELECT id, order_status FROM orders WHERE refund_reference = ? LIMIT 1",
-          [refundEntity.id],
+        console.info("[WEBHOOK] Refund reconciled to completed", {
+          orderId: refundOrder.id,
+          razorpayRefundId: refundEntity.id,
+        });
+        // Same payments-row reconciliation completeRefund's Phase 3 does.
+        await queryFn(
+          `UPDATE payments
+           SET refund_id = ?,
+               refund_amount = ?,
+               status = CASE WHEN ? >= amount THEN 'refunded' ELSE status END,
+               updated_at = NOW()
+           WHERE order_id = ?`,
+          [
+            refundEntity.id,
+            Number(refundOrder.refund_amount),
+            Number(refundOrder.refund_amount),
+            refundOrder.id,
+          ],
         );
-        const order = rows[0];
-        if (order) {
-          console.info("[WEBHOOK] Refund reconciled to completed", {
-            orderId: order.id,
-            razorpayRefundId: refundEntity.id,
-          });
-          await queryFn(
-            `INSERT INTO order_status_history
-               (order_id, previous_status, new_status, changed_by, notes)
-             VALUES (?, ?, ?, NULL, ?)`,
-            [
-              order.id,
-              order.order_status,
-              order.order_status,
-              `Refund ${refundEntity.id} confirmed completed via webhook`,
-            ],
-          );
+        await queryFn(
+          `INSERT INTO order_status_history
+             (order_id, previous_status, new_status, changed_by, notes)
+           VALUES (?, ?, ?, NULL, ?)`,
+          [
+            refundOrder.id,
+            refundOrder.order_status,
+            refundOrder.order_status,
+            `Refund ${refundEntity.id} confirmed completed via webhook`,
+          ],
+        );
+        const { rows: completedRows } = await queryFn(
+          "SELECT * FROM orders WHERE id = ? LIMIT 1",
+          [refundOrder.id],
+        );
+        if (completedRows[0]) {
+          notifyRefundEvent(completedRows[0], "Refund Completed", null);
+          emitUpdate(refundOrder.id, completedRows[0].order_status);
         }
       }
       break;
@@ -3645,6 +3697,26 @@ export const handleWebhook = async (req, res, { queryFn = query } = {}) => {
           razorpayRefundId: refundEntity.id,
           razorpayPaymentId: refundEntity.payment_id,
         });
+        // FIX (return/refund E2E audit): a console line was the only trace —
+        // record it on the order's admin history too (the event ledger
+        // makes this once per delivery; public tracking omits notes).
+        const { rows: failedRows } = await queryFn(
+          "SELECT id, order_status FROM orders WHERE refund_reference = ? LIMIT 1",
+          [refundEntity.id],
+        );
+        if (failedRows[0]) {
+          await queryFn(
+            `INSERT INTO order_status_history
+               (order_id, previous_status, new_status, changed_by, notes)
+             VALUES (?, ?, ?, NULL, ?)`,
+            [
+              failedRows[0].id,
+              failedRows[0].order_status,
+              failedRows[0].order_status,
+              `Razorpay reported refund ${refundEntity.id} FAILED — needs manual review. Refund status left unchanged.`,
+            ],
+          );
+        }
       }
       break;
     }
