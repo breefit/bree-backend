@@ -60,6 +60,14 @@ const createFakeOrdersDb = (initialOrder) => {
         return { rows: [], rowCount: 1 };
       }
 
+      // Row lock + reminder stop that now run inside the cancellation.
+      if (normalized === "SELECT id FROM orders WHERE id = ? FOR UPDATE") {
+        return { rows: orders.has(params[0]) ? [{ id: params[0] }] : [], rowCount: 1 };
+      }
+      if (normalized.startsWith("UPDATE daily_reminders SET reminder_enabled = 0, status = 'ended'")) {
+        return { rows: [], rowCount: 0 };
+      }
+
       throw new Error(`Unhandled fake SQL in cancelShipmentOrderStatus test: ${normalized}`);
     },
     release: () => {},

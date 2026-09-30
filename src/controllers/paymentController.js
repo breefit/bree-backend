@@ -3685,37 +3685,78 @@ export const handleWebhook = async (
     }
 
     case "refund.failed": {
-      // A failed refund needs a human to look at it (retry, investigate the
-      // payment method, etc.) — deliberately does NOT change refund_status
-      // automatically (there is no distinct "failed" refund_status value in
-      // this schema, and inventing one here — with no admin UI or reprocess
-      // flow to act on it — would just be a dead state). This makes the
-      // failure immediately visible server-side instead of only being
-      // discovered whenever an admin happens to recheck.
+      // Cancel Order & Refund workflow: a failed refund now moves the order
+      // to the recoverable refund_status 'failed' (the admin "Retry Refund"
+      // / "Initiate Refund" action goes through completeRefund, which treats
+      // 'failed' like 'approved'). No money moved, so payment_status stays
+      // 'paid' and the payments row keeps status 'captured'; its refund_id/
+      // refund_amount are cleared only if they point at THIS failed refund.
+      // Matched exactly like refund.processed above (refund_reference, or a
+      // 'processing' claim on the same payment whose notes name the order),
+      // and guarded so it never moves a completed refund, or a newer retry
+      // with a different refund id.
       if (refundEntity?.id) {
-        console.error("[WEBHOOK] Razorpay refund FAILED — needs manual review", {
+        console.error("[WEBHOOK] Razorpay refund FAILED", {
           razorpayRefundId: refundEntity.id,
           razorpayPaymentId: refundEntity.payment_id,
         });
+        const { rows: failedCandidates } = await queryFn(
+          `SELECT * FROM orders
+           WHERE refund_reference = ?
+              OR (refund_reference IS NULL
+                  AND refund_status = 'processing'
+                  AND razorpay_payment_id = ?)
+           LIMIT 5`,
+          [refundEntity.id, refundEntity.payment_id || ""],
+        );
+        const failedNotedOrderId = refundEntity.notes?.order_id
+          ? String(refundEntity.notes.order_id)
+          : null;
+        const failedOrder =
+          failedCandidates.find((o) => o.refund_reference === refundEntity.id) ||
+          failedCandidates.find(
+            (o) => failedNotedOrderId && String(o.id) === failedNotedOrderId,
+          );
+        if (!failedOrder) break;
+
+        const failureUpdate = await queryFn(
+          `UPDATE orders SET
+             refund_status = 'failed',
+             refund_reference = COALESCE(refund_reference, ?),
+             updated_at = NOW()
+           WHERE id = ?
+             AND refund_status IN ('initiated', 'processing')
+             AND (refund_reference = ? OR refund_reference IS NULL)`,
+          [refundEntity.id, failedOrder.id, refundEntity.id],
+        );
+
+        if (failureUpdate.rowCount) {
+          await queryFn(
+            `UPDATE payments
+             SET refund_id = NULL, refund_amount = NULL, updated_at = NOW()
+             WHERE order_id = ? AND refund_id = ?`,
+            [failedOrder.id, refundEntity.id],
+          );
+        }
+
         // FIX (return/refund E2E audit): a console line was the only trace —
         // record it on the order's admin history too (the event ledger
         // makes this once per delivery; public tracking omits notes).
-        const { rows: failedRows } = await queryFn(
-          "SELECT id, order_status FROM orders WHERE refund_reference = ? LIMIT 1",
-          [refundEntity.id],
+        await queryFn(
+          `INSERT INTO order_status_history
+             (order_id, previous_status, new_status, changed_by, notes)
+           VALUES (?, ?, ?, NULL, ?)`,
+          [
+            failedOrder.id,
+            failedOrder.order_status,
+            failedOrder.order_status,
+            failureUpdate.rowCount
+              ? `Razorpay reported refund ${refundEntity.id} FAILED — refund status set to failed; retry the refund from admin.`
+              : `Razorpay reported refund ${refundEntity.id} FAILED — needs manual review. Refund status left unchanged (${failedOrder.refund_status || "none"}).`,
+          ],
         );
-        if (failedRows[0]) {
-          await queryFn(
-            `INSERT INTO order_status_history
-               (order_id, previous_status, new_status, changed_by, notes)
-             VALUES (?, ?, ?, NULL, ?)`,
-            [
-              failedRows[0].id,
-              failedRows[0].order_status,
-              failedRows[0].order_status,
-              `Razorpay reported refund ${refundEntity.id} FAILED — needs manual review. Refund status left unchanged.`,
-            ],
-          );
+        if (failureUpdate.rowCount) {
+          emitUpdate(failedOrder.id, failedOrder.order_status);
         }
       }
       break;

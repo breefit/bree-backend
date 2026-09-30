@@ -8,7 +8,15 @@ import {
   sendOrderStatusUpdateEmail,
 } from "../services/orderEmailService.js";
 import { buildDelhiveryShipmentPayload } from "../utils/delhiveryPayload.js";
+import {
+  getDefaultPickupDate,
+  validatePickupSchedule,
+  isPickupTimeInPastError,
+  PICKUP_TIME_IN_PAST,
+  PICKUP_TIMEZONE,
+} from "../utils/pickupSchedule.js";
 import { appendStatusHistory } from "../models/Order.js";
+import { stopRemindersForCancelledOrder } from "../services/dailyReminderService.js";
 import { ORDER_STATUSES } from "../constants/orderStatus.js";
 import { sendOrderStatusUpdateWhatsApp } from "../services/whatsappNotificationService.js";
 import {
@@ -151,23 +159,17 @@ const findShipmentIdentityConflict = async (
 // Uses the same warehouse config as shipment creation, plus sensible
 // defaults for pickup scheduling fields, all overridable via req.body.
 // ─────────────────────────────────────────────────────────────────────────────
-const getDefaultPickupDate = (pickupTime) => {
-  // Delhivery rejects a pickup window that has already passed today.
-  const now = new Date();
-  const [hours, minutes, seconds] = String(pickupTime).split(":").map(Number);
-  const pickupToday = new Date(now);
-  pickupToday.setHours(hours || 0, minutes || 0, seconds || 0, 0);
-  const date = now >= pickupToday ? new Date(now.getTime() + 86400000) : now;
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const dd = String(date.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
-};
-
+// FIX (BREE-100019 — "Pickup time cannot be in past"): the default
+// pickup_date used to be computed from the server's LOCAL clock
+// (setHours/getDate). Production runs in UTC, so at 18:58 IST (13:28 UTC)
+// "14:00 today" still looked ahead and the payload became today 14:00 —
+// already past in IST, which is how Delhivery reads it. The default date is
+// now resolved in Asia/Kolkata (see utils/pickupSchedule.js).
 export const buildPickupRequestPayload = (
   warehouse,
   overrides = {},
   expectedPackageCount = 1,
+  now = new Date(),
 ) => {
   if (!warehouse?.pickupLocation?.trim()) {
     throw new Error(
@@ -182,7 +184,7 @@ export const buildPickupRequestPayload = (
     pickup_location: warehouse.pickupLocation,
     expected_package_count:
       overrides.expected_package_count || expectedPackageCount || 1,
-    pickup_date: overrides.pickup_date || getDefaultPickupDate(pickupTime),
+    pickup_date: overrides.pickup_date || getDefaultPickupDate(pickupTime, now),
     pickup_time: pickupTime,
   };
 };
@@ -214,6 +216,8 @@ export const extractPickupRequestId = (pickupResponse) => {
 
 export const isValidPickupRequestId = (pickupRequestId) =>
   Boolean(String(pickupRequestId || "").trim());
+
+export const PICKUP_SCHEDULABLE_ORDER_STATUSES = ["ready_to_ship", "shipped"];
 
 export const shouldRequestPickup = (order) =>
   !isValidPickupRequestId(order?.pickup_request_id);
@@ -316,6 +320,20 @@ const getDelhiveryErrorMessage = (error) => {
 
   return getPickupResponseMessage(responseBody || error);
 };
+
+// Explicit, non-retryable response for a pickup slot that is not in the
+// future (IST) — whether caught locally before calling Delhivery or reported
+// by Delhivery itself. Re-sending the same payload can never succeed.
+export const buildPickupTimeInPastResponse = (message) => ({
+  success: false,
+  code: PICKUP_TIME_IN_PAST,
+  errorCategory: "invalid_or_expired_pickup_time",
+  retryable: false,
+  message:
+    message ||
+    "Pickup time cannot be in the past. Choose a later pickup date/time.",
+  timezone: PICKUP_TIMEZONE,
+});
 
 export const formatDelhiveryPickupError = (error) => ({
   status: Number(error?.status) || 502,
@@ -425,10 +443,15 @@ export const extractDelhiveryShipmentDetails = (delhiveryResponse) => {
 // matching is case-insensitive and whitespace-safe.
 //
 // Mapping rationale for non-obvious cases:
-//  - "pending", "pickup scheduled", "not picked", "pickup pending",
-//    "manifested", "bagged", "dispatched", "in transit",
-//    "reached destination hub", "undelivered" all keep the order at
-//    "shipped" — these are pre-delivery/in-progress states, not final.
+//  - FIX (BREE-100019): pre-pickup statuses — "manifested" (AWB
+//    generated), "not picked" (pickup failed; also what Delhivery reports
+//    for a cancelled, never-picked AWB), "pickup scheduled", "pickup
+//    pending" — are deliberately NOT mapped: nothing has left the
+//    warehouse, so the order stays "ready_to_ship". Only a status Delhivery
+//    reports after it physically has the parcel moves it to "shipped".
+//  - "picked up", "in transit", "pending", "bagged", "dispatched",
+//    "reached destination hub", "undelivered" are post-pickup,
+//    pre-delivery states and map to "shipped".
 //  - "lost" maps to "cancelled" — the shipment will never be delivered and
 //    there is no dedicated "lost" order_status in the current schema.
 //  - "damaged" maps to "returned" — damaged shipments are typically routed
@@ -437,11 +460,8 @@ export const extractDelhiveryShipmentDetails = (delhiveryResponse) => {
 // application never crashes on an unexpected Delhivery status string.
 // ─────────────────────────────────────────────────────────────────────────────
 const DELHIVERY_STATUS_TO_ORDER_STATUS = {
+  "picked up": "shipped",
   pending: "shipped",
-  "pickup scheduled": "shipped",
-  "not picked": "shipped",
-  "pickup pending": "shipped",
-  manifested: "shipped",
   bagged: "shipped",
   dispatched: "shipped",
   "in transit": "shipped",
@@ -487,6 +507,12 @@ export const mapTrackingStatusToOrderStatus = (trackingStatus) => {
 // returned), no further automatic transition is ever applied — Delhivery
 // data arriving after that point is informational only.
 const TERMINAL_ORDER_STATUSES = ["delivered", "cancelled", "returned"];
+
+// A forward shipment BREE has cancelled (cancelShipment sets both). Either
+// signal counts, because Delhivery tracking can overwrite tracking_status.
+export const isCancelledShipment = (order) =>
+  order?.order_status === "cancelled" ||
+  normalizeTrackingStatus(order?.tracking_status) === "cancelled";
 
 export const isForwardOrderStatusTransition = (currentStatus, nextStatus) => {
   if (TERMINAL_ORDER_STATUSES.includes(currentStatus)) return false;
@@ -718,7 +744,11 @@ export const resolveShippingAddressForOrder = async (order, { queryFn }) => {
   return null;
 };
 
-export const createShipment = async (req, res) => {
+export const createShipment = async (
+  req,
+  res,
+  { getClientFn = getClient, delhiveryServiceFn = delhiveryService } = {},
+) => {
   const { orderId } = req.params;
 
   if (!orderId) {
@@ -728,7 +758,7 @@ export const createShipment = async (req, res) => {
     });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   let transactionStarted = false;
   let transactionFinished = false;
   console.info("[CREATE_SHIPMENT] transaction connection acquired", {
@@ -1012,7 +1042,7 @@ export const createShipment = async (req, res) => {
         orderId: order.id,
         pickup_location: payload.pickup_location?.name,
       });
-      delhiveryResponse = await delhiveryService.createShipment(payload);
+      delhiveryResponse = await delhiveryServiceFn.createShipment(payload);
       console.info("[CREATE_SHIPMENT] Delhivery shipment request completed", {
         orderId: order.id,
         success: delhiveryResponse?.success !== false,
@@ -1144,8 +1174,14 @@ export const createShipment = async (req, res) => {
       parsedShipment;
 
     // ── 8. Update orders table with shipment tracking data ────────────────────
-    const updateColumns = ["order_status = ?"];
-    const updateParams = ["shipped"];
+    // FIX (BREE-100019 — Manifested shown as Shipped): creating the shipment
+    // only generates an AWB (Delhivery status "Manifested"); the parcel has
+    // not been picked up. order_status stays "ready_to_ship" and moves to
+    // "shipped" only when Delhivery tracking (cron / trackShipment) reports
+    // a picked-up / in-transit status — see DELHIVERY_STATUS_TO_ORDER_STATUS.
+    // hasExistingShipmentState() above still blocks a second shipment.
+    const updateColumns = [];
+    const updateParams = [];
 
     if (awbNumber) {
       updateColumns.push("awb_number = ?");
@@ -1191,9 +1227,9 @@ export const createShipment = async (req, res) => {
     await appendStatusHistory({
       orderId,
       previousStatus: "ready_to_ship",
-      newStatus: "shipped",
+      newStatus: "ready_to_ship",
       changedBy: null,
-      notes: `Shipment created with Delhivery. AWB: ${awbNumber}`,
+      notes: `Shipment created with Delhivery (AWB generated, awaiting pickup). AWB: ${awbNumber}`,
       queryExecutor: client.query.bind(client),
     });
     console.info("[CREATE_SHIPMENT] status history updated", { orderId });
@@ -1216,15 +1252,13 @@ export const createShipment = async (req, res) => {
 
     const updatedOrder = updatedOrderRows[0];
 
-    // FIX (missing Shipped notification): this is the ONLY place order_status
-    // ever becomes "shipped" — it's set directly above (step 8), not detected
-    // via a transition diff — so neither the tracking cron nor trackShipment()
-    // can ever "discover" this change later and fire the standard shipped
-    // notification themselves (mappedOrderStatus will already equal
-    // order.order_status by the time either one polls). Previously this sent
-    // only the shipment-created email and no WhatsApp at all for "shipped".
-    // Shares the same order_status_notifications dedupe keyspace as the cron/
-    // trackShipment() so a retried create-shipment call can never double-send.
+    // FIX (BREE-100019): the shipment-created email (AWB + tracking link) is
+    // sent here under its own "shipment_created" key. It must NOT claim the
+    // "shipped" key: order_status now becomes "shipped" only when Delhivery
+    // reports the parcel picked up, and the cron / trackShipment() send the
+    // standard "shipped" notification on that real transition. Still
+    // exactly-once per order via order_status_notifications, so a retried
+    // create-shipment call can never double-send.
     const recipientEmail = updatedOrder?.contact_email || updatedOrder?.email;
     const recipientName =
       updatedOrder?.contact_name || updatedOrder?.customer_name || "Customer";
@@ -1234,11 +1268,11 @@ export const createShipment = async (req, res) => {
         await sendOrderStatusNotificationOnce({
           notificationKey: buildOrderStatusNotificationKey({
             orderId: updatedOrder.id,
-            status: "shipped",
+            status: "shipment_created",
             channel: "email",
           }),
           orderId: updatedOrder.id,
-          status: "shipped",
+          status: "shipment_created",
           channel: "email",
           send: () =>
             sendShipmentCreatedEmail({
@@ -1257,7 +1291,7 @@ export const createShipment = async (req, res) => {
     } else {
       logNotification({
         orderId: updatedOrder?.id,
-        status: "shipped",
+        status: "shipment_created",
         channel: "email",
         action: "failed",
         result: "failure",
@@ -1465,7 +1499,11 @@ export const reconcileShipment = async (req, res) => {
 export const schedulePickup = async (
   req,
   res,
-  { getClientFn = getClient, delhiveryServiceFn = delhiveryService } = {},
+  {
+    getClientFn = getClient,
+    delhiveryServiceFn = delhiveryService,
+    nowFn = () => new Date(),
+  } = {},
 ) => {
   const { orderId } = req.params;
 
@@ -1561,15 +1599,19 @@ export const schedulePickup = async (
       });
     }
 
-    // ── 4. Validate order status is "shipped" ────────────────────────────────
-    if (order.order_status !== "shipped") {
+    // ── 4. Validate order status allows a pickup ─────────────────────────────
+    // FIX (BREE-100019): after shipment creation the order now stays
+    // "ready_to_ship" until Delhivery actually picks it up, so that is the
+    // normal state to schedule a pickup from. "shipped" is still accepted for
+    // orders created before this fix (they were marked shipped at AWB time).
+    if (!PICKUP_SCHEDULABLE_ORDER_STATUSES.includes(order.order_status)) {
       await client.query("ROLLBACK");
       console.warn(
         `[SCHEDULE_PICKUP] Invalid order status for pickup: ${order.order_status}`,
       );
       return res.status(400).json({
         success: false,
-        message: `Pickup cannot be scheduled. Current status is "${order.order_status}". Expected "shipped".`,
+        message: `Pickup cannot be scheduled. Current status is "${order.order_status}". Expected "ready_to_ship" with a created shipment.`,
       });
     }
 
@@ -1587,6 +1629,7 @@ export const schedulePickup = async (
 
     // ── 6. Build pickup payload using warehouse config ───────────────────────
     const warehouse = getWarehouseConfig();
+    const now = nowFn();
     const pickupPayload = buildPickupRequestPayload(
       warehouse,
       {
@@ -1595,7 +1638,33 @@ export const schedulePickup = async (
         pickup_time: req.body?.pickup_time,
       },
       expectedPackageCount,
+      now,
     );
+
+    // ── 6a. Reject a pickup slot that is not in the future (IST) ───────────
+    // Validated here, BEFORE calling Delhivery, so an admin-supplied or
+    // misconfigured past slot never reaches /fm/request/new/.
+    const scheduleError = validatePickupSchedule(pickupPayload, now);
+    if (scheduleError) {
+      await client.query("ROLLBACK");
+      console.warn("[SCHEDULE_PICKUP] Rejected pickup slot before Delhivery call", {
+        orderId,
+        code: scheduleError.code,
+        pickup_date: pickupPayload.pickup_date,
+        pickup_time: pickupPayload.pickup_time,
+      });
+      if (scheduleError.code === PICKUP_TIME_IN_PAST) {
+        return res
+          .status(400)
+          .json(buildPickupTimeInPastResponse(scheduleError.message));
+      }
+      return res.status(400).json({
+        success: false,
+        code: scheduleError.code,
+        retryable: false,
+        message: scheduleError.message,
+      });
+    }
 
     console.log(
       `[SCHEDULE_PICKUP] Requesting pickup for order ${orderId} with metadata:`,
@@ -1620,6 +1689,22 @@ export const schedulePickup = async (
           `[SCHEDULE_PICKUP] Delhivery rejected a duplicate pickup request for order ${orderId}; recovering existing pickup`,
           error,
         );
+      } else if (isPickupTimeInPastError(error)) {
+        // Permanent validation error from Delhivery — surfaced explicitly
+        // and never retried automatically.
+        await client.query("ROLLBACK");
+        console.error("[SCHEDULE_PICKUP] Delhivery rejected pickup time as past", {
+          orderId,
+          awb: order.awb_number,
+          code: PICKUP_TIME_IN_PAST,
+          pickup_date: pickupPayload.pickup_date,
+          pickup_time: pickupPayload.pickup_time,
+          responseBody: error?.data || error,
+        });
+        return res.status(400).json({
+          ...buildPickupTimeInPastResponse(),
+          delhiveryError: error?.data || error,
+        });
       } else {
         await client.query("ROLLBACK");
         const formattedError = formatDelhiveryPickupError(error);
@@ -1644,6 +1729,19 @@ export const schedulePickup = async (
 
     if (!pickupResponse || pickupResponse.success === false) {
       pickupAlreadyExists = isExistingPickupResponse(pickupResponse);
+
+      if (!pickupAlreadyExists && isPickupTimeInPastError(pickupResponse)) {
+        await client.query("ROLLBACK");
+        console.error("[SCHEDULE_PICKUP] Delhivery rejected pickup time as past", {
+          orderId,
+          code: PICKUP_TIME_IN_PAST,
+          response: pickupResponse,
+        });
+        return res.status(400).json({
+          ...buildPickupTimeInPastResponse(),
+          delhiveryError: pickupResponse,
+        });
+      }
 
       if (!pickupAlreadyExists) {
         await client.query("ROLLBACK");
@@ -1785,7 +1883,11 @@ export const schedulePickup = async (
 // the response only and never persisted. Add those columns first if you
 // want them written to the DB.
 // ─────────────────────────────────────────────────────────────────────────────
-export const trackShipment = async (req, res) => {
+export const trackShipment = async (
+  req,
+  res,
+  { getClientFn = getClient, delhiveryServiceFn = delhiveryService } = {},
+) => {
   const { awb } = req.params;
 
   if (!awb) {
@@ -1796,7 +1898,7 @@ export const trackShipment = async (req, res) => {
   }
 
   const startTime = Date.now();
-  const client = await getClient();
+  const client = await getClientFn();
 
   try {
     await client.query("BEGIN");
@@ -1828,7 +1930,7 @@ export const trackShipment = async (req, res) => {
     // ── 2. Call Delhivery tracking API ───────────────────────────────────────
     let trackingResponse;
     try {
-      trackingResponse = await delhiveryService.trackShipment(awb);
+      trackingResponse = await delhiveryServiceFn.trackShipment(awb);
     } catch (error) {
       await client.query("ROLLBACK");
       console.error(
@@ -1874,9 +1976,16 @@ export const trackShipment = async (req, res) => {
     // ── 4. Only touch the DB if tracking_status actually changed ─────────────
     // Comparison is normalized (case/whitespace-insensitive) so re-fetching
     // an identical status in a different casing doesn't trigger a write.
+    // FIX (BREE-100019): once BREE has cancelled the shipment, Delhivery keeps
+    // reporting the AWB as "Not Picked" (X-PNP) — never "Cancelled". Writing
+    // that back replaced tracking_status "Cancelled" with "Not Picked", which
+    // put the cancelled order back into the tracking cron's active set. A
+    // cancelled shipment's live data is still returned, but never persisted.
+    const shipmentCancelled = isCancelledShipment(order);
     const trackingStatusChanged =
+      !shipmentCancelled &&
       normalizeTrackingStatus(trackingStatus) !==
-      normalizeTrackingStatus(order.tracking_status);
+        normalizeTrackingStatus(order.tracking_status);
 
     let mappedOrderStatus = null;
     let shouldTransitionOrderStatus = false;
@@ -2066,6 +2175,7 @@ export const trackShipment = async (req, res) => {
     res.status(200).json({
       success: true,
       message: "Tracking data fetched successfully",
+      shipmentCancelled,
       order: {
         id: order.id,
         orderNumber: order.order_number,
@@ -2175,7 +2285,7 @@ export const cancelShipment = async (
       });
     }
 
-    if (order.tracking_status === "Cancelled") {
+    if (isCancelledShipment(order)) {
       await client.query("ROLLBACK");
       console.warn(
         `[CANCEL_SHIPMENT] Shipment already cancelled for order ${orderId}`,
@@ -2221,6 +2331,14 @@ export const cancelShipment = async (
     // Terminal delivered/already-cancelled shipments are already rejected
     // above, so any order reaching this point is safe to move to the
     // 'cancelled' order_status too.
+    //
+    // The row is locked here — after the Delhivery call, so no lock is held
+    // across that HTTP request — so the cancellation and the reminder stop
+    // below are ordered against the reminder scheduler's shared-lock send
+    // guard, exactly like a return approval.
+    await client.query("SELECT id FROM orders WHERE id = ? FOR UPDATE", [
+      orderId,
+    ]);
     await client.query(
       `UPDATE orders
        SET tracking_status = ?,
@@ -2244,6 +2362,11 @@ export const cancelShipment = async (
       changedBy: null,
       notes: `Shipment cancelled with Delhivery. AWB: ${order.awb_number}`,
       queryExecutor: client.query,
+    });
+
+    // The cancelled order's daily reminders stop in this same transaction.
+    await stopRemindersForCancelledOrder(orderId, {
+      queryFn: (text, params) => client.query(text, params),
     });
 
     await client.query("COMMIT");

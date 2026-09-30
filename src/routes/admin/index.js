@@ -58,6 +58,7 @@ import {
   rejectRefund,
   completeRefund,
 } from "../../controllers/admin/returnController.js";
+import { cancelOrderAndRefund } from "../../controllers/admin/orderCancellationController.js";
 
 const router = Router();
 
@@ -123,6 +124,10 @@ router.patch("/orders/:orderId/refund/reject", rejectRefund);
 
 // Complete Refund
 router.patch("/orders/:orderId/refund/complete", completeRefund);
+
+// Cancel Order & Refund — separate from Cancel Shipment
+// (POST /api/shipping/cancel/:orderId), which never refunds.
+router.post("/orders/:orderId/cancel-refund", cancelOrderAndRefund);
 
 // Products
 router.get("/products", getProducts);

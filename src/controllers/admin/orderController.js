@@ -13,7 +13,10 @@ import {
   sendOrderCancelledEmail,
 } from "../../services/orderEmailService.js";
 import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
-import { activateReminderFromDelivery } from "../../services/dailyReminderService.js";
+import {
+  activateReminderFromDelivery,
+  stopRemindersForCancelledOrder,
+} from "../../services/dailyReminderService.js";
 import { publishOrderUpdateFromRequest } from "../../services/orderRealtime.js";
 import { invalidateDashboardCache } from "./dashboardController.js";
 import { shouldSendBreeStatusWhatsApp } from "../shippingController.js";
@@ -578,6 +581,15 @@ export const updateOrderStatus = async (req, res) => {
       );
     }
 
+    // Cancelling stops the order's daily reminders in this same
+    // transaction (order row already locked FOR UPDATE above). Also runs
+    // when the order was already cancelled, to clear a stale reminder.
+    if (status && normalizeOrderStatus(status) === "cancelled") {
+      await stopRemindersForCancelledOrder(req.params.id, {
+        queryFn: (text, queryParams) => client.query(text, queryParams),
+      });
+    }
+
     await client.query("COMMIT");
 
     // FIX (Medium #20 — Phase 3): dashboard stats cache was never
@@ -874,6 +886,16 @@ export const bulkUpdateStatus = async (req, res) => {
         `INSERT INTO order_status_history (order_id, previous_status, new_status, changed_by) VALUES ${historyValues}`,
         historyParams,
       );
+    }
+
+    // Same as updateOrderStatus: bulk cancellation stops each order's daily
+    // reminders inside this transaction (rows locked FOR UPDATE above).
+    if (normalizeOrderStatus(status) === "cancelled") {
+      for (const orderId of ids) {
+        await stopRemindersForCancelledOrder(orderId, {
+          queryFn: (text, queryParams) => client.query(text, queryParams),
+        });
+      }
     }
 
     await client.query("COMMIT");

@@ -131,6 +131,7 @@ const getEligibleReminders = async (today) => {
     WHERE
       dr.reminder_enabled = 1
       AND dr.status = 'active'
+      AND COALESCE(o.order_status, '') <> 'cancelled'
       AND dr.reminder_start_date IS NOT NULL
       AND dr.reminder_end_date IS NOT NULL
       AND dr.reminder_start_date <= ?
@@ -341,6 +342,15 @@ export const acquireReminderSendGuard = async (
       // the customer kept getting daily reminders.
       reason = "order_returned";
     } else if (
+      String(orderRows[0].order_status || "").trim().toLowerCase() === "cancelled"
+    ) {
+      // Order cancellation stops reminders in its own transaction
+      // (stopRemindersForCancelledOrder), and that transaction's FOR UPDATE
+      // lock orders it against this shared lock exactly like a return
+      // approval. This also covers a stale active reminder left on an order
+      // cancelled before that existed, or cancelled via Delhivery tracking.
+      reason = "order_cancelled";
+    } else if (
       !reminderRow ||
       Number(reminderRow.reminder_enabled) !== 1 ||
       reminderRow.status !== "active"
@@ -439,11 +449,13 @@ const logSkippedReminders = async (today) => {
         dr.reminder_end_date,
         drs.id AS send_record_id
       FROM daily_reminders dr
+      INNER JOIN orders o ON dr.order_id = o.id
       LEFT JOIN daily_reminder_sends drs
         ON dr.id = drs.reminder_id
         AND drs.send_date = ?
         AND drs.status = 'success'
       WHERE dr.reminder_enabled = 1 AND dr.status = 'active'
+        AND COALESCE(o.order_status, '') <> 'cancelled'
       `,
       [today],
     );

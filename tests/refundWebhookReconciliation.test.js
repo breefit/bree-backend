@@ -144,6 +144,26 @@ const makeFakeOrdersDb = (initialOrder) => {
       return { rows: [], rowCount: 0 };
     }
 
+    if (normalized.startsWith("UPDATE orders SET refund_status = 'failed', refund_reference = COALESCE")) {
+      const [refundReference, id, guardReference] = params;
+      const row = orders.get(id);
+      if (
+        row &&
+        ["initiated", "processing"].includes(row.refund_status) &&
+        (row.refund_reference === guardReference || row.refund_reference == null)
+      ) {
+        row.refund_status = "failed";
+        row.refund_reference = row.refund_reference ?? refundReference;
+        return { rows: [], rowCount: 1 };
+      }
+      return { rows: [], rowCount: 0 };
+    }
+
+    if (normalized.startsWith("UPDATE payments SET refund_id = NULL")) {
+      paymentUpdates.push(params);
+      return { rows: [], rowCount: 1 };
+    }
+
     if (normalized.startsWith("UPDATE payments SET refund_id = ?")) {
       paymentUpdates.push(params);
       return { rows: [], rowCount: 1 };
@@ -227,7 +247,10 @@ test("ISSUE-011 (Medium) regression: refund.processed for an unknown refund id (
   assert.equal(db.orders.get("order-1").refund_status, "initiated", "an unrelated order must be untouched");
 });
 
-test("ISSUE-011 (Medium): refund.failed does NOT change any order state (surfaced for manual review only)", async () => {
+// Cancel Order & Refund workflow: refund.failed now moves the refund to the
+// recoverable 'failed' refund_status (retried via completeRefund). No money
+// moved, so payment_status stays 'paid'.
+test("refund.failed moves an 'initiated' refund to recoverable 'failed'; payment_status stays 'paid'", async () => {
   const db = makeFakeOrdersDb({
     id: "order-1",
     order_status: "delivered",
@@ -242,8 +265,24 @@ test("ISSUE-011 (Medium): refund.failed does NOT change any order state (surface
   await handleWebhook(req, res, { queryFn: db.queryFn });
 
   const order = db.orders.get("order-1");
-  assert.equal(order.refund_status, "initiated", "refund_status must not be silently changed on a failure event");
+  assert.equal(order.refund_status, "failed");
   assert.equal(order.payment_status, "paid");
+});
+
+test("refund.failed never moves a completed refund", async () => {
+  const db = makeFakeOrdersDb({
+    id: "order-1",
+    order_status: "delivered",
+    refund_status: "completed",
+    refund_reference: "rfnd_test1",
+    payment_status: "refunded",
+  });
+
+  await handleWebhook(buildSignedRequest(refundFailedPayload("rfnd_test1")), makeRes(), { queryFn: db.queryFn });
+
+  assert.equal(db.orders.get("order-1").refund_status, "completed");
+  assert.equal(db.paymentUpdates.length, 0);
+  assert.match(db.historyInserts[0][3], /needs manual review/);
 });
 
 test("ISSUE-011 (Medium) regression: an invalid webhook signature is still rejected before any refund reconciliation logic runs", async () => {
@@ -347,7 +386,7 @@ test("audit: a 'processing' order on the same payment is NOT completed by a refu
   }
 });
 
-test("audit: refund.failed leaves refund state unchanged but records an admin history row", async () => {
+test("audit: refund.failed records the recoverable failure on the order and an admin history row", async () => {
   const db = makeFakeOrdersDb({
     id: "order-1",
     order_status: "delivered",
@@ -356,7 +395,7 @@ test("audit: refund.failed leaves refund state unchanged but records an admin hi
     payment_status: "paid",
   });
   await handleWebhook(buildSignedRequest(refundFailedPayload("rfnd_test1")), makeRes(), { queryFn: db.queryFn });
-  assert.equal(db.orders.get("order-1").refund_status, "initiated");
+  assert.equal(db.orders.get("order-1").refund_status, "failed");
   assert.equal(db.historyInserts.length, 1);
-  assert.match(db.historyInserts[0][3], /FAILED — needs manual review/);
+  assert.match(db.historyInserts[0][3], /FAILED — refund status set to failed/);
 });

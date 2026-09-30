@@ -1,5 +1,6 @@
 import axios from "axios";
 import PDFDocument from "pdfkit";
+import { validatePickupSchedule } from "../utils/pickupSchedule.js";
 
 const BASE_URL = process.env.DELHIVERY_BASE_URL;
 const API_TOKEN = process.env.DELHIVERY_API_TOKEN;
@@ -161,7 +162,7 @@ class DelhiveryService {
    * Throws a formatted error object (same shape as handleError) so callers
    * can handle validation failures the same way they handle API failures.
    */
-  validatePickupPayload(data) {
+  validatePickupPayload(data, now = new Date()) {
     const errors = [];
 
     if (!data || typeof data !== "object") {
@@ -202,6 +203,18 @@ class DelhiveryService {
 
     if (errors.length > 0) {
       return this.buildValidationError(errors);
+    }
+
+    // Backstop for every caller: never send a pickup slot that is not in the
+    // future in Asia/Kolkata — Delhivery rejects it permanently with
+    // 400 { pickup_time: "Pickup time cannot be in past" }.
+    const scheduleError = validatePickupSchedule(data, now);
+    if (scheduleError) {
+      return {
+        ...this.buildValidationError([scheduleError.message]),
+        code: scheduleError.code,
+        message: scheduleError.message,
+      };
     }
 
     return null;

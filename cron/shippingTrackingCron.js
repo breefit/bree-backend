@@ -7,6 +7,7 @@ import {
   mapTrackingStatusToOrderStatus,
   isForwardOrderStatusTransition,
   shouldSendBreeStatusWhatsApp,
+  isCancelledShipment,
 } from "../src/controllers/shippingController.js";
 import { appendStatusHistory } from "../src/models/Order.js";
 import {
@@ -25,6 +26,29 @@ import { runWithCronLock } from "../src/utils/cronLock.js";
 import { syncReverseShipmentTracking } from "../src/services/reverseShipmentTracking.js";
 
 const TERMINAL_STATUSES = ["delivered", "cancelled", "returned"];
+
+// FIX (BREE-100019 / AWB 58045510000055): the active set used to be decided
+// by tracking_status text alone. After a cancellation Delhivery reports the
+// AWB as "Not Picked" (never "Cancelled"), and once that text replaced
+// "Cancelled" the cancelled order was polled and rewritten every 30 minutes
+// indefinitely. order_status = 'cancelled' (set by cancelShipment) now
+// excludes it as well.
+//
+// Why order_status is a safe signal here (audited, not assumed): for an
+// order WITH an AWB, order_status can only become 'cancelled' through
+// cancelShipment (Delhivery accepted the cancel) or Delhivery's own tracking
+// reporting Cancelled/Lost. Manual admin/bulk status changes cannot set it
+// (DELHIVERY_LOCKED_STATUSES in admin/orderController.js), and Cancel Order &
+// Refund refuses a live shipment. 'cancelled' is also already terminal for
+// isForwardOrderStatusTransition(), so polling it could never move the order
+// — it only overwrote tracking_status and delhivery_response.
+export const NOT_CANCELLED_SHIPMENT_GUARD = `AND COALESCE(order_status, '') <> 'cancelled'
+       AND LOWER(TRIM(COALESCE(tracking_status, ''))) <> 'cancelled'`;
+
+export const ACTIVE_FORWARD_SHIPMENTS_WHERE = `WHERE awb_number IS NOT NULL
+       AND awb_number != ''
+       AND LOWER(TRIM(COALESCE(tracking_status, ''))) NOT IN ('delivered', 'cancelled', 'returned')
+       ${NOT_CANCELLED_SHIPMENT_GUARD}`;
 
 // FIX (Medium #17 — Phase 3): a persistently-failing Delhivery tracking API
 // call for a given order used to be only console.error'd and silently
@@ -69,8 +93,8 @@ export const resetTrackingSyncFailure = async (order, { queryFn = query } = {}) 
   );
 };
 
-const getAvailableOrderColumns = async () => {
-  const { rows } = await query("SHOW COLUMNS FROM orders");
+const getAvailableOrderColumns = async (queryFn = query) => {
+  const { rows } = await queryFn("SHOW COLUMNS FROM orders");
   const fields = new Set((rows || []).map((row) => row.Field));
 
   return {
@@ -81,31 +105,40 @@ const getAvailableOrderColumns = async () => {
   };
 };
 
-export const syncShippingTracking = async () => {
+// Dependencies are injectable only for tests; the cron lock calls this with
+// no arguments, so production always uses the real defaults.
+export const syncShippingTracking = async ({
+  queryFn = query,
+  delhiveryServiceFn = delhiveryService,
+  activateReminderFn = activateReminderFromDelivery,
+} = {}) => {
   console.log("[SHIPPING_CRON] Cron start");
 
-  const { rows: orders } = await query(
+  const { rows: orders } = await queryFn(
     `SELECT id, order_number, order_status, awb_number, tracking_status,
             contact_name, customer_name, email, contact_email,
             mobile_number, contact_phone, tracking_url, courier_name,
             tracking_sync_failure_count
      FROM orders
-     WHERE awb_number IS NOT NULL
-       AND awb_number != ''
-       AND LOWER(TRIM(COALESCE(tracking_status, ''))) NOT IN ('delivered', 'cancelled', 'returned')`,
+     ${ACTIVE_FORWARD_SHIPMENTS_WHERE}`,
   );
 
-  const availableColumns = await getAvailableOrderColumns();
+  const availableColumns = await getAvailableOrderColumns(queryFn);
   console.log(`[SHIPPING_CRON] Processing ${orders.length} orders`);
 
   for (const order of orders) {
     const awb = order.awb_number;
     if (!awb) continue;
+    // Same rule as ACTIVE_FORWARD_SHIPMENTS_WHERE, re-checked per row.
+    if (isCancelledShipment(order)) {
+      console.log(`[SHIPPING_CRON] Skipping cancelled shipment ${order.id} AWB ${awb}`);
+      continue;
+    }
 
     console.log(`[SHIPPING_CRON] Processing order ${order.id} AWB ${awb}`);
 
     try {
-      const trackingResponse = await delhiveryService.trackShipment(awb);
+      const trackingResponse = await delhiveryServiceFn.trackShipment(awb);
       const parsedTracking = extractDelhiveryTrackingDetails(trackingResponse);
 
       if (!parsedTracking.success) {
@@ -174,25 +207,28 @@ export const syncShippingTracking = async () => {
         }
       }
 
+      // FIX (BREE-100019): the row snapshot above can be stale — a Cancel
+      // Shipment committed after the SELECT would otherwise be overwritten
+      // here with Delhivery's "Not Picked" (exactly how a cancelled order
+      // re-entered the active set). The cancellation check is repeated
+      // against the CURRENT row, atomically with the write.
       updateParams.push(order.id);
-      const updateWhere = shouldTransitionOrderStatus
-        ? "WHERE id = ? AND order_status = ?"
-        : "WHERE id = ?";
+      let updateWhere = `WHERE id = ? ${NOT_CANCELLED_SHIPMENT_GUARD}`;
       if (shouldTransitionOrderStatus) {
+        updateWhere += " AND order_status = ?";
         updateParams.push(order.order_status);
       }
 
-      const updateResult = await query(
+      const updateResult = await queryFn(
         `UPDATE orders SET ${updateFields.join(", ")} ${updateWhere}`,
         updateParams,
       );
 
-      if (
-        shouldTransitionOrderStatus &&
-        !Number(updateResult.affectedRows ?? updateResult.rowCount)
-      ) {
+      if (!Number(updateResult.affectedRows ?? updateResult.rowCount)) {
         console.warn(
-          `[SHIPPING_CRON] Skipping stale status transition for order ${order.id}; another update won the race`,
+          shouldTransitionOrderStatus
+            ? `[SHIPPING_CRON] Skipping stale status transition for order ${order.id}; another update won the race`
+            : `[SHIPPING_CRON] Order ${order.id} AWB ${awb} was cancelled during this run — tracking not written`,
         );
         continue;
       }
@@ -204,6 +240,7 @@ export const syncShippingTracking = async () => {
           newStatus: mappedOrderStatus,
           changedBy: null,
           notes: `Order status auto-synced from Delhivery tracking status "${trackingStatus}" for AWB ${awb}`,
+          queryExecutor: queryFn,
         });
       }
 
@@ -333,14 +370,14 @@ export const syncShippingTracking = async () => {
         if (normalizedTrackingStatus === "delivered") {
           // Activate daily reminders when order is delivered
           try {
-            const { rows: reminders } = await query(
+            const { rows: reminders } = await queryFn(
               `SELECT id FROM daily_reminders
                WHERE order_id = ? AND reminder_enabled = 1`,
               [order.id],
             );
 
             for (const reminder of reminders) {
-              await activateReminderFromDelivery({
+              await activateReminderFn({
                 reminderId: reminder.id,
                 deliveryDate: new Date().toISOString().split("T")[0], // Today's date in YYYY-MM-DD
               });
@@ -374,7 +411,7 @@ export const syncShippingTracking = async () => {
         `[SHIPPING_CRON] API success for order ${order.id} AWB ${awb}`,
       );
 
-      await resetTrackingSyncFailure(order).catch((err) =>
+      await resetTrackingSyncFailure(order, { queryFn }).catch((err) =>
         console.error(
           `[SHIPPING_CRON] Failed to reset tracking_sync_failure_count for order ${order.id}`,
           err,
@@ -386,7 +423,7 @@ export const syncShippingTracking = async () => {
         error.message || error,
       );
 
-      await recordTrackingSyncFailure(order).catch((err) =>
+      await recordTrackingSyncFailure(order, { queryFn }).catch((err) =>
         console.error(
           `[SHIPPING_CRON] Failed to record tracking_sync_failure_count for order ${order.id}`,
           err,

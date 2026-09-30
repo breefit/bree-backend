@@ -35,7 +35,8 @@ const whatsappServiceSource = read(
 );
 
 test("Delhivery shipment statuses map to the tracking-timeline order statuses", () => {
-  assert.equal(mapTrackingStatusToOrderStatus("Manifested"), "shipped");
+  // FIX (BREE-100019): AWB generated / not yet picked up is not "shipped".
+  assert.equal(mapTrackingStatusToOrderStatus("Manifested"), null);
   assert.equal(mapTrackingStatusToOrderStatus("In Transit"), "shipped");
   assert.equal(
     mapTrackingStatusToOrderStatus("Out for delivery"),

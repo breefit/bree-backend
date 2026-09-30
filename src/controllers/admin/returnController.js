@@ -2074,6 +2074,12 @@ export const completeRefund = async (
       mode = "recheck";
     } else if (
       order.refund_status === "approved" ||
+      // A refund Razorpay reported FAILED (refund.failed webhook, or a
+      // recheck below) is recoverable: retrying goes through the exact same
+      // claim + existing-refund lookup as a first attempt.
+      // findExistingRazorpayRefund ignores failed refunds, so a retry
+      // creates at most one new refund.
+      order.refund_status === "failed" ||
       (order.refund_status === "processing" &&
         isProcessingClaimStale(order.updated_at))
     ) {
@@ -2245,6 +2251,22 @@ export const completeRefund = async (
       orderId,
       razorpayRefundId: razorpayRefund.id,
     });
+    // Recorded as the recoverable 'failed' refund_status (same transition
+    // the refund.failed webhook makes), so the next attempt retries instead
+    // of rechecking the same failed refund forever. Guarded so it can only
+    // move this exact 'initiated' refund.
+    try {
+      await queryFn(
+        `UPDATE orders SET refund_status = 'failed', updated_at = NOW()
+         WHERE id = ? AND refund_status = 'initiated' AND refund_reference = ?`,
+        [orderId, razorpayRefund.id],
+      );
+    } catch (markErr) {
+      log("error", "return.refund_mark_failed_failed", {
+        orderId,
+        error: markErr?.message || markErr,
+      });
+    }
     return res.status(409).json({
       success: false,
       code: "RAZORPAY_REFUND_FAILED",
@@ -2268,7 +2290,13 @@ export const completeRefund = async (
     );
     const relocked = relockedRows[0];
 
-    if (relocked.refund_status === "completed") {
+    if (
+      relocked.refund_status === "completed" ||
+      // A refund.failed webhook for this same refund landed while the
+      // Razorpay call was in flight — never overwrite it back to initiated.
+      (relocked.refund_status === "failed" &&
+        relocked.refund_reference === razorpayRefund.id)
+    ) {
       // Another concurrent request already finished this.
       await phase3.query("COMMIT");
       updated = relocked;

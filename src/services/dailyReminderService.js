@@ -368,10 +368,11 @@ export const getOrderReturnStatus = async (orderId, { queryFn = query } = {}) =>
 };
 
 /**
- * Permanently stops every not-yet-stopped daily reminder on an order whose
- * return was approved. Called by returnController.approveReturn INSIDE its
- * transaction (pass the transaction client's query as queryFn), so the
- * return approval and the reminder stop commit or roll back together.
+ * Permanently stops every not-yet-stopped daily reminder on an order that
+ * will never be used by the customer — an approved return or a
+ * cancellation. Always called INSIDE the caller's transaction (pass the
+ * transaction client's query as queryFn), after the order row is locked,
+ * so the order change and the reminder stop commit or roll back together.
  *
  * Uses the existing canonical "permanently stopped" representation:
  * status = 'ended' (same value a cancelled subscription uses, which
@@ -384,7 +385,7 @@ export const getOrderReturnStatus = async (orderId, { queryFn = query } = {}) =>
  *
  * @returns {Promise<{stopped: number}>} number of reminder rows changed
  */
-export const stopRemindersForReturnedOrder = async (
+export const stopRemindersForOrder = async (
   orderId,
   { queryFn = query } = {},
 ) => {
@@ -397,6 +398,15 @@ export const stopRemindersForReturnedOrder = async (
   );
   return { stopped: Number(result?.rowCount || 0) };
 };
+
+// Return approval (returnController.approveReturn) — same mechanism.
+export const stopRemindersForReturnedOrder = (orderId, options) =>
+  stopRemindersForOrder(orderId, options);
+
+// Order cancellation (Cancel Shipment, Cancel Order & Refund, manual/bulk
+// admin cancel) — same mechanism and state convention as returns.
+export const stopRemindersForCancelledOrder = (orderId, options) =>
+  stopRemindersForOrder(orderId, options);
 
 /**
  * Helper: Format date as YYYY-MM-DD
@@ -422,5 +432,7 @@ export default {
   resumeReminderForOrder,
   isReminderBlockedByReturnStatus,
   getOrderReturnStatus,
+  stopRemindersForOrder,
   stopRemindersForReturnedOrder,
+  stopRemindersForCancelledOrder,
 };
