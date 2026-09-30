@@ -224,6 +224,26 @@ export const findExistingRazorpayRefund = async (razorpay, order) => {
   );
 };
 
+// Stores what Razorpay last reported about a refund: its own status
+// (pending / processed / failed) and, when supplied, the bank RRN
+// (acquirer_data.rrn). Admin-only columns — the customer / public tracking
+// endpoints never select them. An RRN is never blanked once known.
+export const recordRefundGatewayDetails = async (queryFn, orderId, razorpayRefund) => {
+  if (!razorpayRefund) return;
+  const gatewayStatus = razorpayRefund.status ? String(razorpayRefund.status) : null;
+  const rrn = razorpayRefund.acquirer_data?.rrn
+    ? String(razorpayRefund.acquirer_data.rrn)
+    : null;
+  if (!gatewayStatus && !rrn) return;
+  await queryFn(
+    `UPDATE orders
+     SET refund_gateway_status = COALESCE(?, refund_gateway_status),
+         refund_rrn = COALESCE(?, refund_rrn)
+     WHERE id = ?`,
+    [gatewayStatus, rrn, orderId],
+  );
+};
+
 // Every order_status_history row a return/refund transition writes goes
 // through here — order_status itself never changes for a return, so
 // previous/new are recorded identically (same trick as approveReturn).
@@ -2036,7 +2056,12 @@ export const rejectRefund = async (req, res, { getClientFn = getClient } = {}) =
 export const completeRefund = async (
   req,
   res,
-  { getClientFn = getClient, queryFn = query, getRazorpayFn = getRazorpay } = {},
+  {
+    getClientFn = getClient,
+    queryFn = query,
+    getRazorpayFn = getRazorpay,
+    allowCreate = true,
+  } = {},
 ) => {
   const { orderId } = req.params;
 
@@ -2072,6 +2097,17 @@ export const completeRefund = async (
     } else if (order.refund_status === "initiated" && order.refund_reference) {
       await phase1.query("COMMIT");
       mode = "recheck";
+    } else if (!allowCreate) {
+      // Reconciliation (refundReconciliationCron) — never creates a refund
+      // and never claims. A stale 'processing' claim may only ADOPT a
+      // refund Razorpay already holds for this order; anything else
+      // (approved / failed / fresh processing) is left for an admin action.
+      await phase1.query("COMMIT");
+      mode =
+        order.refund_status === "processing" &&
+        isProcessingClaimStale(order.updated_at)
+          ? "adopt_only"
+          : "skip";
     } else if (
       order.refund_status === "approved" ||
       // A refund Razorpay reported FAILED (refund.failed webhook, or a
@@ -2153,6 +2189,15 @@ export const completeRefund = async (
     });
   }
 
+  if (mode === "skip") {
+    return res.json({
+      success: true,
+      reconciled: false,
+      message: "Nothing to reconcile for this refund.",
+      order,
+    });
+  }
+
   // ── Phase 2: talk to Razorpay with no DB transaction open. ──────────────
   const razorpay = getRazorpayFn();
   let razorpayRefund;
@@ -2182,6 +2227,19 @@ export const completeRefund = async (
           },
         );
       }
+    } else if (mode === "adopt_only") {
+      // Reconciliation of a stale 'processing' claim: adopt a refund of
+      // ours that Razorpay already holds, never create one.
+      razorpayRefund = await findExistingRazorpayRefund(razorpay, order);
+      if (!razorpayRefund) {
+        return res.json({
+          success: true,
+          reconciled: false,
+          message: "No Razorpay refund exists for this claim — left for an admin retry.",
+          order,
+        });
+      }
+      reconciledExisting = true;
     } else {
       // mode === "recheck" — check status of the refund already created;
       // never call payments.refund() a second time for the same order.
@@ -2243,9 +2301,8 @@ export const completeRefund = async (
 
   // FIX (return/refund E2E audit): a recheck that finds Razorpay reports
   // the refund FAILED used to answer "Refund initiated successfully." and
-  // leave it 'initiated' with nothing telling the admin it failed. There is
-  // no 'failed' refund_status (see BUSINESS DECISIONS in the audit), so the
-  // state is left unchanged — but the admin is told, and it is recorded.
+  // leave it 'initiated' with nothing telling the admin it failed. The admin
+  // is told (409), and the order moves to the recoverable 'failed' state.
   if (mode === "recheck" && razorpayRefund?.status === "failed") {
     log("error", "return.refund_failed_at_razorpay", {
       orderId,
@@ -2256,11 +2313,19 @@ export const completeRefund = async (
     // of rechecking the same failed refund forever. Guarded so it can only
     // move this exact 'initiated' refund.
     try {
-      await queryFn(
+      const marked = await queryFn(
         `UPDATE orders SET refund_status = 'failed', updated_at = NOW()
          WHERE id = ? AND refund_status = 'initiated' AND refund_reference = ?`,
         [orderId, razorpayRefund.id],
       );
+      if (Number(marked?.rowCount || 0) > 0) {
+        await recordRefundGatewayDetails(queryFn, orderId, razorpayRefund);
+        appendReturnHistory(
+          req,
+          order,
+          `Razorpay reported refund ${razorpayRefund.id} FAILED (status check) — refund status set to failed; retry the refund from admin.`,
+        );
+      }
     } catch (markErr) {
       log("error", "return.refund_mark_failed_failed", {
         orderId,
@@ -2275,7 +2340,17 @@ export const completeRefund = async (
     });
   }
 
-  const isProcessed = razorpayRefund?.status === "processed";
+  // FIX (BREE-100020 — refund marked Completed at creation): Razorpay's
+  // create-refund response can already say status "processed" (typical for
+  // UPI), and that used to be persisted as refund_status 'completed' one
+  // second after the refund was created. Creating (or adopting) a refund now
+  // always records 'initiated'; 'completed' is reached only from a verified
+  // final Razorpay state — the refund.processed webhook
+  // (paymentController.handleWebhook) or an explicit status fetch of the
+  // existing refund (mode "recheck": admin "Check Status" / the refund
+  // reconciliation cron).
+  const isProcessed =
+    mode === "recheck" && razorpayRefund?.status === "processed";
 
   // ── Phase 3: short transaction to persist the result. ────────────────────
   const phase3 = await getClientFn();
@@ -2295,7 +2370,16 @@ export const completeRefund = async (
       // A refund.failed webhook for this same refund landed while the
       // Razorpay call was in flight — never overwrite it back to initiated.
       (relocked.refund_status === "failed" &&
-        relocked.refund_reference === razorpayRefund.id)
+        relocked.refund_reference === razorpayRefund.id) ||
+      // A recheck / reconciliation only ever moves the exact state it read;
+      // anything that changed meanwhile (webhook, admin retry) wins.
+      (mode === "recheck" &&
+        !(
+          relocked.refund_status === "initiated" &&
+          relocked.refund_reference === razorpayRefund.id
+        )) ||
+      (mode === "adopt_only" &&
+        !(relocked.refund_status === "processing" && !relocked.refund_reference))
     ) {
       // Another concurrent request already finished this.
       await phase3.query("COMMIT");
@@ -2342,6 +2426,11 @@ export const completeRefund = async (
           Number(relocked.refund_amount),
           orderId,
         ],
+      );
+      await recordRefundGatewayDetails(
+        (text, params) => phase3.query(text, params),
+        orderId,
+        razorpayRefund,
       );
       await phase3.query("COMMIT");
 

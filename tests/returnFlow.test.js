@@ -667,9 +667,10 @@ test("completeRefund is three-mode idempotent (already_completed / recheck / cre
   const phase1End = fnSource.indexOf("// ── Phase 2:");
   const phase2Block = fnSource.slice(phase1End, fnSource.indexOf("// ── Phase 3:"));
   assert.doesNotMatch(phase2Block, /BEGIN/);
-  // Only "processed" is ever mapped to completed — everything else,
-  // including any unrecognized status, becomes "initiated".
-  assert.match(fnSource, /isProcessed = razorpayRefund\?\.status === "processed"/);
+  // Only a verified status fetch ("recheck") reporting "processed" is
+  // mapped to completed — creating/adopting a refund, and any other status,
+  // becomes "initiated" (refund lifecycle fix, BREE-100020).
+  assert.match(fnSource, /isProcessed =\s*mode === "recheck" && razorpayRefund\?\.status === "processed"/);
   // Notification only fires on an actual state transition.
   assert.match(fnSource, /if \(didTransition\)/);
 });

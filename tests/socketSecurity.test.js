@@ -33,6 +33,7 @@ const { publishOrderUpdate, toSafeOrderEvent, SAFE_ORDER_EVENT_FIELDS } = await 
 );
 const { approveReturn, rejectRefund } = await import("../src/controllers/admin/returnController.js");
 const { handleWebhook } = await import("../src/controllers/paymentController.js");
+const { cancelShipment } = await import("../src/controllers/shippingController.js");
 const { setProductVisibility } = await import("../src/controllers/admin/productController.js");
 const { ADMIN_COOKIE_NAME, COOKIE_NAME } = await import("../src/utils/jwt.js");
 
@@ -443,6 +444,50 @@ test("M: shipping/status updates publish through the same admin-room path (safe 
   assert.equal(eventsFor("adminA")[0].order_status, "shipped");
   assert.equal(eventsFor("customer2")[0].order_status, "shipped");
   assert.deepEqual(eventsFor("customer1"), []);
+  assert.deepEqual(eventsFor("anon"), []);
+  assertNoLeaks();
+});
+
+test("N: an order cancellation (with its refund state) reaches admins and ONLY the owning customer — never another customer or anonymous", async () => {
+  reset();
+  // What Cancel Order & Refund publishes: the locked orders row after the
+  // cancellation, refund initiated.
+  await publishOrderUpdate(
+    io,
+    fullOrderRow(ORDER_1, CUSTOMER_1, { order_status: "cancelled", refund_status: "initiated" }),
+  );
+  await settle();
+  assert.deepEqual(
+    eventsFor("customer1").map((e) => [e.id, e.order_status, e.refund_status]),
+    [[ORDER_1, "cancelled", "initiated"]],
+  );
+  assert.deepEqual(eventsFor("customer2"), []);
+  assert.deepEqual(eventsFor("anon"), []);
+  assert.equal(eventsFor("adminA")[0].order_status, "cancelled");
+  assertNoLeaks();
+
+  // A real Cancel Shipment now publishes its cancellation too (it used to
+  // emit nothing, so a customer viewing the order never saw it change).
+  reset();
+  const row = { ...fullOrderRow(ORDER_2, CUSTOMER_2, { order_status: "ready_to_ship" }), awb_number: "AWB-SOCKET", tracking_status: "Manifested", contact_email: null };
+  const client = {
+    query: async (sql) => {
+      const q = sql.replace(/\s+/g, " ").trim();
+      if (q.startsWith("SELECT id, order_number, order_status, tracking_status, awb_number")) return { rows: [{ ...row }] };
+      if (q.startsWith("SELECT id FROM orders WHERE id = ? FOR UPDATE")) return { rows: [{ id: ORDER_2 }] };
+      return { rows: [], rowCount: 1 };
+    },
+    release() {},
+  };
+  const res = { statusCode: 200, status(c) { this.statusCode = c; return this; }, json(b) { this.body = b; return this; } };
+  await cancelShipment({ params: { orderId: ORDER_2 }, body: {}, app: { locals: { io } } }, res, {
+    getClientFn: async () => client,
+    delhiveryServiceFn: { cancelShipment: async () => ({ status: true }) },
+  });
+  await settle();
+  assert.equal(res.statusCode, 200);
+  assert.ok(eventsFor("adminA").some((e) => e.id === ORDER_2 && e.order_status === "cancelled"));
+  assert.deepEqual(eventsFor("customer1"), [], "customer1 never sees customer2's cancellation");
   assert.deepEqual(eventsFor("anon"), []);
   assertNoLeaks();
 });

@@ -1084,6 +1084,8 @@ export const getMyOrders = async (req, res) => {
            o.parent_package_id, o.fulfillment_cycle,
            o.is_bulk_order, o.bulk_booking_id, o.bulk_booking_number, o.company_name,
            o.is_subscription, o.is_renewal_order, o.parent_order_id,
+           o.refund_status,
+           (o.awb_number IS NOT NULL AND TRIM(o.awb_number) <> '') AS has_shipment,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            pkg.next_fulfillment_date AS package_next_fulfillment_date,
            pkg.status AS package_status
@@ -1099,6 +1101,8 @@ export const getMyOrders = async (req, res) => {
            o.parent_package_id, o.fulfillment_cycle,
            o.is_bulk_order, o.bulk_booking_id, o.bulk_booking_number, o.company_name,
            o.is_subscription, o.is_renewal_order, o.parent_order_id,
+           o.refund_status,
+           (o.awb_number IS NOT NULL AND TRIM(o.awb_number) <> '') AS has_shipment,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            pkg.next_fulfillment_date AS package_next_fulfillment_date,
            pkg.status AS package_status
@@ -1142,7 +1146,14 @@ export const getMyOrders = async (req, res) => {
       }
     });
 
-    sendJson(res, 200, orderRows);
+    // has_shipment: authoritative "a Delhivery shipment exists" flag (from
+    // awb_number, computed in SQL) — the Orders list uses it to choose
+    // Track Order vs View Details without guessing from status text.
+    sendJson(
+      res,
+      200,
+      orderRows.map((o) => ({ ...o, has_shipment: Boolean(Number(o.has_shipment)) })),
+    );
   } catch (error) {
     log("error", "order.get_my_orders_failed", { error: error?.message });
     sendError(res, 500, "Failed to fetch orders");
@@ -1242,6 +1253,7 @@ export const getOrderTracking = async (req, res, { queryFn = query } = {}) => {
            o.reverse_shipment_type, o.reverse_tracking_status, o.reverse_tracking_raw_status, o.reverse_tracking_updated_at, o.reverse_pickup_scheduled_at, o.reverse_picked_up_at, o.reverse_delivered_at, o.returned_source, o.inspection_completed_at, o.refund_approved_at,
            o.inspection_status,
            o.refund_status, o.refund_amount, o.refund_completed_at,
+           (o.awb_number IS NOT NULL AND TRIM(o.awb_number) <> '') AS has_shipment,
            o.parent_package_id, o.fulfillment_cycle,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.contact_name, o.contact_email,
@@ -1273,6 +1285,7 @@ export const getOrderTracking = async (req, res, { queryFn = query } = {}) => {
            o.reverse_shipment_type, o.reverse_tracking_status, o.reverse_tracking_raw_status, o.reverse_tracking_updated_at, o.reverse_pickup_scheduled_at, o.reverse_picked_up_at, o.reverse_delivered_at, o.returned_source, o.inspection_completed_at, o.refund_approved_at,
            o.inspection_status,
            o.refund_status, o.refund_amount, o.refund_completed_at,
+           (o.awb_number IS NOT NULL AND TRIM(o.awb_number) <> '') AS has_shipment,
            o.parent_package_id, o.fulfillment_cycle,
            pkg.package_number, pkg.total_cycles AS package_total_cycles,
            o.customer_name AS contact_name, o.email AS contact_email,
@@ -1399,6 +1412,8 @@ export const getOrderTracking = async (req, res, { queryFn = query } = {}) => {
 
     const responseOrder = {
       ...publicOrderFields,
+      // Boolean only — the AWB itself is not exposed on this public page.
+      has_shipment: Boolean(Number(publicOrderFields.has_shipment)),
       shipping_address: resolvedShippingAddress,
       items: orderItems,
       reminders: reminderRows,

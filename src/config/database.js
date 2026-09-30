@@ -1408,6 +1408,19 @@ export const ensureOrderReturnColumns = async () => {
         "ADD COLUMN refund_completed_at DATETIME NULL DEFAULT NULL",
       );
     }
+    // Refund lifecycle: Razorpay's own refund status (pending / processed /
+    // failed) as last reported by Razorpay, and the bank RRN when Razorpay
+    // supplies one (acquirer_data.rrn). Admin-only — never returned by the
+    // customer or public tracking endpoints. refund_status stays the BREE
+    // business state (processing → initiated → completed / failed).
+    if (!existing.has("refund_gateway_status")) {
+      additions.push(
+        "ADD COLUMN refund_gateway_status VARCHAR(30) NULL DEFAULT NULL",
+      );
+    }
+    if (!existing.has("refund_rrn")) {
+      additions.push("ADD COLUMN refund_rrn VARCHAR(64) NULL DEFAULT NULL");
+    }
 
     // FIX (return timeline not synchronized with Delhivery): reverse
     // shipment tracking state, kept entirely separate from the forward

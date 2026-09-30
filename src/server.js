@@ -6,6 +6,7 @@ import { Server } from "socket.io";
 import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
+import { startRefundReconciliationCron } from "../cron/refundReconciliationCron.js";
 import { startDailyReminderCron } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 import { getSafeRazorpayConfig } from "./config/razorpay.js";
@@ -95,6 +96,10 @@ const startServer = async () => {
 
       // Recurring package fulfillment cron (creates cycle 2+ orders)
       cronTasks.push(startPackageFulfillmentCron());
+
+      // Refund reconciliation (missed refund.processed/failed webhooks) —
+      // status checks only, never creates a refund.
+      cronTasks.push(startRefundReconciliationCron());
 
       // Daily wellness reminder cron (runs every minute to check for
       // reminders). Idempotent per process — see startDailyReminderCron.

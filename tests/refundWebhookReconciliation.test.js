@@ -185,6 +185,16 @@ const makeFakeOrdersDb = (initialOrder) => {
       return { rows: [], rowCount: 1 };
     }
 
+    if (normalized.startsWith("UPDATE orders SET refund_gateway_status = COALESCE(?, refund_gateway_status)")) {
+      const [gatewayStatus, rrn, id] = params;
+      const row = orders.get(id);
+      if (row) {
+        if (gatewayStatus != null) row.refund_gateway_status = gatewayStatus;
+        if (rrn != null) row.refund_rrn = rrn;
+      }
+      return { rows: [], rowCount: row ? 1 : 0 };
+    }
+
     throw new Error(`Unhandled fake SQL in refundWebhookReconciliation test: ${normalized}`);
   };
 

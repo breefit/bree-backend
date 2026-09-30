@@ -17,6 +17,7 @@ import {
 } from "../utils/pickupSchedule.js";
 import { appendStatusHistory } from "../models/Order.js";
 import { stopRemindersForCancelledOrder } from "../services/dailyReminderService.js";
+import { publishOrderUpdateFromRequest } from "../services/orderRealtime.js";
 import { ORDER_STATUSES } from "../constants/orderStatus.js";
 import { sendOrderStatusUpdateWhatsApp } from "../services/whatsappNotificationService.js";
 import {
@@ -2370,6 +2371,11 @@ export const cancelShipment = async (
     });
 
     await client.query("COMMIT");
+
+    // Realtime: a customer viewing this order sees the cancellation (the
+    // publisher only reaches admins, the owner's room, and — as { id } only —
+    // sockets tracking this order's UUID).
+    publishOrderUpdateFromRequest(req, { id: order.id, order_status: "cancelled" });
 
     try {
       await sendShipmentCancelledEmail({

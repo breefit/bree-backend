@@ -252,3 +252,41 @@ test("ISSUE-009 regression: an unknown order id still 404s the same way as befor
   await getOrderTracking(req, res, { queryFn: createFakeQueryFn(null) });
   assert.equal(res.statusCode, 404);
 });
+
+// ── Cancelled order / refund state on the public UUID page ──────────────────
+test("public tracking: cancelled order with no shipment → has_shipment false + customer refund state; no AWB, refund id, RRN or Razorpay status", async () => {
+  const seenSql = [];
+  const baseQueryFn = createFakeQueryFn({
+    ...fakeOrderRow,
+    order_status: "cancelled",
+    refund_status: "initiated",
+    refund_amount: 1,
+    has_shipment: 0,
+  });
+  const queryFn = async (sql, params) => {
+    seenSql.push(sql);
+    return baseQueryFn(sql, params);
+  };
+  const { req, res } = makeReqRes("00000000-0000-4000-8000-000000000001");
+  await getOrderTracking(req, res, { queryFn });
+
+  const order = res.body.order;
+  assert.equal(order.order_status, "cancelled");
+  assert.equal(order.has_shipment, false);
+  assert.equal(order.refund_status, "initiated");
+  for (const hidden of ["awb_number", "refund_reference", "refund_rrn", "refund_gateway_status", "razorpay_payment_id"]) {
+    assert.equal(order[hidden], undefined, `${hidden} must not be exposed`);
+  }
+  const orderSql = seenSql.find((sql) => sql.includes("FROM orders o"));
+  assert.match(orderSql, /\(o\.awb_number IS NOT NULL AND TRIM\(o\.awb_number\) <> ''\) AS has_shipment/);
+  assert.doesNotMatch(orderSql, /o\.refund_rrn|o\.refund_gateway_status|o\.refund_reference/);
+});
+
+test("public tracking: an order with a Delhivery shipment reports has_shipment true (boolean, AWB still not exposed)", async () => {
+  const { req, res } = makeReqRes("00000000-0000-4000-8000-000000000001");
+  await getOrderTracking(req, res, {
+    queryFn: createFakeQueryFn({ ...fakeOrderRow, order_status: "cancelled", has_shipment: 1 }),
+  });
+  assert.equal(res.body.order.has_shipment, true);
+  assert.equal(res.body.order.awb_number, undefined);
+});

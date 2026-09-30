@@ -12,6 +12,9 @@ const { cancelOrderAndRefund, evaluateCancelRefundEligibility } = await import(
 const { completeRefund } = await import("../src/controllers/admin/returnController.js");
 const { cancelShipment } = await import("../src/controllers/shippingController.js");
 const { handleWebhook } = await import("../src/controllers/paymentController.js");
+const { reconcilePendingRefunds, reconcileOrderRefund } = await import(
+  "../cron/refundReconciliationCron.js"
+);
 
 /**
  * Admin "Cancel Order & Refund" — separate from "Cancel Shipment", reusing
@@ -272,6 +275,24 @@ const createFakeDb = ({ order, payment }) => {
         row.refund_status = "failed";
         row.refund_reference = row.refund_reference ?? reference;
         return { rows: [], rowCount: 1 };
+      }
+
+if (q.startsWith("UPDATE orders SET refund_gateway_status = COALESCE(?, refund_gateway_status)")) {
+  const [gatewayStatus, rrn, id] = params;
+  const row = orders.get(id);
+  if (row) {
+    if (gatewayStatus != null) row.refund_gateway_status = gatewayStatus;
+    if (rrn != null) row.refund_rrn = rrn;
+  }
+  return { rows: [], rowCount: row ? 1 : 0 };
+}
+
+      // Refund reconciliation cron's candidate query.
+      if (q.startsWith("SELECT id, refund_status FROM orders WHERE refund_status IN ('initiated', 'processing')")) {
+        const rows = [...orders.values()]
+          .filter((r) => ["initiated", "processing"].includes(r.refund_status))
+          .map((r) => ({ id: r.id, refund_status: r.refund_status }));
+        return { rows, rowCount: rows.length };
       }
 
       // Cancellation also locks the row (Cancel Shipment) and stops reminders.
@@ -547,14 +568,19 @@ test("cancel order + captured payment → order cancelled, refund initiated thro
   assert.deepEqual(db.remindersStopped, [ORDER_ID], "cancellation stops the order's reminders in its transaction");
 });
 
-test("cancel order where Razorpay processes the refund instantly → completed; orders + payments both refunded", async () => {
+// BREE-100020 regression: Razorpay's create-refund response already said
+// "processed" (UPI) and BREE marked the refund Completed one second after
+// creating it. Creation now always stops at 'initiated'.
+test("Cancel Order & Refund where Razorpay's create response already says 'processed' → cancelled + initiated, NOT completed", async () => {
   const { db, cancel } = setup({ rzp: { refundStatus: "processed" } });
   const res = await cancel();
   assert.equal(res.statusCode, 200);
   const order = db.orders.get(ORDER_ID);
-  assert.equal(order.refund_status, "completed");
-  assert.equal(order.payment_status, "refunded");
-  assert.equal(db.payments.get(ORDER_ID).status, "refunded");
+  assert.equal(order.order_status, "cancelled");
+  assert.equal(order.refund_status, "initiated");
+  assert.equal(order.payment_status, "paid");
+  assert.equal(order.refund_gateway_status, "processed", "Razorpay's own status is recorded for admins");
+  assert.equal(db.payments.get(ORDER_ID).status, "captured");
   assert.equal(db.payments.get(ORDER_ID).refund_id, "rfnd_1");
 });
 
@@ -713,7 +739,7 @@ test("refund.failed webhook → recoverable 'failed' state; retry creates exactl
   assert.equal(order.refund_status, "failed");
   assert.equal(order.payment_status, "paid", "no money moved");
   assert.equal(db.payments.get(ORDER_ID).status, "captured");
-  assert.equal(db.payments.get(ORDER_ID).refund_id, null, "failed refund id cleared from payments");
+  assert.equal(db.payments.get(ORDER_ID).refund_id, "rfnd_1", "failed refund id preserved for audit");
   assert.equal(historyMatching(db, /FAILED — refund status set to failed/).length, 1);
 
   // Recover: the admin retries.
@@ -782,4 +808,215 @@ test("concurrent Cancel Order & Refund requests (plus a concurrent Initiate Refu
   for (const r of refused) {
     assert.ok([400, 409].includes(r.statusCode), `unexpected ${r.statusCode}: ${r.body?.message}`);
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// Refund lifecycle (BREE-100020): processing → initiated → completed/failed.
+// Creating a refund never completes it; refund.processed or a verified
+// Razorpay status check does. Reconciliation never creates a refund.
+// ════════════════════════════════════════════════════════════════════════
+
+const processedWebhook = (refundId, extra = {}) =>
+  signedWebhook("refund.processed", {
+    id: refundId,
+    payment_id: "pay_1",
+    status: "processed",
+    notes: { order_id: ORDER_ID },
+    acquirer_data: { rrn: "627320498946" },
+    ...extra,
+  });
+
+test("lifecycle: refund creation → 'processing' while Razorpay is called → 'initiated' afterwards, never 'completed'", async () => {
+  const { db, cancel } = setup({ rzp: { refundStatus: "processed", refundDelayMs: 30 } });
+  const pending = cancel();
+  await sleep(10);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "processing", "claimed while Razorpay is being called");
+  const res = await pending;
+  assert.equal(res.statusCode, 200);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "initiated");
+  assert.notEqual(db.orders.get(ORDER_ID).refund_status, "completed");
+  assert.equal(historyMatching(db, /Refund completed/).length, 0);
+});
+
+test("lifecycle: verified refund.processed → initiated → completed, stores RRN and Razorpay status, payments refunded, one history row + one notification", async () => {
+  const { db, cancel } = setup();
+  await cancel();
+  const notified = [];
+  await handleWebhook(processedWebhook("rfnd_1"), makeRes(), {
+    queryFn: db.queryFn,
+    notifyRefundEvent: (o, label) => notified.push(label),
+  });
+
+  const order = db.orders.get(ORDER_ID);
+  assert.equal(order.refund_status, "completed");
+  assert.equal(order.payment_status, "refunded");
+  assert.equal(order.refund_rrn, "627320498946");
+  assert.equal(order.refund_gateway_status, "processed");
+  assert.equal(db.payments.get(ORDER_ID).status, "refunded");
+  assert.deepEqual(notified, ["Refund Completed"]);
+  assert.equal(historyMatching(db, /confirmed completed via webhook/).length, 1);
+});
+
+test("lifecycle: duplicate refund.processed (same event, and a distinct re-delivery) → no duplicate history, notification or state change", async () => {
+  const { db, razorpay, cancel } = setup();
+  await cancel();
+  const notified = [];
+  const deps = { queryFn: db.queryFn, notifyRefundEvent: (o, label) => notified.push(label) };
+  await handleWebhook(processedWebhook("rfnd_1"), makeRes(), deps);
+  const dup = makeRes();
+  await handleWebhook(processedWebhook("rfnd_1"), dup, deps); // ledger duplicate
+  await handleWebhook(processedWebhook("rfnd_1", { created_at: 2 }), makeRes(), deps); // new event id, stale
+  assert.equal(dup.body.duplicate, true);
+  assert.deepEqual(notified, ["Refund Completed"]);
+  assert.equal(historyMatching(db, /confirmed completed via webhook/).length, 1);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "completed");
+  assert.equal(razorpay.counts.refund, 1, "never a second refund");
+});
+
+test("lifecycle: refund.processed whose payment belongs to a different order is ignored", async () => {
+  const { db, cancel } = setup();
+  await cancel();
+  await handleWebhook(processedWebhook("rfnd_1", { payment_id: "pay_SOMEONE_ELSE" }), makeRes(), {
+    queryFn: db.queryFn,
+    notifyRefundEvent: () => assert.fail("must not notify"),
+  });
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "initiated");
+});
+
+test("lifecycle: refund.failed from 'processing' (webhook raced the create call) → failed, refund id kept for audit", async () => {
+  const { db, cancel } = setup({ rzp: { refundDelayMs: 40 } });
+  const pending = cancel();
+  await sleep(10);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "processing");
+  // Razorpay created rfnd_1 and failed it before BREE saved the id.
+  await sleep(35);
+  await handleWebhook(
+    signedWebhook("refund.failed", { id: "rfnd_1", payment_id: "pay_1", status: "failed", notes: { order_id: ORDER_ID } }),
+    makeRes(),
+    { queryFn: db.queryFn },
+  );
+  await pending;
+  const order = db.orders.get(ORDER_ID);
+  assert.equal(order.refund_status, "failed", "the in-flight create never overwrites the failure");
+  assert.equal(order.refund_reference, "rfnd_1");
+  assert.equal(order.payment_status, "paid");
+});
+
+test("lifecycle: a stale refund.failed after the refund completed → completed remains completed", async () => {
+  const { db, cancel } = setup();
+  await cancel();
+  await handleWebhook(processedWebhook("rfnd_1"), makeRes(), { queryFn: db.queryFn, notifyRefundEvent: () => {} });
+  await handleWebhook(
+    signedWebhook("refund.failed", { id: "rfnd_1", payment_id: "pay_1", status: "failed", notes: { order_id: ORDER_ID } }),
+    makeRes(),
+    { queryFn: db.queryFn },
+  );
+  const order = db.orders.get(ORDER_ID);
+  assert.equal(order.refund_status, "completed");
+  assert.equal(order.payment_status, "refunded");
+  assert.equal(db.payments.get(ORDER_ID).status, "refunded");
+});
+
+test("lifecycle: retry after failure → failed → processing → initiated → completed, exactly one new refund", async () => {
+  const { db, razorpay, cancel } = setup({ rzp: { refundDelayMs: 25 } });
+  await cancel();
+  razorpay.ledger[0].status = "failed";
+  await handleWebhook(
+    signedWebhook("refund.failed", { id: "rfnd_1", payment_id: "pay_1", status: "failed", notes: { order_id: ORDER_ID } }),
+    makeRes(),
+    { queryFn: db.queryFn },
+  );
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "failed");
+
+  const retry = cancel();
+  await sleep(10);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "processing");
+  await retry;
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "initiated");
+  assert.equal(db.orders.get(ORDER_ID).refund_reference, "rfnd_2");
+
+  await handleWebhook(processedWebhook("rfnd_2"), makeRes(), { queryFn: db.queryFn, notifyRefundEvent: () => {} });
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "completed");
+  assert.equal(razorpay.counts.refund, 2, "one original + one retry, nothing more");
+});
+
+// ── Reconciliation ─────────────────────────────────────────────────────
+
+test("reconciliation: Razorpay 'processed' → completed (payments refunded, RRN stored)", async () => {
+  const { db, razorpay, cancel, deps } = setup();
+  await cancel();
+  Object.assign(razorpay.ledger[0], { status: "processed", acquirer_data: { rrn: "RRN-TEST-1" } });
+
+  const results = await reconcilePendingRefunds(deps);
+
+  assert.equal(results.length, 1);
+  const order = db.orders.get(ORDER_ID);
+  assert.equal(order.refund_status, "completed");
+  assert.equal(order.payment_status, "refunded");
+  assert.equal(order.refund_rrn, "RRN-TEST-1");
+  assert.equal(db.payments.get(ORDER_ID).status, "refunded");
+  assert.equal(razorpay.counts.refund, 1, "reconciliation never creates a refund");
+});
+
+test("reconciliation: Razorpay 'pending' → stays initiated; idempotent across runs", async () => {
+  const { db, razorpay, cancel, deps } = setup();
+  await cancel();
+  await reconcilePendingRefunds(deps);
+  await reconcilePendingRefunds(deps);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "initiated");
+  assert.equal(db.orders.get(ORDER_ID).payment_status, "paid");
+  assert.equal(razorpay.counts.refund, 1);
+  assert.equal(razorpay.counts.refundFetch, 2, "status checked each run, nothing created");
+});
+
+test("reconciliation: Razorpay 'failed' → failed (recoverable), no new refund", async () => {
+  const { db, razorpay, cancel, deps } = setup();
+  await cancel();
+  razorpay.ledger[0].status = "failed";
+  await reconcilePendingRefunds(deps);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "failed");
+  assert.equal(db.orders.get(ORDER_ID).payment_status, "paid");
+  assert.equal(razorpay.counts.refund, 1);
+});
+
+test("reconciliation never creates a refund: approved / failed / fresh processing are left alone; a stale claim only adopts an existing refund", async () => {
+  for (const refund_status of ["approved", "failed"]) {
+    const { db, razorpay, deps } = setup({ order: { order_status: "cancelled", refund_status, refund_amount: 500 } });
+    const result = await reconcileOrderRefund(ORDER_ID, deps);
+    assert.equal(result.body.reconciled, false, refund_status);
+    assert.equal(razorpay.counts.refund, 0, refund_status);
+    assert.equal(db.orders.get(ORDER_ID).refund_status, refund_status);
+  }
+
+  const stale = new Date(Date.now() - 10 * 60 * 1000);
+  const none = setup({ order: { order_status: "cancelled", refund_status: "processing", refund_amount: 500, updated_at: stale } });
+  await reconcileOrderRefund(ORDER_ID, none.deps);
+  assert.equal(none.razorpay.counts.refund, 0);
+  assert.equal(none.db.orders.get(ORDER_ID).refund_status, "processing", "no refund at Razorpay → left for an admin retry");
+
+  const adopt = setup({
+    order: { order_status: "cancelled", refund_status: "processing", refund_amount: 500, updated_at: stale },
+    rzp: { existingRefunds: [{ id: "rfnd_ours", amount: 50000, status: "processed", notes: { order_id: ORDER_ID } }] },
+  });
+  await reconcileOrderRefund(ORDER_ID, adopt.deps);
+  assert.equal(adopt.razorpay.counts.refund, 0);
+  assert.equal(adopt.db.orders.get(ORDER_ID).refund_status, "initiated", "adopted; completion needs a verified status check");
+  assert.equal(adopt.db.orders.get(ORDER_ID).refund_reference, "rfnd_ours");
+  await reconcileOrderRefund(ORDER_ID, adopt.deps);
+  assert.equal(adopt.db.orders.get(ORDER_ID).refund_status, "completed");
+});
+
+test("reconciliation: a Razorpay error keeps the existing state", async () => {
+  const { db, cancel, deps } = setup();
+  await cancel();
+  const brokenDeps = {
+    ...deps,
+    getRazorpayFn: () => ({
+      refunds: { fetch: async () => { throw new Error("Razorpay 503"); } },
+      payments: { refund: async () => assert.fail("never create") },
+    }),
+  };
+  const result = await reconcileOrderRefund(ORDER_ID, brokenDeps);
+  assert.equal(result.statusCode, 502);
+  assert.equal(db.orders.get(ORDER_ID).refund_status, "initiated");
 });

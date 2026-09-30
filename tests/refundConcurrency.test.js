@@ -155,6 +155,29 @@ const createFakeReturnDb = (initialOrder) => {
           return { rows: row ? [{ ...row }] : [], rowCount: row ? 1 : 0 };
         }
 
+        if (
+          normalized ===
+          "UPDATE orders SET refund_status = 'failed', updated_at = NOW() WHERE id = ? AND refund_status = 'initiated' AND refund_reference = ?"
+        ) {
+          const [id, reference] = params;
+          const row = orders.get(id);
+          if (row?.refund_status !== "initiated" || row.refund_reference !== reference) {
+            return { rows: [], rowCount: 0 };
+          }
+          row.refund_status = "failed";
+          return { rows: [], rowCount: 1 };
+        }
+
+        if (normalized.startsWith("UPDATE orders SET refund_gateway_status = COALESCE(?, refund_gateway_status)")) {
+          const [gatewayStatus, rrn, id] = params;
+          const row = orders.get(id);
+          if (row) {
+            if (gatewayStatus != null) row.refund_gateway_status = gatewayStatus;
+            if (rrn != null) row.refund_rrn = rrn;
+          }
+          return { rows: [], rowCount: row ? 1 : 0 };
+        }
+
         throw new Error(`Unhandled fake SQL in refundConcurrency test: ${normalized}`);
       },
       release: () => {
@@ -278,8 +301,11 @@ test("ISSUE-011: two concurrent completeRefund calls on the same order result in
   assert.equal(rzp.getRefundCalls(), 1, "razorpay.payments.refund() must be called exactly once");
   assert.equal(rzp.getFetchCalls(), 0);
 
+  // Refund lifecycle fix (BREE-100020): creating a refund records
+  // 'initiated' even when Razorpay's create response already says
+  // "processed" — completed only via refund.processed / a status recheck.
   const finalOrder = db.orders.get("order-refund-1");
-  assert.equal(finalOrder.refund_status, "completed");
+  assert.equal(finalOrder.refund_status, "initiated");
   assert.equal(finalOrder.refund_reference, "rfnd_test1");
 
   const responses = [resA, resB];
@@ -331,7 +357,7 @@ test("ISSUE-011: when Razorpay itself fails, the 'processing' claim is reverted 
   const { req: req2, res: res2 } = makeReqRes("order-refund-1");
   await completeRefund(req2, res2, { ...db, ...rzpRetry });
   assert.equal(res2.body.success, true);
-  assert.equal(db.orders.get("order-refund-1").refund_status, "completed");
+  assert.equal(db.orders.get("order-refund-1").refund_status, "initiated");
 });
 
 test("ISSUE-011: a 'processing' claim stuck from a crashed prior attempt (stale updated_at) is reclaimed and retried, not permanently stuck", async () => {
@@ -346,7 +372,7 @@ test("ISSUE-011: a 'processing' claim stuck from a crashed prior attempt (stale 
 
   assert.equal(res.body.success, true);
   assert.equal(rzp.getRefundCalls(), 1);
-  assert.equal(db.orders.get("order-refund-1").refund_status, "completed");
+  assert.equal(db.orders.get("order-refund-1").refund_status, "initiated");
 });
 
 test("ISSUE-011: a 'processing' claim that is still fresh (well within the staleness window) is NOT reclaimed — refused instead", async () => {
@@ -413,12 +439,20 @@ test("ISSUE-010 regression: rejectRefund still succeeds for a refund that was ap
 
 test("ISSUE-021: a completed refund also sets payment_status to 'refunded', not just refund_status", async () => {
   const db = createFakeReturnDb(baseOrder({ payment_status: "paid" }));
-  const rzp = createFakeRazorpay();
+  // Razorpay's create response already says "processed" — still only
+  // 'initiated' (and payment 'paid') until a verified status check.
+  const rzp = createFakeRazorpay({ fetchResult: { id: "rfnd_test1", status: "processed" } });
 
   const { req, res } = makeReqRes("order-refund-1");
   await completeRefund(req, res, { ...db, ...rzp });
-
   assert.equal(res.body.success, true);
+  assert.equal(db.orders.get("order-refund-1").refund_status, "initiated");
+  assert.equal(db.orders.get("order-refund-1").payment_status, "paid");
+
+  const { req: req2, res: res2 } = makeReqRes("order-refund-1");
+  await completeRefund(req2, res2, { ...db, ...rzp });
+  assert.equal(res2.body.success, true);
+  assert.equal(rzp.getRefundCalls(), 1);
   const finalOrder = db.orders.get("order-refund-1");
   assert.equal(finalOrder.refund_status, "completed");
   assert.equal(
@@ -466,9 +500,9 @@ test("audit: a stale 'processing' claim whose refund Razorpay DID create (DB wri
   assert.equal(res.body.success, true);
   assert.equal(rzp.getRefundCalls(), 0, "no second refund");
   const row = db.orders.get("order-refund-1");
-  assert.equal(row.refund_status, "completed");
+  assert.equal(row.refund_status, "initiated", "adopted refund waits for a verified final state");
   assert.equal(row.refund_reference, "rfnd_already");
-  assert.equal(row.payment_status, "refunded");
+  assert.equal(row.payment_status, "paid");
 });
 
 test("audit: Razorpay accepts the refund but the response is lost (timeout) → the refund is adopted, not reverted to 'approved' — a retry can never create a second one", async () => {
@@ -531,7 +565,7 @@ test("audit: a refund belonging to a different order on the same payment (or one
   assert.equal(db.orders.get("order-refund-1").refund_reference, "rfnd_new");
 });
 
-test("audit: recheck of a refund Razorpay reports FAILED tells the admin (409) instead of 'initiated successfully', and changes nothing", async () => {
+test("audit: recheck of a refund Razorpay reports FAILED tells the admin (409) and records the recoverable 'failed' state — no new refund", async () => {
   const db = createFakeReturnDb(baseOrder({ refund_status: "initiated", refund_reference: "rfnd_x" }));
   const rzp = createFakeRazorpay({ fetchResult: { id: "rfnd_x", status: "failed" } });
 
@@ -541,7 +575,7 @@ test("audit: recheck of a refund Razorpay reports FAILED tells the admin (409) i
   assert.equal(res.statusCode, 409);
   assert.equal(res.body.code, "RAZORPAY_REFUND_FAILED");
   assert.equal(rzp.getRefundCalls(), 0);
-  assert.equal(db.orders.get("order-refund-1").refund_status, "initiated");
+  assert.equal(db.orders.get("order-refund-1").refund_status, "failed");
 });
 
 test("audit: rejectRefund is refused on an order with no received return or before QC passed, and is idempotent once rejected", async () => {
@@ -569,8 +603,16 @@ test("audit: rejectRefund is refused on an order with no received return or befo
 
 test("audit: a completed refund also records refund_id/refund_amount on the payments row (and flags it refunded) in the same transaction", async () => {
   const db = createFakeReturnDb(baseOrder());
-  const rzp = createFakeRazorpay({ refundResult: { id: "rfnd_pay", status: "processed" } });
+  const rzp = createFakeRazorpay({
+    refundResult: { id: "rfnd_pay", status: "processed" },
+    fetchResult: { id: "rfnd_pay", status: "processed" },
+  });
   const { req, res } = makeReqRes("order-refund-1");
   await completeRefund(req, res, { ...db, ...rzp });
-  assert.deepEqual(db.paymentUpdates, [{ orderId: "order-refund-1", refundId: "rfnd_pay", refundAmount: 500, processed: true }]);
+  // Creation: refund id/amount recorded, payments row NOT flagged refunded.
+  assert.deepEqual(db.paymentUpdates, [{ orderId: "order-refund-1", refundId: "rfnd_pay", refundAmount: 500, processed: false }]);
+  // Verified completion (status recheck) flags it refunded.
+  const { req: req2, res: res2 } = makeReqRes("order-refund-1");
+  await completeRefund(req2, res2, { ...db, ...rzp });
+  assert.deepEqual(db.paymentUpdates[1], { orderId: "order-refund-1", refundId: "rfnd_pay", refundAmount: 500, processed: true });
 });

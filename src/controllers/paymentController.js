@@ -52,7 +52,10 @@ import {
   validateMobile,
   maskMobile,
 } from "../services/whatsappNotificationService.js";
-import { notifyReturnEvent } from "./admin/returnController.js";
+import {
+  notifyReturnEvent,
+  recordRefundGatewayDetails,
+} from "./admin/returnController.js";
 import { publishOrderUpdateFromRequest } from "../services/orderRealtime.js";
 
 let productShippingColumnsAvailable = null;
@@ -3125,6 +3128,14 @@ export const getPaymentStatus = async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/payment/webhook — Razorpay async event notifications
 // ─────────────────────────────────────────────────────────────────────────────
+// A refund webhook may only move the order whose Razorpay payment it was
+// issued against. Both ids are Razorpay-issued; when either is missing the
+// refund-id / notes.order_id matching above is the only evidence available.
+export const refundBelongsToOrder = (refundEntity, order) =>
+  !refundEntity?.payment_id ||
+  !order?.razorpay_payment_id ||
+  String(refundEntity.payment_id) === String(order.razorpay_payment_id);
+
 export const handleWebhook = async (
   req,
   res,
@@ -3628,7 +3639,20 @@ export const handleWebhook = async (
         refundCandidates.find((o) => o.refund_reference === refundEntity.id) ||
         refundCandidates.find((o) => notedOrderId && String(o.id) === notedOrderId);
       if (!refundOrder) break;
+      if (!refundBelongsToOrder(refundEntity, refundOrder)) {
+        console.error("[WEBHOOK] refund.processed payment mismatch — ignored", {
+          orderId: refundOrder.id,
+          razorpayRefundId: refundEntity.id,
+        });
+        break;
+      }
 
+      // refund.processed is the authoritative completion signal (creating a
+      // refund only ever records 'initiated' — see completeRefund). This
+      // single guarded UPDATE is the row lock + state check: it moves only
+      // an initiated/processing refund for THIS refund id, so duplicate
+      // deliveries (also stopped by the webhook_events ledger) and stale
+      // events match nothing — no second history row or notification.
       const completionUpdate = await queryFn(
         `UPDATE orders SET
            refund_status = 'completed',
@@ -3661,6 +3685,7 @@ export const handleWebhook = async (
             refundOrder.id,
           ],
         );
+        await recordRefundGatewayDetails(queryFn, refundOrder.id, refundEntity);
         await queryFn(
           `INSERT INTO order_status_history
              (order_id, previous_status, new_status, changed_by, notes)
@@ -3678,7 +3703,16 @@ export const handleWebhook = async (
         );
         if (completedRows[0]) {
           notifyRefundEvent(completedRows[0], "Refund Completed", null);
-          emitUpdate(refundOrder.id, completedRows[0].order_status);
+          publishOrderUpdateFromRequest(
+            req,
+            {
+              id: refundOrder.id,
+              order_status: completedRows[0].order_status,
+              payment_status: completedRows[0].payment_status,
+              refund_status: completedRows[0].refund_status,
+            },
+            { userId: completedRows[0].user_id },
+          );
         }
       }
       break;
@@ -3689,8 +3723,9 @@ export const handleWebhook = async (
       // to the recoverable refund_status 'failed' (the admin "Retry Refund"
       // / "Initiate Refund" action goes through completeRefund, which treats
       // 'failed' like 'approved'). No money moved, so payment_status stays
-      // 'paid' and the payments row keeps status 'captured'; its refund_id/
-      // refund_amount are cleared only if they point at THIS failed refund.
+      // 'paid' and the payments row keeps status 'captured'. The failed
+      // refund id is kept (orders.refund_reference, payments.refund_id) for
+      // audit until a retry replaces it.
       // Matched exactly like refund.processed above (refund_reference, or a
       // 'processing' claim on the same payment whose notes name the order),
       // and guarded so it never moves a completed refund, or a newer retry
@@ -3718,6 +3753,13 @@ export const handleWebhook = async (
             (o) => failedNotedOrderId && String(o.id) === failedNotedOrderId,
           );
         if (!failedOrder) break;
+        if (!refundBelongsToOrder(refundEntity, failedOrder)) {
+          console.error("[WEBHOOK] refund.failed payment mismatch — ignored", {
+            orderId: failedOrder.id,
+            razorpayRefundId: refundEntity.id,
+          });
+          break;
+        }
 
         const failureUpdate = await queryFn(
           `UPDATE orders SET
@@ -3731,12 +3773,7 @@ export const handleWebhook = async (
         );
 
         if (failureUpdate.rowCount) {
-          await queryFn(
-            `UPDATE payments
-             SET refund_id = NULL, refund_amount = NULL, updated_at = NOW()
-             WHERE order_id = ? AND refund_id = ?`,
-            [failedOrder.id, refundEntity.id],
-          );
+          await recordRefundGatewayDetails(queryFn, failedOrder.id, refundEntity);
         }
 
         // FIX (return/refund E2E audit): a console line was the only trace —
@@ -3756,7 +3793,15 @@ export const handleWebhook = async (
           ],
         );
         if (failureUpdate.rowCount) {
-          emitUpdate(failedOrder.id, failedOrder.order_status);
+          publishOrderUpdateFromRequest(
+            req,
+            {
+              id: failedOrder.id,
+              order_status: failedOrder.order_status,
+              refund_status: "failed",
+            },
+            { userId: failedOrder.user_id },
+          );
         }
       }
       break;
