@@ -467,6 +467,62 @@ const ensureOrderStatusNotificationSchema = async () => {
       err?.message || err,
     );
   }
+  await ensureOrderStatusNotificationRetryColumn();
+};
+
+// FIX (notification reconciliation): next_retry_at schedules a retry of a
+// customer return/refund notification the provider provably did not accept
+// (see services/notificationReconciliation.js). NULL — the value for every
+// existing row — means "never retried automatically", so adding it changes
+// nothing for historical notifications. Additive and idempotent; a
+// duplicate-column/index error from another Hostinger process booting at
+// the same moment is the same end state and is ignored.
+const isAlreadyExistsError = (err) =>
+  ["ER_DUP_FIELDNAME", "ER_DUP_KEYNAME"].includes(err?.code);
+
+export const ensureOrderStatusNotificationRetryColumn = async ({
+  queryFn = pool.query.bind(pool),
+} = {}) => {
+  try {
+    const [dbRows] = await queryFn("SELECT DATABASE() AS db");
+    const currentDb = dbRows?.[0]?.db;
+    if (!currentDb) return;
+
+    const [cols] = await queryFn(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = ? AND table_name = 'order_status_notifications'
+         AND column_name = 'next_retry_at'
+       LIMIT 1`,
+      [currentDb],
+    );
+    if (!cols.length) {
+      await queryFn(
+        "ALTER TABLE order_status_notifications ADD COLUMN next_retry_at DATETIME NULL DEFAULT NULL",
+      ).catch((err) => {
+        if (!isAlreadyExistsError(err)) throw err;
+      });
+    }
+
+    const [idx] = await queryFn(
+      `SELECT 1 FROM information_schema.statistics
+       WHERE table_schema = ? AND table_name = 'order_status_notifications'
+         AND index_name = 'idx_osn_status_next_retry'
+       LIMIT 1`,
+      [currentDb],
+    );
+    if (!idx.length) {
+      await queryFn(
+        "CREATE INDEX idx_osn_status_next_retry ON order_status_notifications(status, next_retry_at)",
+      ).catch((err) => {
+        if (!isAlreadyExistsError(err)) throw err;
+      });
+    }
+  } catch (err) {
+    console.error(
+      "Could not ensure order_status_notifications.next_retry_at:",
+      err?.message || err,
+    );
+  }
 };
 
 // FIX: ensure the orders table has the shipping / totals columns expected by

@@ -882,9 +882,13 @@ test("a full-repo audit of every sendOrderStatusUpdateWhatsApp call site account
   assert.match(paymentControllerSource, /status:\s*"paid",/);
   assert.doesNotMatch(paymentControllerSource, /sendPaidWhatsApp/);
   assert.doesNotMatch(paymentControllerSource, /sendOrderStatusUpdateWhatsApp/);
-  // Unaffected: returnController's return/refund event labels (never
-  // literally "shipped"/"out_for_delivery"/"delivered").
-  assert.match(returnControllerSource, /sendOrderStatusUpdateWhatsApp\(/);
+  // Unaffected: return/refund events now go through the customer-event
+  // sender (services/customerOrderNotifications.js), not the generic
+  // order-status sender — so they can never hit the shipped/out-for-
+  // delivery suppression nor be confused with a real order_status.
+  const customerNotificationsSource = read("../src/services/customerOrderNotifications.js");
+  assert.doesNotMatch(returnControllerSource, /sendOrderStatusUpdateWhatsApp\(/);
+  assert.match(customerNotificationsSource, /sendWhatsApp = sendCustomerEventWhatsApp/);
   assert.doesNotMatch(returnControllerSource, /status:\s*"shipped"/);
   assert.doesNotMatch(returnControllerSource, /status:\s*"out_for_delivery"/);
 });

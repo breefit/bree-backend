@@ -1,6 +1,6 @@
 import nodemailer from "nodemailer";
 import { getOrderStatusLabel } from "../constants/orderStatus.js";
-import { getEmailLogoUrl } from "../config/emailAssets.js";
+import { getEmailLogoUrl, getEmailSiteOrigin } from "../config/emailAssets.js";
 
 const createTransporter = () =>
   nodemailer.createTransport({
@@ -20,22 +20,38 @@ const getFromAddress = () =>
   process.env.SMTP_USER ||
   "BREE Wellness <no-reply@breewellness.com>";
 
-const getFrontendUrl = () => {
-  const configuredUrl = (
-    process.env.FRONTEND_URL || "https://www.breefit.in"
-  ).trim();
-  const embeddedAbsoluteUrl = configuredUrl.match(/\/((?:https?:\/\/).+)$/);
-  const candidateUrl = embeddedAbsoluteUrl?.[1] || configuredUrl;
-  const absoluteUrl = candidateUrl.match(/^https?:\/\//)
-    ? candidateUrl
-    : `https://${candidateUrl}`;
-  const frontendUrl = new URL(absoluteUrl);
+// FIX (notification audit — email links): delegates to the validated
+// origin in config/emailAssets.js. FRONTEND_URL is the CORS allow-list and
+// may hold several, localhost or preview origins; parsing it here directly
+// produced malformed tracking links (or threw at module load).
+const getFrontendUrl = () => getEmailSiteOrigin();
 
-  if (frontendUrl.hostname === "breefit.in") {
-    frontendUrl.hostname = "www.breefit.in";
+// FIX (notification reconciliation): classifies an SMTP failure for the
+// order_status_notifications claim layer, mirroring classifyWaplifyError:
+//   retryable  — provably not accepted (SMTP 4xx reply, or the connection
+//                was never established): safe for the reconciler to retry.
+//   failed     — permanent (5xx reply, authentication, bad envelope):
+//                retrying cannot help.
+//   unknown    — the connection broke or timed out mid-transaction; the
+//                server may already have accepted the message, so it is
+//                never re-sent automatically.
+const NEVER_CONNECTED = /ECONNREFUSED|ENOTFOUND|EAI_AGAIN/;
+export const classifyEmailError = (error) => {
+  const responseCode = Number(error?.responseCode);
+  if (Number.isFinite(responseCode) && responseCode >= 400 && responseCode < 500) {
+    return { outcome: "failed", retryable: true };
   }
-
-  return frontendUrl.origin.replace(/\/+$/, "");
+  if (Number.isFinite(responseCode) && responseCode >= 500) {
+    return { outcome: "failed", retryable: false };
+  }
+  const code = String(error?.code || "");
+  if (code === "EDNS" || NEVER_CONNECTED.test(`${code} ${error?.message || ""}`)) {
+    return { outcome: "failed", retryable: true };
+  }
+  if (["ETIMEDOUT", "ESOCKET", "ECONNECTION", "ECONNRESET"].includes(code)) {
+    return { outcome: "unknown", retryable: false };
+  }
+  return { outcome: "failed", retryable: false };
 };
 
 const sendEmail = async ({ to, subject, html }) => {
@@ -63,12 +79,19 @@ const sendEmail = async ({ to, subject, html }) => {
     throw new Error("SMTP_USER/SMTP_PASSWORD not configured");
   }
 
-  await createTransporter().sendMail({
-    from: getFromAddress(),
-    to,
-    subject,
-    html,
-  });
+  try {
+    await createTransporter().sendMail({
+      from: getFromAddress(),
+      to,
+      subject,
+      html,
+    });
+  } catch (error) {
+    const { outcome, retryable } = classifyEmailError(error);
+    error.deliveryOutcome = outcome;
+    error.retryable = retryable;
+    throw error;
+  }
 };
 
 export const buildOrderTrackingUrl = (orderId) =>
@@ -501,6 +524,66 @@ export const sendOrderStatusUpdateEmail = async ({
       frontendUrl,
       content,
       preheader: `Your order status is now ${label}.`,
+    }),
+  });
+};
+
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+/**
+ * Customer-facing return/refund/cancellation update. Every argument comes
+ * from services/customerOrderNotifications.js's whitelisted payload:
+ * `label`, `message` and `subject` are fixed copy from
+ * services/customerOrderEvents.js — there is no free-text "notes" input,
+ * so admin/internal notes cannot reach this email.
+ */
+export const sendCustomerEventEmail = async ({
+  to,
+  name,
+  orderId,
+  orderNumber,
+  label,
+  message,
+  subject,
+}) => {
+  const frontendUrl = getFrontendUrl();
+  const trackingLink = buildOrderTrackingUrl(orderId);
+  const orderRef = formatOrderRef(orderNumber || orderId);
+
+  const content = `
+    ${buildIntro({
+      name,
+      heading: `Hi ${escapeHtml(name || "there")},`,
+      subtext: `Here is an update on your order <strong>#${escapeHtml(orderRef)}</strong>.`,
+    })}
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td style="padding:0 24px;">
+          ${buildOrderInfoCard({ orderId: orderNumber || orderId })}
+          ${buildInfoCard([
+            { label: "Status", value: escapeHtml(label) },
+            { label: "Update", value: escapeHtml(message) },
+          ])}
+          ${buildActionSection({ trackingLink })}
+        </td>
+      </tr>
+    </table>
+    ${buildSignOff("Thanks for shopping with BREE Wellness.")}
+  `;
+
+  await sendEmail({
+    to,
+    subject: subject || `Order Status Updated — ${label} (#${orderRef})`,
+    html: buildBrandedEmail({
+      frontendUrl,
+      content,
+      preheader: escapeHtml(message),
     }),
   });
 };

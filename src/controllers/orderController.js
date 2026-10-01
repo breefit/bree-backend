@@ -801,15 +801,94 @@ export const getOrder = async (req, res) => {
 // GET ORDER HISTORY
 // ==========================================================================
 
+// FIX (audit findings 6 + 7 — customer history leak): this endpoint used to
+// return raw order_status_history rows — `notes` (admin verification notes,
+// manual-override reasons, QC notes, Razorpay refund ids) and `changed_by`
+// (admin ids) — and matched `user_id IS NULL`, so any logged-in user who
+// knew a guest order's UUID could read its internal history. It now returns
+// only {status, label, timestamp}, built from whitelisted status values and
+// the order's own milestone timestamps, and only for the caller's own order.
+// The public tracking page (GET /api/orders/:id/tracking) is unchanged and
+// remains the way guest orders are tracked.
+const CUSTOMER_ORDER_STATUS_LABELS = Object.freeze({
+  pending_payment: "Order Placed",
+  paid: "Order Confirmed",
+  processing: "Processing",
+  ready_to_ship: "Ready To Ship",
+  shipped: "Shipped",
+  out_for_delivery: "Out For Delivery",
+  delivered: "Delivered",
+  cancelled: "Cancelled",
+  returned: "Returned",
+});
+
+const CUSTOMER_HISTORY_ORDER_COLUMNS = `id, order_status, return_status, return_approved_at,
+  reverse_shipment_created_at, reverse_pickup_scheduled_at, reverse_picked_up_at,
+  returned_at, inspection_status, inspection_completed_at, refund_status,
+  refund_approved_at, refund_completed_at`;
+
+export const buildCustomerSafeOrderHistory = (order, historyRows = []) => {
+  const entries = [];
+  let previous = null;
+  for (const row of historyRows) {
+    const status = String(row?.new_status || "").toLowerCase();
+    // Only whitelisted order statuses; consecutive rows with the same
+    // status (return/refund bookkeeping rows all repeat "delivered")
+    // collapse into one entry. Their notes are never read.
+    if (CUSTOMER_ORDER_STATUS_LABELS[status] && status !== previous) {
+      entries.push({
+        status,
+        label: CUSTOMER_ORDER_STATUS_LABELS[status],
+        timestamp: row.created_at || null,
+      });
+      previous = status;
+    }
+  }
+
+  if (order?.return_status) {
+    const rejected = order.return_status === "rejected";
+    const milestones = [
+      [rejected ? "return_rejected" : "return_approved", rejected ? "Return Rejected" : "Return Approved", order.return_approved_at],
+      ["return_shipment_created", "Return Shipment Created", order.reverse_shipment_created_at],
+      ["return_pickup_scheduled", "Pickup Scheduled", order.reverse_pickup_scheduled_at],
+      ["return_picked_up", "Picked Up", order.reverse_picked_up_at],
+      ["return_received", "Return Received", order.returned_at],
+      [
+        order.inspection_status === "rejected" ? "quality_check_failed" : "quality_check_passed",
+        order.inspection_status === "rejected" ? "Quality Check Failed" : "Quality Check Passed",
+        ["approved", "rejected"].includes(order.inspection_status) ? order.inspection_completed_at : null,
+      ],
+      ["refund_approved", "Refund Approved", order.refund_approved_at],
+      ["refund_completed", "Refund Completed", order.refund_status === "completed" ? order.refund_completed_at : null],
+    ];
+    for (const [status, label, timestamp] of milestones) {
+      if (timestamp) entries.push({ status, label, timestamp });
+    }
+    if (order.refund_status === "failed") {
+      entries.push({ status: "refund_failed", label: "Refund Failed", timestamp: null });
+    }
+    if (order.refund_status === "rejected") {
+      entries.push({ status: "refund_rejected", label: "Refund Rejected", timestamp: null });
+    }
+  }
+
+  const time = (entry) =>
+    entry.timestamp ? new Date(entry.timestamp).getTime() : Number.POSITIVE_INFINITY;
+  return entries
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => time(a.entry) - time(b.entry) || a.index - b.index)
+    .map(({ entry }) => entry);
+};
+
 /**
- * Fetches an order's status-change history.
+ * Fetches the caller's own order history (customer-safe).
  *
  * @route GET /api/orders/:id/history
  * @param {import('express').Request} req - params: { id }
  * @param {import('express').Response} res
- * @returns {Promise<void>} JSON: { success, history }
+ * @returns {Promise<void>} JSON: { success, history: [{ status, label, timestamp }] }
  */
-export const getOrderHistory = async (req, res) => {
+export const getOrderHistory = async (req, res, { queryFn = query } = {}) => {
   try {
     const userId = req.user?.id;
     const { id } = req.params;
@@ -818,24 +897,31 @@ export const getOrderHistory = async (req, res) => {
       return sendError(res, 400, ERROR_MESSAGES.INVALID_ORDER_ID);
     }
 
-    const { rows: orderRows } = await query(
-      "SELECT id, order_number FROM orders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
-      [id, userId],
-    );
+    // Strict ownership: a guest order (user_id NULL) or another customer's
+    // order is indistinguishable from a missing one.
+    const { rows: orderRows } = userId
+      ? await queryFn(
+          `SELECT ${CUSTOMER_HISTORY_ORDER_COLUMNS} FROM orders WHERE id = ? AND user_id = ? LIMIT 1`,
+          [id, userId],
+        )
+      : { rows: [] };
 
     if (!orderRows.length) {
       return sendError(res, 404, ERROR_MESSAGES.ORDER_NOT_FOUND);
     }
 
-    const { rows: historyRows } = await query(
-      `SELECT id, previous_status, new_status, changed_by, notes, created_at
+    const { rows: historyRows } = await queryFn(
+      `SELECT new_status, created_at
        FROM order_status_history
        WHERE order_id = ?
        ORDER BY created_at ASC`,
       [id],
     );
 
-    sendJson(res, 200, { success: true, history: historyRows });
+    sendJson(res, 200, {
+      success: true,
+      history: buildCustomerSafeOrderHistory(orderRows[0], historyRows),
+    });
   } catch (error) {
     log("error", "order.get_history_failed", {
       orderId: req.params?.id,

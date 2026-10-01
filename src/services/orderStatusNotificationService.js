@@ -43,6 +43,40 @@ export const maskNotificationPhone = (phone) => {
 // this is treated as abandoned and reclaimable, same as a 'failed' one.
 const STALE_CLAIM_MINUTES = 5;
 
+// FIX (notification reconciliation — audit finding 4): a 'failed' row used
+// to be terminal. For reconcilable (customer return/refund) notifications,
+// a failure the provider PROVABLY did not accept (error.retryable — see
+// classifyWaplifyError / classifyEmailError) is now scheduled for a retry
+// with exponential backoff: 5 min, 10, 20, 40 … capped at 6 h, at most
+// NOTIFICATION_MAX_ATTEMPTS sends in total. Permanent failures (other 4xx,
+// SMTP 5xx/auth, missing config) and 'unknown' outcomes get no
+// next_retry_at, so they are never retried automatically.
+export const NOTIFICATION_MAX_ATTEMPTS = 5;
+const RETRY_BASE_SECONDS = 300;
+const RETRY_MAX_SECONDS = 6 * 60 * 60;
+
+export const scheduleNotificationRetry = ({
+  notificationKey,
+  retryable,
+  queryExecutor = query,
+}) =>
+  queryExecutor(
+    `UPDATE order_status_notifications
+     SET next_retry_at = CASE
+       WHEN ? = 1 AND status = 'failed' AND attempts < ?
+         THEN DATE_ADD(NOW(), INTERVAL LEAST(? * POW(2, GREATEST(attempts - 1, 0)), ?) SECOND)
+       ELSE NULL
+     END
+     WHERE notification_key = ?`,
+    [
+      retryable ? 1 : 0,
+      NOTIFICATION_MAX_ATTEMPTS,
+      RETRY_BASE_SECONDS,
+      RETRY_MAX_SECONDS,
+      notificationKey,
+    ],
+  );
+
 // Best-effort extraction of a provider message/request id from whatever
 // send() resolved with, for the success log line only — never the whole
 // provider payload (which could carry more than an id). WhatsApp sends
@@ -102,6 +136,15 @@ export const sendOrderStatusNotificationOnce = async ({
   orderId,
   status,
   channel,
+  // Customer return/refund events (services/customerOrderNotifications.js)
+  // pass true: a provably-unaccepted failure is then scheduled for the
+  // notification reconciler instead of being terminal.
+  reconcilable = false,
+  // false = a 'sending' row left behind by a dead process is NOT re-sent:
+  // the provider may already have accepted it (Waplify has no idempotency
+  // key). Customer return/refund events pass false; the reconciler marks
+  // such rows 'unknown' for manual review instead.
+  reclaimStaleSending = true,
   // Same injection pattern as dailyReminderService.createDailyReminder's
   // queryExecutor — defaults to the real pool, overridable so this claim/
   // send/resolve state machine can be exercised against an in-memory fake
@@ -130,9 +173,9 @@ export const sendOrderStatusNotificationOnce = async ({
        AND (
          status = 'pending'
          OR (status = 'failed' AND ? = 1)
-         OR (status = 'sending' AND last_attempt_at < NOW() - INTERVAL ? MINUTE)
+         OR (status = 'sending' AND last_attempt_at < NOW() - INTERVAL ? MINUTE AND ? = 1)
        )`,
-    [notificationKey, retryFailed ? 1 : 0, STALE_CLAIM_MINUTES],
+    [notificationKey, retryFailed ? 1 : 0, STALE_CLAIM_MINUTES, reclaimStaleSending ? 1 : 0],
   );
 
   if (!claimResult.rowCount) {
@@ -156,6 +199,20 @@ export const sendOrderStatusNotificationOnce = async ({
        WHERE notification_key = ? AND status = 'sending'`,
       [outcome, String(error?.message || error).slice(0, 1000), notificationKey],
     );
+    if (reconcilable) {
+      await scheduleNotificationRetry({
+        notificationKey,
+        retryable: outcome === "failed" && error?.retryable === true,
+        queryExecutor,
+      }).catch((scheduleError) =>
+        logNotification({
+          ...logCtx,
+          action: "retry_schedule_failed",
+          result: "failure",
+          error: scheduleError?.message || scheduleError,
+        }),
+      );
+    }
     logNotification({
       ...logCtx,
       action: outcome === "unknown" ? "unknown_outcome" : "failed",

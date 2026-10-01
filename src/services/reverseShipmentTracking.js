@@ -64,6 +64,27 @@ export const normalizeReverseTrackingStatus = (statusType, status) => {
 const PICKUP_SCHEDULED_EVIDENCE = [S.PICKUP_SCHEDULED, S.OUT_FOR_PICKUP, S.IN_TRANSIT, S.DELIVERED_TO_BREE];
 const PICKED_UP_EVIDENCE = [S.IN_TRANSIT, S.DELIVERED_TO_BREE];
 
+// FIX (audit finding 8): states in which "A pickup has been scheduled for
+// your return." is actually true. PU/* already proves the parcel was picked
+// up, so a first observation of PU/* still records return_status
+// 'pickup_scheduled' (unchanged state machine) but sends no pickup-
+// scheduled message — and no new "picked up" message either, since none is
+// an approved customer milestone. DL/DTO sends only "Return Received"; a
+// missed pickup message is never backfilled.
+const PICKUP_SCHEDULED_MESSAGE_STATES = [S.PICKUP_SCHEDULED, S.OUT_FOR_PICKUP];
+
+/** Customer event for an applied transition, or null when none is approved. */
+export const customerEventForReverseTransition = (target, normalized) => {
+  if (target === RETURN_STATUS.RETURNED) return "Return Received";
+  if (
+    target === RETURN_STATUS.PICKUP_SCHEDULED &&
+    PICKUP_SCHEDULED_MESSAGE_STATES.includes(normalized)
+  ) {
+    return "Return Pickup Scheduled";
+  }
+  return null;
+};
+
 /** The return_status a normalized reverse state proves, or null. */
 export const returnStatusProvenBy = (normalized) => {
   if (normalized === S.DELIVERED_TO_BREE) return RETURN_STATUS.RETURNED;
@@ -206,10 +227,13 @@ const applyObservation = async (order, parsed, rawResponse, { queryFn, notify, h
     return { normalized, transitioned: null };
   }
 
+  const customerEvent = customerEventForReverseTransition(target, normalized);
   const note =
     target === RETURN_STATUS.RETURNED
       ? `Return delivered to BREE — Delhivery reverse status ${rawStatus} (POD received). Reverse AWB: ${order.reverse_awb}`
-      : `Return pickup scheduled by Delhivery — reverse status ${rawStatus}. Reverse AWB: ${order.reverse_awb}`;
+      : customerEvent
+        ? `Return pickup scheduled by Delhivery — reverse status ${rawStatus}. Reverse AWB: ${order.reverse_awb}`
+        : `Return already picked up when first observed — Delhivery reverse status ${rawStatus}; no pickup-scheduled notification sent. Reverse AWB: ${order.reverse_awb}`;
   await historyFn({
     orderId: order.id,
     previousStatus: order.order_status,
@@ -227,11 +251,13 @@ const applyObservation = async (order, parsed, rawResponse, { queryFn, notify, h
     delhiveryStatus: rawStatus,
   });
 
-  const { rows } = await queryFn("SELECT * FROM orders WHERE id = ? LIMIT 1", [order.id]);
-  if (rows[0]) {
-    // Same labels, and the same exactly-once notification claim
-    // (order_status_notifications), the admin buttons already used.
-    notify(rows[0], target === RETURN_STATUS.RETURNED ? "Return Received" : "Return Pickup Scheduled", null);
+  if (customerEvent) {
+    const { rows } = await queryFn("SELECT * FROM orders WHERE id = ? LIMIT 1", [order.id]);
+    if (rows[0]) {
+      // Same events, and the same at-most-once notification claim
+      // (order_status_notifications), the admin buttons already use.
+      notify(rows[0], customerEvent);
+    }
   }
 
   return { normalized, transitioned: target };

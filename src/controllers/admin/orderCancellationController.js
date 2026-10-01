@@ -455,12 +455,10 @@ export const cancelOrderAndRefund = async (
     }
     // Exactly-once per order/channel via order_status_notifications
     // (key order:{id}:status:cancelled:channel:*). "Refund Initiated"/
-    // "Refund Completed" follow from completeRefund / the webhook.
-    notifyFn(
-      order,
-      "cancelled",
-      `Your order has been cancelled and a refund of ₹${refundAmount} is being processed to your original payment method.`,
-    );
+    // "Refund Completed" follow from completeRefund / the webhook. The
+    // customer copy (including the refund amount) comes from the "cancelled"
+    // event in services/customerOrderEvents.js — callers pass no free text.
+    notifyFn({ ...order, refund_amount: refundAmount }, "cancelled");
   }
 
   // ── 4. Existing refund state machine does the Razorpay work ─────────────

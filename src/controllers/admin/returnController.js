@@ -9,14 +9,9 @@ import {
   RETURNED_SOURCE,
 } from "../../constants/returnStatus.js";
 import delhiveryService from "../../services/delhiveryService.js";
-import { sendOrderStatusUpdateEmail } from "../../services/orderEmailService.js";
-import { sendOrderStatusUpdateWhatsApp } from "../../services/whatsappNotificationService.js";
 import { stopRemindersForReturnedOrder } from "../../services/dailyReminderService.js";
 import { publishOrderUpdateFromRequest } from "../../services/orderRealtime.js";
-import {
-  sendOrderStatusNotificationOnce,
-  buildOrderStatusNotificationKey,
-} from "../../services/orderStatusNotificationService.js";
+import { notifyCustomerOrderEvent } from "../../services/customerOrderNotifications.js";
 import {
   getWarehouseConfig,
   validateShippingAddress,
@@ -90,93 +85,39 @@ export const slugifyReturnEventLabel = (label) =>
 
 // ──────────────────────────────────────────────────────────────────────────
 // Notifications — fire-and-forget, never awaited, never allowed to throw
-// into the request. Reuses the existing generic order-status notification
-// senders (sendOrderStatusUpdateEmail / sendOrderStatusUpdateWhatsApp).
-// Those senders only look up their status->label/message maps for known
-// order_status values and fall back to the raw string otherwise, so passing
-// an already human-readable label (e.g. "Return Approved") degrades
-// gracefully instead of requiring new template/label entries.
+// into the request.
 //
-// FIX (return flow audit — idempotency): previously these two sends had no
-// idempotency layer of their own at all — safe in practice only because
-// every one of the 10 call sites already guards the state transition that
-// precedes it (an already-approved/already-returned/etc. repeat click
-// short-circuits before ever reaching this function). That guard is
-// necessary but was the *only* protection — no persisted, auditable record
-// existed of whether a given return/refund notification actually
-// succeeded, and nothing would stop a future call site (a cron, a webhook,
-// a retry helper) from calling this twice for the same event without
-// re-deriving the same care. Routes both sends through the exact same
-// claim/send/resolve mechanism (sendOrderStatusNotificationOnce) already
-// proven for every other order-status notification — same
-// order_status_notifications table, same key shape
-// (order:{id}:status:{slug}:channel:{channel}), no new infrastructure —
-// giving return/refund notifications a persisted, atomically-claimed,
-// exactly-once guarantee independent of the state-machine guards, and a
-// real "failed" record (with the provider error) instead of only a
-// console log line.
-export const notifyReturnEvent = (order, label, notes) => {
-  const recipientEmail = order.contact_email || order.email;
-  const recipientPhone = order.contact_phone || order.mobile_number;
-  const recipientName = order.contact_name || order.customer_name || "Customer";
-  const eventSlug = slugifyReturnEventLabel(label);
+// FIX (notification privacy audit): this used to take a free-text `notes`
+// argument, and Approve Return / Reject Return / QC failure passed the
+// admin's own notes — which were emailed to the customer verbatim. It now
+// takes only an event name; every customer-visible word comes from the
+// fixed copy in services/customerOrderEvents.js, and only whitelisted order
+// fields are read (services/customerOrderNotifications.js). Admin notes stay
+// in order_status_history. Each (order, event, channel) is still sent at
+// most once via the order_status_notifications claim, under the same keys
+// as before (order:{id}:status:{slug}:channel:{channel}).
+// ──────────────────────────────────────────────────────────────────────────
+export const notifyReturnEvent = (order, eventName, deps) =>
+  notifyCustomerOrderEvent(order, eventName, deps);
 
-  if (recipientEmail) {
-    sendOrderStatusNotificationOnce({
-      notificationKey: buildOrderStatusNotificationKey({
-        orderId: order.id,
-        status: eventSlug,
-        channel: "email",
-      }),
-      orderId: order.id,
-      status: eventSlug,
-      channel: "email",
-      send: () =>
-        sendOrderStatusUpdateEmail({
-          to: recipientEmail,
-          name: recipientName,
-          orderId: order.id,
-          // FIX (return/refund E2E audit): omitted before, so every return/
-          // refund email identified the order by a UUID fragment instead of
-          // the BREE order number the WhatsApp message and site use.
-          orderNumber: order.order_number,
-          status: label,
-          notes,
-        }),
-    }).catch((error) => {
-      log("error", "return.email_failed", {
-        orderId: order.id,
-        error: error?.message || error,
-      });
-    });
-  }
+// FIX (package-cycle refunds — business decision pending): cycle 2+ orders
+// of a package are created by the fulfilment cron with no Razorpay payment
+// of their own; the money was paid on the package's original order. Which
+// payment (and how much of it) a cycle's refund should come from is a
+// business decision that has not been made, so the refund is refused with
+// an explicit explanation instead of the generic "no successful payment".
+export const PACKAGE_CYCLE_REFUND_UNSUPPORTED_MESSAGE =
+  "Refund processing for package-cycle orders requires the original package payment mapping and is not currently supported.";
 
-  if (recipientPhone) {
-    sendOrderStatusNotificationOnce({
-      notificationKey: buildOrderStatusNotificationKey({
-        orderId: order.id,
-        status: eventSlug,
-        channel: "whatsapp",
-      }),
-      orderId: order.id,
-      status: eventSlug,
-      channel: "whatsapp",
-      send: () =>
-        sendOrderStatusUpdateWhatsApp({
-          customerName: recipientName,
-          mobile: recipientPhone,
-          orderNumber: order.order_number,
-          orderUuid: order.id,
-          status: label,
-        }),
-    }).catch((error) => {
-      log("error", "return.whatsapp_failed", {
-        orderId: order.id,
-        error: error?.message || error,
-      });
-    });
-  }
-};
+export const isPackageCycleOrderWithoutPayment = (order) =>
+  Boolean(order?.parent_package_id) && !order?.razorpay_payment_id;
+
+const packageCycleRefundRefusal = (res) =>
+  res.status(400).json({
+    success: false,
+    code: "PACKAGE_CYCLE_REFUND_UNSUPPORTED",
+    message: PACKAGE_CYCLE_REFUND_UNSUPPORTED_MESSAGE,
+  });
 
 const isPositiveNumber = (value) =>
   value !== undefined &&
@@ -585,7 +526,7 @@ export const approveReturn = async (
     });
 
     emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Approved", notes);
+    notifyReturnEvent(updated, "Return Approved");
 
     log("info", "return.approved", { orderId });
     res.json({ success: true, message: "Return approved", order: updated });
@@ -617,7 +558,7 @@ export const approveReturn = async (
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const rejectReturn = async (req, res) => {
+export const rejectReturn = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
   const { reason, notes } = req.body;
 
@@ -627,7 +568,7 @@ export const rejectReturn = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -695,7 +636,7 @@ export const rejectReturn = async (req, res) => {
     });
 
     emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Rejected", notes);
+    notifyReturnEvent(updated, "Return Rejected");
 
     log("info", "return.rejected", { orderId });
     res.json({ success: true, message: "Return rejected", order: updated });
@@ -1108,7 +1049,7 @@ export const createReverseShipment = async (
     });
 
     emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Shipment Created", null);
+    notifyReturnEvent(updated, "Return Shipment Created");
 
     log("info", "return.reverse_shipment_created", { orderId, awbNumber });
     res.json({
@@ -1289,7 +1230,7 @@ export const scheduleReversePickup = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const markReturned = async (req, res) => {
+export const markReturned = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
   const { notes, override, reason } = req.body || {};
 
@@ -1299,7 +1240,7 @@ export const markReturned = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -1402,11 +1343,9 @@ export const markReturned = async (req, res) => {
     });
 
     emitOrderUpdated(req, updated);
-    // FIX (return/refund E2E audit): `notes` here is the admin's manual-
-    // override justification (internal audit text) — it used to be emailed
-    // to the customer as the email's "Note". Same message the automatic
-    // Delhivery DL/DTO path sends (no notes), so both share one wording.
-    notifyReturnEvent(updated, "Return Received", null);
+    // The admin's manual-override reason/notes are internal audit text —
+    // recorded in history above, never sent to the customer.
+    notifyReturnEvent(updated, "Return Received");
 
     log("info", "return.marked_returned", {
       orderId,
@@ -1455,7 +1394,7 @@ export const markReturned = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const approveInspection = async (req, res) => {
+export const approveInspection = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
   const { notes } = req.body;
 
@@ -1465,7 +1404,7 @@ export const approveInspection = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -1536,7 +1475,7 @@ export const approveInspection = async (req, res) => {
     });
 
     emitOrderUpdated(req, updated);
-    notifyReturnEvent(updated, "Return Inspection Approved", notes);
+    notifyReturnEvent(updated, "Return Inspection Approved");
 
     log("info", "return.inspection_approved", { orderId });
     res.json({
@@ -1569,7 +1508,7 @@ export const approveInspection = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const rejectInspection = async (req, res) => {
+export const rejectInspection = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
   const { reason, notes } = req.body;
 
@@ -1579,7 +1518,7 @@ export const rejectInspection = async (req, res) => {
       .json({ success: false, message: "Order ID is required" });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -1650,10 +1589,9 @@ export const rejectInspection = async (req, res) => {
     });
 
     emitOrderUpdated(req, updated);
-    // FIX (return flow audit): distinct label from rejectReturn's "Return
-    // Rejected" — see the comment on RETURN_STATUS_MESSAGES in
-    // whatsappNotificationService.js for why this had to change.
-    notifyReturnEvent(updated, "Return Quality Check Failed", notes || reason);
+    // Distinct event from rejectReturn's "Return Rejected". The QC reason/
+    // notes stay in admin history only.
+    notifyReturnEvent(updated, "Return Quality Check Failed");
 
     log("info", "return.inspection_rejected", { orderId });
     res.json({
@@ -1697,7 +1635,7 @@ export const rejectInspection = async (req, res) => {
  * @param {import('express').Response} res
  * @returns {Promise<void>} JSON `{ success, message, order }` on success.
  */
-export const approveRefund = async (req, res) => {
+export const approveRefund = async (req, res, { getClientFn = getClient } = {}) => {
   const { orderId } = req.params;
   const { refund_amount } = req.body;
 
@@ -1722,7 +1660,7 @@ export const approveRefund = async (req, res) => {
     });
   }
 
-  const client = await getClient();
+  const client = await getClientFn();
   try {
     await client.query("BEGIN");
 
@@ -1777,6 +1715,11 @@ export const approveRefund = async (req, res) => {
         success: false,
         message: `A refund can only be approved after quality check has passed. Current inspection status is "${order.inspection_status || "none"}".`,
       });
+    }
+
+    if (isPackageCycleOrderWithoutPayment(order)) {
+      await client.query("ROLLBACK");
+      return packageCycleRefundRefusal(res);
     }
 
     // FIX (requirement 11 — refundable amount): payment must actually have
@@ -1980,7 +1923,7 @@ export const rejectRefund = async (req, res, { getClientFn = getClient } = {}) =
     // rejectRefund call (double-click, retry) can never send this twice.
     // approveRefund deliberately still sends nothing — see the comment at
     // that function's own notifyReturnEvent-free ending for why.
-    notifyReturnEvent(updated, "Refund Rejected", null);
+    notifyReturnEvent(updated, "Refund Rejected");
 
     log("info", "return.refund_rejected", { orderId });
     res.json({ success: true, message: "Refund rejected", order: updated });
@@ -2119,6 +2062,10 @@ export const completeRefund = async (
       (order.refund_status === "processing" &&
         isProcessingClaimStale(order.updated_at))
     ) {
+      if (isPackageCycleOrderWithoutPayment(order)) {
+        await phase1.query("ROLLBACK");
+        return packageCycleRefundRefusal(res);
+      }
       if (order.payment_status !== "paid" || !order.razorpay_payment_id) {
         await phase1.query("ROLLBACK");
         return res.status(400).json({
@@ -2325,6 +2272,10 @@ export const completeRefund = async (
           order,
           `Razorpay reported refund ${razorpayRefund.id} FAILED (status check) — refund status set to failed; retry the refund from admin.`,
         );
+        // FIX (audit finding 2): same customer-safe "Refund Failed" event as
+        // the refund.failed webhook — one shared key, so whichever path
+        // observes the failure first notifies and the other is a no-op.
+        notifyReturnEvent({ ...order, refund_status: "failed" }, "Refund Failed");
       }
     } catch (markErr) {
       log("error", "return.refund_mark_failed_failed", {
@@ -2477,7 +2428,6 @@ export const completeRefund = async (
     notifyReturnEvent(
       updated,
       isProcessed ? "Refund Completed" : "Refund Initiated",
-      null,
     );
   }
 

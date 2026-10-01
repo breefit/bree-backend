@@ -485,8 +485,13 @@ CREATE TABLE IF NOT EXISTS order_status_notifications (
   last_attempt_at    DATETIME      NULL DEFAULT NULL,
   sent_at            DATETIME      NULL DEFAULT NULL,
   last_error         VARCHAR(1000) NULL DEFAULT NULL,
+  -- Retry schedule for customer return/refund notifications the provider
+  -- provably did not accept; NULL = never retried automatically
+  -- (migration 011, services/notificationReconciliation.js).
+  next_retry_at      DATETIME      NULL DEFAULT NULL,
   created_at         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  updated_at         DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_osn_status_next_retry (status, next_retry_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------

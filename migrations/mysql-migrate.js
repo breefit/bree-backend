@@ -69,6 +69,15 @@ const productVisibilityMigration = await fs.readFile(
   "utf8",
 );
 
+const notificationRetryMigrationPath = resolve(
+  __dirname,
+  "011_order_status_notifications_retry.sql",
+);
+const notificationRetryMigration = await fs.readFile(
+  notificationRetryMigrationPath,
+  "utf8",
+);
+
 const connection = await pool.getConnection();
 try {
   console.log(`Executing MySQL schema from ${schemaPath}`);
@@ -81,6 +90,8 @@ try {
   await connection.query(ordersUserFkMigration);
   console.log(`Executing migration from ${productVisibilityMigrationPath}`);
   await connection.query(productVisibilityMigration);
+  console.log(`Executing migration from ${notificationRetryMigrationPath}`);
+  await connection.query(notificationRetryMigration);
   console.log("✅ MySQL schema created successfully");
 } catch (err) {
   console.error("❌ MySQL schema creation failed:", err.message);

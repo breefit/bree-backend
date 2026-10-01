@@ -416,6 +416,10 @@ export const getOrder = async (req, res) => {
             o.refund_completed_at,
             o.parent_package_id,
             o.fulfillment_cycle,
+            -- Whether this order carries its own Razorpay payment to refund
+            -- (package-cycle 2+ orders do not — see returnController's
+            -- PACKAGE_CYCLE_REFUND_UNSUPPORTED). The id itself is not sent.
+            (o.razorpay_payment_id IS NOT NULL AND o.razorpay_payment_id <> '') AS has_refundable_payment,
             pkg.package_number,
             pkg.total_cycles AS package_total_cycles,
             pkg.next_fulfillment_date AS package_next_fulfillment_date,
@@ -470,8 +474,10 @@ export const getOrder = async (req, res) => {
   // Status history (read-only) — the admin order timeline is built from the
   // states the order actually reached, so a cancelled order shows its real
   // branch instead of the normal lifecycle with invented "done" steps.
+  // `notes` is internal (admin reasons, QC notes, Razorpay refund ids) —
+  // admin-authenticated route only; the customer APIs never select it.
   const { rows: historyRows } = await query(
-    `SELECT previous_status, new_status, created_at
+    `SELECT previous_status, new_status, notes, created_at
      FROM order_status_history
      WHERE order_id = ?
      ORDER BY created_at ASC`,

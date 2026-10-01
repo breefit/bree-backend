@@ -729,11 +729,15 @@ test("refund.failed webhook → recoverable 'failed' state; retry creates exactl
   await cancel();
   razorpay.ledger[0].status = "failed";
 
+  // Audit finding 2: the customer is now told the refund failed (generic
+  // copy) — exactly one "Refund Failed" event, never "Refund Completed".
+  const customerEvents = [];
   await handleWebhook(
     signedWebhook("refund.failed", { id: "rfnd_1", payment_id: "pay_1", status: "failed", notes: { order_id: ORDER_ID } }),
     makeRes(),
-    { queryFn: db.queryFn, notifyRefundEvent: () => assert.fail("no completion notification on failure") },
+    { queryFn: db.queryFn, notifyRefundEvent: (o, event) => customerEvents.push([o.id, event]) },
   );
+  assert.deepEqual(customerEvents, [[ORDER_ID, "Refund Failed"]]);
 
   let order = db.orders.get(ORDER_ID);
   assert.equal(order.refund_status, "failed");

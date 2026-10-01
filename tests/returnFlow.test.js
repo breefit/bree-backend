@@ -5,6 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import {
   isReturnWindowOpen,
+  notifyReturnEvent,
   slugifyReturnEventLabel,
   resolveCustomerAddressWithFallback,
   resolveApprovedRefundAmount,
@@ -17,6 +18,12 @@ import {
   sendOrderStatusNotificationOnce,
   buildOrderStatusNotificationKey,
 } from "../src/services/orderStatusNotificationService.js";
+
+import { CUSTOMER_ORDER_EVENTS } from "../src/services/customerOrderEvents.js";
+import {
+  buildOrderStatusMessage,
+  getReadableOrderStatus,
+} from "../src/services/whatsappNotificationService.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = (p) => fs.readFileSync(path.join(__dirname, p), "utf8");
@@ -432,19 +439,28 @@ test("REGRESSION FIX: webhook/cron-style redelivery of the same return event (si
 // ── Source-level wiring checks: confirm notifyReturnEvent() actually uses
 //    the mechanism exercised above, for every one of the 10 call sites ────
 
-test("notifyReturnEvent is wired through sendOrderStatusNotificationOnce for both channels, not a bare fire-and-forget call", () => {
-  const fnSource = returnControllerSource.slice(
-    returnControllerSource.indexOf("const notifyReturnEvent ="),
-    returnControllerSource.indexOf("const isPositiveNumber ="),
+test("notifyReturnEvent is wired through sendOrderStatusNotificationOnce for both channels, not a bare fire-and-forget call", async () => {
+  // Behavioral (replaces a source regex): both channels go through the
+  // claim layer, under the existing key shape, as reconcilable sends.
+  const claims = [];
+  await notifyReturnEvent(
+    { id: "order-w", order_number: "BREE-1", contact_email: "a@example.com", contact_phone: "9876500011", contact_name: "Asha" },
+    "Return Approved",
+    { sendOnce: async (args) => { claims.push(args); return { sent: true }; } },
   );
-  assert.match(fnSource, /sendOrderStatusNotificationOnce\(/g);
-  assert.match(fnSource, /buildOrderStatusNotificationKey\(/g);
-  assert.match(fnSource, /slugifyReturnEventLabel\(label\)/);
-  // Both channels must go through it — not just one.
-  const emailBlock = fnSource.slice(fnSource.indexOf("if (recipientEmail)"), fnSource.indexOf("if (recipientPhone)"));
-  const whatsappBlock = fnSource.slice(fnSource.indexOf("if (recipientPhone)"));
-  assert.match(emailBlock, /sendOrderStatusNotificationOnce\(/);
-  assert.match(whatsappBlock, /sendOrderStatusNotificationOnce\(/);
+  assert.deepEqual(
+    claims.map((c) => c.notificationKey).sort(),
+    [
+      "order:order-w:status:return_approved:channel:email",
+      "order:order-w:status:return_approved:channel:whatsapp",
+    ],
+  );
+  for (const claim of claims) {
+    assert.equal(claim.reconcilable, true);
+    assert.equal(claim.reclaimStaleSending, false);
+    assert.equal(typeof claim.send, "function");
+  }
+  assert.match(returnControllerSource, /notifyCustomerOrderEvent\(order, eventName, deps\)/);
 });
 
 test("all notifying return/refund endpoints still call notifyReturnEvent (unchanged call sites — only its internals changed), and rejectRefund now notifies too", () => {
@@ -501,16 +517,11 @@ test("REGRESSION FIX: rejectInspection sends the distinct 'Return Quality Check 
 });
 
 test("REGRESSION FIX: 'Return Quality Check Failed' has its own dedicated WhatsApp message and readable label, distinct from 'Return Rejected'", () => {
-  const messagesBlock = whatsappServiceSource.slice(
-    whatsappServiceSource.indexOf("const RETURN_STATUS_MESSAGES"),
-    whatsappServiceSource.indexOf("export const buildOrderStatusMessage"),
-  );
-  assert.match(messagesBlock, /"Return Quality Check Failed":\s*\n?\s*"[^"]*did not pass our quality check/);
-
-  const labelsBlock = whatsappServiceSource.slice(
-    whatsappServiceSource.indexOf("export const getReadableOrderStatus"),
-  );
-  assert.match(labelsBlock, /"Return Quality Check Failed": "Return Quality Check Failed"/);
+  const qc = CUSTOMER_ORDER_EVENTS["Return Quality Check Failed"];
+  assert.match(qc.message, /did not pass our quality check/);
+  assert.notEqual(qc.message, CUSTOMER_ORDER_EVENTS["Return Rejected"].message);
+  assert.match(buildOrderStatusMessage("Return Quality Check Failed"), /did not pass our quality check/);
+  assert.equal(getReadableOrderStatus("Return Quality Check Failed"), "Return Quality Check Failed");
 });
 
 // ── REGRESSION FIX: scheduleReversePickup repeat-click no longer returns a
@@ -742,18 +753,9 @@ test("CONCLUSION (audited, not blindly added): approveRefund still sends NO cust
 });
 
 test("'Refund Rejected' has its own dedicated email/WhatsApp message and readable label, not the generic fallback", () => {
-  const messagesBlock = whatsappServiceSource.slice(
-    whatsappServiceSource.indexOf("const RETURN_STATUS_MESSAGES"),
-    whatsappServiceSource.indexOf("export const buildOrderStatusMessage"),
-  );
-  assert.match(
-    messagesBlock,
-    /"Refund Rejected":\s*\n?\s*"[^"]*refund request could not be approved/,
-  );
-  const labelsBlock = whatsappServiceSource.slice(
-    whatsappServiceSource.indexOf("export const getReadableOrderStatus"),
-  );
-  assert.match(labelsBlock, /"Refund Rejected": "Refund Rejected"/);
+  assert.match(CUSTOMER_ORDER_EVENTS["Refund Rejected"].message, /refund request could not be approved/);
+  assert.match(buildOrderStatusMessage("Refund Rejected"), /refund request could not be approved/);
+  assert.equal(getReadableOrderStatus("Refund Rejected"), "Refund Rejected");
 });
 
 test("REGRESSION: Refund Rejected notification sends exactly one email + one WhatsApp per order, and a repeated rejectRefund call sends 0 additional notifications", async () => {

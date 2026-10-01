@@ -3642,39 +3642,58 @@ export const handleWebhook = async (
           orderId: refundOrder.id,
           razorpayRefundId: refundEntity.id,
         });
-        // Same payments-row reconciliation completeRefund's Phase 3 does.
-        await queryFn(
-          `UPDATE payments
-           SET refund_id = ?,
-               refund_amount = ?,
-               status = CASE WHEN ? >= amount THEN 'refunded' ELSE status END,
-               updated_at = NOW()
-           WHERE order_id = ?`,
-          [
-            refundEntity.id,
-            Number(refundOrder.refund_amount),
-            Number(refundOrder.refund_amount),
-            refundOrder.id,
-          ],
-        );
-        await recordRefundGatewayDetails(queryFn, refundOrder.id, refundEntity);
-        await queryFn(
-          `INSERT INTO order_status_history
-             (order_id, previous_status, new_status, changed_by, notes)
-           VALUES (?, ?, ?, NULL, ?)`,
-          [
-            refundOrder.id,
-            refundOrder.order_status,
-            refundOrder.order_status,
-            `Refund ${refundEntity.id} confirmed completed via webhook`,
-          ],
-        );
+        // FIX (audit finding 3): the refund is completed as of the guarded
+        // UPDATE above. A failure in the bookkeeping below used to skip the
+        // customer notification entirely, and Razorpay's redelivery then
+        // matched nothing (already 'completed'), so "Refund Completed" was
+        // lost for good. The bookkeeping error is now captured, the
+        // customer is still notified, and the error is rethrown afterwards
+        // so the webhook ledger records the failure exactly as before. A
+        // process crash in this window is covered by the notification
+        // reconciler (services/notificationReconciliation.js), which
+        // recovers a completed refund whose notification row never appeared.
+        let bookkeepingError = null;
+        try {
+          // Same payments-row reconciliation completeRefund's Phase 3 does.
+          await queryFn(
+            `UPDATE payments
+             SET refund_id = ?,
+                 refund_amount = ?,
+                 status = CASE WHEN ? >= amount THEN 'refunded' ELSE status END,
+                 updated_at = NOW()
+             WHERE order_id = ?`,
+            [
+              refundEntity.id,
+              Number(refundOrder.refund_amount),
+              Number(refundOrder.refund_amount),
+              refundOrder.id,
+            ],
+          );
+          await recordRefundGatewayDetails(queryFn, refundOrder.id, refundEntity);
+          await queryFn(
+            `INSERT INTO order_status_history
+               (order_id, previous_status, new_status, changed_by, notes)
+             VALUES (?, ?, ?, NULL, ?)`,
+            [
+              refundOrder.id,
+              refundOrder.order_status,
+              refundOrder.order_status,
+              `Refund ${refundEntity.id} confirmed completed via webhook`,
+            ],
+          );
+        } catch (error) {
+          bookkeepingError = error;
+          console.error("[WEBHOOK] Refund completed but bookkeeping failed", {
+            orderId: refundOrder.id,
+            message: error?.message || String(error),
+          });
+        }
         const { rows: completedRows } = await queryFn(
           "SELECT * FROM orders WHERE id = ? LIMIT 1",
           [refundOrder.id],
         );
         if (completedRows[0]) {
-          notifyRefundEvent(completedRows[0], "Refund Completed", null);
+          notifyRefundEvent(completedRows[0], "Refund Completed");
           publishOrderUpdateFromRequest(
             req,
             {
@@ -3686,6 +3705,7 @@ export const handleWebhook = async (
             { userId: completedRows[0].user_id },
           );
         }
+        if (bookkeepingError) throw bookkeepingError;
       }
       break;
     }
@@ -3744,27 +3764,43 @@ export const handleWebhook = async (
           [refundEntity.id, failedOrder.id, refundEntity.id],
         );
 
-        if (failureUpdate.rowCount) {
-          await recordRefundGatewayDetails(queryFn, failedOrder.id, refundEntity);
-        }
+        let bookkeepingError = null;
+        try {
+          if (failureUpdate.rowCount) {
+            await recordRefundGatewayDetails(queryFn, failedOrder.id, refundEntity);
+          }
 
-        // FIX (return/refund E2E audit): a console line was the only trace —
-        // record it on the order's admin history too (the event ledger
-        // makes this once per delivery; public tracking omits notes).
-        await queryFn(
-          `INSERT INTO order_status_history
-             (order_id, previous_status, new_status, changed_by, notes)
-           VALUES (?, ?, ?, NULL, ?)`,
-          [
-            failedOrder.id,
-            failedOrder.order_status,
-            failedOrder.order_status,
-            failureUpdate.rowCount
-              ? `Razorpay reported refund ${refundEntity.id} FAILED — refund status set to failed; retry the refund from admin.`
-              : `Razorpay reported refund ${refundEntity.id} FAILED — needs manual review. Refund status left unchanged (${failedOrder.refund_status || "none"}).`,
-          ],
-        );
+          // FIX (return/refund E2E audit): a console line was the only trace —
+          // record it on the order's admin history too (the event ledger
+          // makes this once per delivery; public tracking omits notes).
+          await queryFn(
+            `INSERT INTO order_status_history
+               (order_id, previous_status, new_status, changed_by, notes)
+             VALUES (?, ?, ?, NULL, ?)`,
+            [
+              failedOrder.id,
+              failedOrder.order_status,
+              failedOrder.order_status,
+              failureUpdate.rowCount
+                ? `Razorpay reported refund ${refundEntity.id} FAILED — refund status set to failed; retry the refund from admin.`
+                : `Razorpay reported refund ${refundEntity.id} FAILED — needs manual review. Refund status left unchanged (${failedOrder.refund_status || "none"}).`,
+            ],
+          );
+        } catch (error) {
+          bookkeepingError = error;
+          console.error("[WEBHOOK] Refund failure recorded but bookkeeping failed", {
+            orderId: failedOrder.id,
+            message: error?.message || String(error),
+          });
+        }
         if (failureUpdate.rowCount) {
+          // FIX (audit finding 2): the customer used to hear nothing when a
+          // refund failed. Generic, customer-safe copy only (no gateway
+          // reason, refund id or RRN — those stay in the history row above).
+          // Only on the guarded transition, and under one notification key
+          // (order:{id}:status:refund_failed:channel:*), so duplicate
+          // deliveries cannot notify twice.
+          notifyRefundEvent({ ...failedOrder, refund_status: "failed" }, "Refund Failed");
           publishOrderUpdateFromRequest(
             req,
             {
@@ -3775,6 +3811,7 @@ export const handleWebhook = async (
             { userId: failedOrder.user_id },
           );
         }
+        if (bookkeepingError) throw bookkeepingError;
       }
       break;
     }

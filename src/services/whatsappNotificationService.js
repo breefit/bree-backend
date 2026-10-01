@@ -1,4 +1,5 @@
 import axios from "axios";
+import { CUSTOMER_ORDER_EVENT_MESSAGES } from "./customerOrderEvents.js";
 
 /*
 |--------------------------------------------------------------------------
@@ -95,7 +96,7 @@ const DEFAULT_CONTACT_NAME = "BREE Customer";
 | Example:
 |
 | WAPLIFY_TEMPLATE_ORDER_CONFIRMED=order_confirmed
-| WAPLIFY_TEMPLATE_ORDER_STATUS=order_status_update
+| WAPLIFY_TEMPLATE_ORDER_STATUS=order_status_v2
 |
 | WAPLIFY_TEMPLATE_SUBSCRIPTION_STATUS=subscription_status_update
 |
@@ -607,9 +608,13 @@ export const sendTemplateMessage = async ({
           { durationMs, requestId, retryAttempt: attempt },
         );
 
-        const { outcome } = classifyWaplifyError(error);
+        const { outcome, retrySafe } = classifyWaplifyError(error);
         const sendError = new Error(buildErrorMessage(error, templateName));
         sendError.deliveryOutcome = outcome;
+        // Provably NOT accepted (429 / no TCP connection) even after the
+        // in-request retries — safe for the notification reconciler to try
+        // again later. Never true for an 'unknown' outcome or another 4xx.
+        sendError.retryable = retrySafe;
         sendError.retryAttempts = attempt;
         if (outcome === WHATSAPP_DELIVERY_OUTCOME.UNKNOWN) {
           console.error(
@@ -707,7 +712,7 @@ export const sendOrderConfirmationWhatsApp = async ({
 
 /**
  * Maps an internal order status value to the body message shown in
- * template variable {{4}} of `order_status_update`.
+ * template variable {{4}} of `order_status_v2`.
  *
  * @param {string} status - Internal order status value (e.g. "shipped").
  * @returns {string} The status message line, or a generic fallback if
@@ -722,41 +727,13 @@ export const sendOrderConfirmationWhatsApp = async ({
 // but none of them were keys here, so every single return/refund WhatsApp
 // message fell back to the generic "Your order status has been updated."
 // regardless of what actually happened. Reuses the exact same
-// order_status_update template (still 4 params: name, order number,
+// order_status_v2 template (still 4 params: name, order number,
 // readable status, message) — no new template, no new client.
-const RETURN_STATUS_MESSAGES = {
-  "Return Approved":
-    "Your return request has been approved. We will arrange the pickup shortly.",
-  "Return Shipment Created":
-    "Your return shipment has been created. Our courier partner will pick up the item shortly.",
-  "Return Pickup Scheduled": "A pickup has been scheduled for your return.",
-  "Return Received":
-    "We have received your returned item and are reviewing it.",
-  "Return Inspection Approved":
-    "Your returned item has passed our quality check and is approved for a refund.",
-  "Return Rejected":
-    "Your return request could not be approved. Please contact BREE Support for details.",
-  // FIX (return flow audit): rejectInspection previously reused this exact
-  // "Return Rejected" label — a customer whose already-returned item
-  // failed quality check got the identical message as one whose initial
-  // return request was rejected, with no way to tell the two apart. This
-  // is passed only from rejectInspection (returnController.js); rejectReturn
-  // still uses "Return Rejected" for the earlier-stage rejection above.
-  "Return Quality Check Failed":
-    "Your returned item did not pass our quality check, so a refund cannot be processed for this return. Please contact BREE Support for details.",
-  "Refund Initiated":
-    "Your refund has been initiated and will reflect in your account soon.",
-  "Refund Completed": "Your refund has been completed successfully.",
-  // FIX (return/refund customer tracking): rejectRefund previously sent no
-  // customer notification at all — a customer whose refund was rejected
-  // was left silently waiting with no email/WhatsApp and (before the
-  // tracking-page fix) no visible status change either. Approving a
-  // refund still sends nothing deliberately (see the comment at
-  // rejectRefund's call site in returnController.js) — only rejection,
-  // a genuine dead-end for the customer, gets a message.
-  "Refund Rejected":
-    "Your refund request could not be approved. Please contact BREE Support if you need assistance.",
-};
+// FIX (notification privacy audit): the return/refund copy now lives in
+// services/customerOrderEvents.js — the single registry of customer-safe
+// messages — instead of being duplicated here. Kept as a lookup so
+// buildOrderStatusMessage() still resolves those labels.
+const RETURN_STATUS_MESSAGES = CUSTOMER_ORDER_EVENT_MESSAGES;
 
 export const buildOrderStatusMessage = (status) => {
   const messages = {
@@ -789,7 +766,7 @@ export const buildOrderStatusMessage = (status) => {
 // customer-name greeting baked into the body itself, matching the exact
 // content requested for this notification.
 //
-// UPDATE (4-milestone notification spec): the order_status_update template
+// UPDATE (4-milestone notification spec): the order_status_v2 template
 // already supplies the "Hi {{1}}" greeting, order number, current status
 // and the closing "Thank you for choosing BREE! 💚" line, so the delivered
 // body variable no longer repeats a greeting — it carries only the
@@ -801,7 +778,7 @@ export const buildOrderDeliveredThankYouMessage = (customerName) =>
 
 /**
  * Maps an internal order status value to the human-readable label shown
- * in template variable {{3}} of `order_status_update`.
+ * in template variable {{3}} of `order_status_v2`.
  *
  * @param {string} status - Internal order status value (e.g. "out_for_delivery").
  * @returns {string} The readable label, or a title-cased fallback if
@@ -850,7 +827,7 @@ export const getReadableOrderStatus = (status) => {
 
 /**
  * Sends the consolidated order status update WhatsApp notification via
- * the `order_status_update` template. This single function replaces the
+ * the `order_status_v2` template. This single function replaces the
  * previous per-status senders and should be called for every order
  * status change after the initial order confirmation.
  *
@@ -923,6 +900,41 @@ export const sendOrderStatusUpdateWhatsApp = async ({
             parameters: [orderUuid],
           },
         ]
+      : undefined,
+  });
+};
+
+/**
+ * Sends one customer-facing return/refund/cancellation event through the
+ * same order-status template (4 body params + tracking button) used for
+ * every order-status update. `label`/`message` must come from
+ * services/customerOrderEvents.js — this sender adds nothing of its own,
+ * so it can never carry admin notes.
+ */
+export const sendCustomerEventWhatsApp = async ({
+  mobile,
+  customerName,
+  orderNumber,
+  orderUuid,
+  label,
+  message,
+}) => {
+  if (!customerName || !String(customerName).trim()) {
+    throw new Error("customerName is required");
+  }
+  if (!orderNumber || !String(orderNumber).trim()) {
+    throw new Error("orderNumber is required");
+  }
+  if (!label || !message) {
+    throw new Error("label and message are required");
+  }
+
+  return sendTemplateMessage({
+    mobile,
+    templateName: TEMPLATES.ORDER_STATUS,
+    parameters: [customerName, orderNumber, label, message],
+    buttonParameters: orderUuid
+      ? [{ subType: "url", index: 0, parameters: [orderUuid] }]
       : undefined,
   });
 };
@@ -1375,7 +1387,7 @@ export const sendBulkWhatsAppNotifications = async (notifications = []) => {
  * @param {number} [meta.statusCode] - HTTP status code of the response.
  *
  * @example
- * logNotificationSuccess("order_status_update", "91******3210", "order_status_update", {
+ * logNotificationSuccess("order_status_v2", "91******3210", "order_status_v2", {
  *   durationMs: 214,
  *   requestId: "req_abc123",
  *   statusCode: 200,
@@ -1410,7 +1422,7 @@ export const logNotificationSuccess = (type, mobile, template, meta = {}) => {
  * @param {number} [meta.retryAttempt] - Number of retry attempts made.
  *
  * @example
- * logNotificationFailure("order_status_update", "91******3210", "order_status_update", error, {
+ * logNotificationFailure("order_status_v2", "91******3210", "order_status_v2", error, {
  *   durationMs: 512,
  *   requestId: "req_abc123",
  *   retryAttempt: 3,
@@ -1505,6 +1517,7 @@ export default {
   // Order Notifications
   sendOrderConfirmationWhatsApp,
   sendOrderStatusUpdateWhatsApp,
+  sendCustomerEventWhatsApp,
   buildOrderStatusMessage,
   buildOrderDeliveredThankYouMessage,
   getReadableOrderStatus,

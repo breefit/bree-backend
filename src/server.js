@@ -7,6 +7,7 @@ import cron from "node-cron";
 import { startShippingTrackingCron } from "../cron/shippingTrackingCron.js";
 import { startPackageFulfillmentCron } from "../cron/packageFulfillmentCron.js";
 import { startRefundReconciliationCron } from "../cron/refundReconciliationCron.js";
+import { startNotificationReconciliationCron } from "../cron/notificationReconciliationCron.js";
 import { startDailyReminderCron } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 import { getSafeRazorpayConfig } from "./config/razorpay.js";
@@ -122,6 +123,11 @@ const startServer = async () => {
       // Refund reconciliation (missed refund.processed/failed webhooks) —
       // status checks only, never creates a refund.
       cronTasks.push(startRefundReconciliationCron());
+
+      // Customer return/refund notification retry + recovery (failed sends
+      // the provider provably did not accept, and notifications lost to a
+      // crash after the state commit) — see notificationReconciliation.js.
+      cronTasks.push(startNotificationReconciliationCron());
 
       // Daily wellness reminder cron (runs every minute to check for
       // reminders). Idempotent per process — see startDailyReminderCron.
