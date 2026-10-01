@@ -47,7 +47,6 @@ import {
 import {
   safelySendWhatsApp,
   sendOrderConfirmationWhatsApp,
-  sendOrderStatusUpdateWhatsApp,
   sendSubscriptionStatusWhatsApp,
   validateMobile,
   maskMobile,
@@ -1486,18 +1485,22 @@ export const notifyInitialOrderConfirmation = async (
 // both send. Now uses the same atomic order_status_notifications claim as
 // notifyInitialOrderConfirmation above, keyed on status "paid" (distinct
 // from "confirmed") so the two notification types never share a claim.
+//
+// FIX (BREE-100020 duplicate Confirmed WhatsApp): this used to also send a
+// generic order_status_update WhatsApp for "paid" ("Your BREE order has
+// been updated … Current Status: Confirmed") immediately after
+// notifyInitialOrderConfirmation's dedicated "confirmed successfully"
+// WhatsApp — two messages for one event. The dedicated confirmation is
+// the only Confirmed WhatsApp now; this function is email-only. Existing
+// order:<id>:status:paid:channel:whatsapp rows are left untouched.
 export const notifyPaidStatusUpdate = async (
   orderId,
-  {
-    queryExecutor = query,
-    sendPaidEmail = sendOrderStatusUpdateEmail,
-    sendPaidWhatsApp = sendOrderStatusUpdateWhatsApp,
-  } = {},
+  { queryExecutor = query, sendPaidEmail = sendOrderStatusUpdateEmail } = {},
 ) => {
   try {
     const { rows } = await queryExecutor(
       `SELECT id, order_number, customer_name, contact_name, email,
-              contact_email, mobile_number, contact_phone
+              contact_email
        FROM orders WHERE id = ? LIMIT 1`,
       [orderId],
     );
@@ -1506,7 +1509,6 @@ export const notifyPaidStatusUpdate = async (
 
     const name = order.contact_name || order.customer_name || "Customer";
     const email = order.contact_email || order.email;
-    const phone = order.contact_phone || order.mobile_number;
 
     if (email) {
       try {
@@ -1535,36 +1537,6 @@ export const notifyPaidStatusUpdate = async (
     } else {
       console.error(
         `[PAYMENT] Cannot send paid status email for order ${orderId}: no customer email`,
-      );
-    }
-
-    if (phone) {
-      try {
-        await sendOrderStatusNotificationOnce({
-          notificationKey: buildOrderStatusNotificationKey({
-            orderId: order.id,
-            status: "paid",
-            channel: "whatsapp",
-          }),
-          orderId: order.id,
-          status: "paid",
-          channel: "whatsapp",
-          queryExecutor,
-          send: () =>
-            sendPaidWhatsApp({
-              customerName: name,
-              mobile: phone,
-              orderNumber: order.order_number,
-              orderUuid: order.id,
-              status: "paid",
-            }),
-        });
-      } catch (error) {
-        console.error("Paid order status WhatsApp failed", { orderId, error });
-      }
-    } else {
-      console.error(
-        `[PAYMENT] Cannot send paid status WhatsApp for order ${orderId}: no customer phone`,
       );
     }
   } catch (error) {

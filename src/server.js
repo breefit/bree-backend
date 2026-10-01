@@ -11,6 +11,7 @@ import { startDailyReminderCron } from "../cron/dailyReminderCron.js";
 import { cleanupExpiredOtps } from "./services/otpCleanupJob.js";
 import { getSafeRazorpayConfig } from "./config/razorpay.js";
 import { validateWhatsAppConfiguration } from "./services/whatsappNotificationService.js";
+import { transporter as smtpTransporter } from "./services/email.js";
 import { registerSocketSecurity } from "./services/socketAuth.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -59,6 +60,27 @@ try {
     waplifyConfigError?.message || waplifyConfigError,
   );
 }
+
+// SMTP (Hostinger) connection check — same non-fatal approach as the
+// WhatsApp check above: a mail problem is logged, never blocks startup.
+// Only host/port/user are logged; the password never is.
+smtpTransporter
+  .verify()
+  .then(() => {
+    console.info("[SMTP] connection verified", {
+      host: process.env.SMTP_HOST,
+      port: Number(process.env.SMTP_PORT),
+      secure: process.env.SMTP_SECURE === "true",
+      user: process.env.SMTP_USER,
+    });
+  })
+  .catch((smtpError) => {
+    console.error(
+      "[SMTP] connection verification FAILED — emails will fail until this is fixed:",
+      smtpError?.code || "",
+      smtpError?.message || smtpError,
+    );
+  });
 
 // console.log("STEP 1 - Server file loaded");
 // console.log("STEP 4 - Environment variables loaded");

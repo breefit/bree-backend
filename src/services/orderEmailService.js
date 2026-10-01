@@ -3,12 +3,14 @@ import { getOrderStatusLabel } from "../constants/orderStatus.js";
 
 const createTransporter = () =>
   nodemailer.createTransport({
-    host: process.env.SMTP_HOST || "smtp.gmail.com",
-    port: Number(process.env.SMTP_PORT) || 587,
-    secure: false,
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT),
+    secure: process.env.SMTP_SECURE === "true",
     auth: {
       user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
+      // SMTP_PASSWORD is the current name; SMTP_PASS is still honoured so
+      // an environment that hasn't been renamed yet keeps sending.
+      pass: process.env.SMTP_PASSWORD || process.env.SMTP_PASS,
     },
   });
 
@@ -53,8 +55,11 @@ const sendEmail = async ({ to, subject, html }) => {
   // successfully delivered when nothing was ever sent. This is a genuine
   // system misconfiguration, not a data condition, so it must throw and
   // be recorded as 'failed' like any other provider error.
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    throw new Error("SMTP_USER/SMTP_PASS not configured");
+  if (
+    !process.env.SMTP_USER ||
+    !(process.env.SMTP_PASSWORD || process.env.SMTP_PASS)
+  ) {
+    throw new Error("SMTP_USER/SMTP_PASSWORD not configured");
   }
 
   await createTransporter().sendMail({

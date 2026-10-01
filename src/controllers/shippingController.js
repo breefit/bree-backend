@@ -546,8 +546,27 @@ const DELHIVERY_ALREADY_NOTIFIES_STATUSES = new Set([
   "out_for_delivery",
 ]);
 
+// FIX (BREE-100020 duplicate "Current Status: Confirmed" WhatsApp): the
+// order-created/confirmed milestone is covered by exactly one dedicated
+// message — notifyInitialOrderConfirmation()'s order_confirmed template in
+// paymentController.js. A generic order_status_update for "paid" (labelled
+// "Confirmed") was a second message for the same event, so it is
+// suppressed on every path that sends order_status_update. pending_payment
+// is not a customer milestone either. The customer-facing progress
+// WhatsApps are therefore: Confirmed (dedicated), Processing, Ready To
+// Ship, Delivered — plus the separate cancellation/return/refund events.
+const NON_MILESTONE_STATUSES = new Set(["pending_payment", "paid"]);
+
 export const shouldSendBreeStatusWhatsApp = (status) =>
-  !DELHIVERY_ALREADY_NOTIFIES_STATUSES.has(status);
+  !DELHIVERY_ALREADY_NOTIFIES_STATUSES.has(status) &&
+  !NON_MILESTONE_STATUSES.has(status);
+
+// Structured-log action for a status whose generic WhatsApp is suppressed,
+// so logs say why the send was skipped.
+export const getSkippedBreeStatusWhatsAppAction = (status) =>
+  DELHIVERY_ALREADY_NOTIFIES_STATUSES.has(status)
+    ? "skipped_delhivery_duplicate"
+    : "skipped_not_customer_milestone";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Robust Delhivery tracking-response parser.

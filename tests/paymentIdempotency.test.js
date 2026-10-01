@@ -306,24 +306,25 @@ test("ISSUE-003: an order that is not yet paid never claims or sends a confirmat
   assert.equal(emailCalls, 0);
 });
 
-test("ISSUE-004: concurrent payment-received triggers (verifyPayment racing payment.captured webhook) send exactly one email and one WhatsApp", async () => {
-  const { queryExecutor } = createFakeOrderDb({ order: paidOrder });
+test("ISSUE-004: concurrent payment-received triggers (verifyPayment racing payment.captured webhook) send exactly one email and no generic WhatsApp", async () => {
+  const { queryExecutor, notifRows } = createFakeOrderDb({ order: paidOrder });
   let emailCalls = 0;
-  let whatsappCalls = 0;
   const sendPaidEmail = async () => {
     emailCalls += 1;
   };
-  const sendPaidWhatsApp = async () => {
-    whatsappCalls += 1;
-  };
 
   await Promise.all([
-    notifyPaidStatusUpdate(paidOrder.id, { queryExecutor, sendPaidEmail, sendPaidWhatsApp }),
-    notifyPaidStatusUpdate(paidOrder.id, { queryExecutor, sendPaidEmail, sendPaidWhatsApp }),
+    notifyPaidStatusUpdate(paidOrder.id, { queryExecutor, sendPaidEmail }),
+    notifyPaidStatusUpdate(paidOrder.id, { queryExecutor, sendPaidEmail }),
   ]);
 
   assert.equal(emailCalls, 1, "payment received email must be sent exactly once");
-  assert.equal(whatsappCalls, 1, "payment received WhatsApp must be sent exactly once");
+  // BREE-100020: the generic "Current Status: Confirmed" WhatsApp is no
+  // longer sent or claimed — the dedicated confirmation covers it.
+  assert.equal(
+    [...notifRows.keys()].some((key) => key.endsWith(":channel:whatsapp")),
+    false,
+  );
 });
 
 test("ISSUE-003/ISSUE-004: order-confirmation and payment-received notifications use distinct keys and never share a claim", () => {

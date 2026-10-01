@@ -228,22 +228,20 @@ test("REGRESSION FIX: 'delivered' status routes to the dedicated thank-you messa
   assert.match(fnSource, /buildOrderDeliveredThankYouMessage\(customerName\)/);
 });
 
-test("the delivered thank-you message matches the exact requested content", () => {
+test("the delivered message body matches the 4-milestone spec (greeting/order no./status/sign-off come from the template)", () => {
   const message = buildOrderDeliveredThankYouMessage("Asha");
-  assert.match(message, /^BREE Wellness 💚/);
-  assert.match(message, /Hi Asha 👋/);
-  assert.match(message, /Your order has been successfully delivered\./);
-  assert.match(
+  assert.equal(
     message,
-    /Thank you for choosing BREE Wellness! We hope you enjoy your order\. 🌿/,
+    "Your order has been delivered successfully. 🎉 We hope you enjoy your purchase.",
   );
-  assert.match(message, /We appreciate your trust in BREE\. 💚$/);
+  // The order_status_update template already greets "Hi {{1}}" — the body
+  // variable must not greet a second time.
+  assert.doesNotMatch(message, /Hi /);
 });
 
-test("the delivered thank-you message falls back gracefully when customerName is missing (never crashes, never says 'Hi undefined')", () => {
+test("the delivered message never depends on customerName (never crashes, never says 'undefined')", () => {
   const message = buildOrderDeliveredThankYouMessage(undefined);
   assert.doesNotMatch(message, /undefined/);
-  assert.match(message, /Hi there 👋/);
 });
 
 test("createShipment sends the Shipped Email notification via the existing sendShipmentCreatedEmail template", () => {
@@ -631,7 +629,7 @@ test("sendOrderStatusNotificationOnce: a claim still fresh (well within the stal
 });
 
 test("email provider misconfiguration (missing SMTP creds) throws instead of silently 'succeeding' — a real send failure can never be marked sent", async () => {
-  // FIX: sendEmail() used to `return` silently when SMTP_USER/SMTP_PASS
+  // FIX: sendEmail() used to `return` silently when SMTP_USER/SMTP_PASS(WORD)
   // were unset, so sendOrderStatusNotificationOnce's send() callback
   // resolved normally and the row was marked 'sent' even though no email
   // ever left the server. Missing recipient (`to`) is still a soft no-op
@@ -639,8 +637,10 @@ test("email provider misconfiguration (missing SMTP creds) throws instead of sil
   // must throw.
   const previousUser = process.env.SMTP_USER;
   const previousPass = process.env.SMTP_PASS;
+  const previousPassword = process.env.SMTP_PASSWORD;
   delete process.env.SMTP_USER;
   delete process.env.SMTP_PASS;
+  delete process.env.SMTP_PASSWORD;
 
   try {
     await assert.rejects(
@@ -652,13 +652,15 @@ test("email provider misconfiguration (missing SMTP creds) throws instead of sil
           orderNumber: "BREE-100001",
           status: "shipped",
         }),
-      /SMTP_USER\/SMTP_PASS not configured/,
+      /SMTP_USER\/SMTP_PASSWORD not configured/,
     );
   } finally {
     if (previousUser === undefined) delete process.env.SMTP_USER;
     else process.env.SMTP_USER = previousUser;
     if (previousPass === undefined) delete process.env.SMTP_PASS;
     else process.env.SMTP_PASS = previousPass;
+    if (previousPassword === undefined) delete process.env.SMTP_PASSWORD;
+    else process.env.SMTP_PASSWORD = previousPassword;
   }
 });
 
@@ -671,8 +673,10 @@ test("sendOrderStatusNotificationOnce marks 'failed', not 'sent', when the under
   });
   const previousUser = process.env.SMTP_USER;
   const previousPass = process.env.SMTP_PASS;
+  const previousPassword = process.env.SMTP_PASSWORD;
   delete process.env.SMTP_USER;
   delete process.env.SMTP_PASS;
+  delete process.env.SMTP_PASSWORD;
 
   try {
     await assert.rejects(() =>
@@ -697,10 +701,12 @@ test("sendOrderStatusNotificationOnce marks 'failed', not 'sent', when the under
     else process.env.SMTP_USER = previousUser;
     if (previousPass === undefined) delete process.env.SMTP_PASS;
     else process.env.SMTP_PASS = previousPass;
+    if (previousPassword === undefined) delete process.env.SMTP_PASSWORD;
+    else process.env.SMTP_PASSWORD = previousPassword;
   }
 
   assert.equal(rows.get(key).status, "failed");
-  assert.match(rows.get(key).last_error, /SMTP_USER\/SMTP_PASS not configured/);
+  assert.match(rows.get(key).last_error, /SMTP_USER\/SMTP_PASSWORD not configured/);
 });
 
 test("WhatsApp config validation (base URL, API key, every WAPLIFY_TEMPLATE_* including ORDER_STATUS) is wired into server startup, non-fatally", () => {
@@ -855,7 +861,7 @@ test("no remaining bare/unguarded sendOrderStatusUpdateWhatsApp call exists anyw
   assert.equal(bareCalls, null);
 });
 
-test("a full-repo audit of every sendOrderStatusUpdateWhatsApp call site accounts for each one: 4 guarded (createShipment removed, trackShipment/cron/admin-single/admin-bulk guarded), 2 correctly unaffected (paid, return/refund labels)", () => {
+test("a full-repo audit of every sendOrderStatusUpdateWhatsApp call site accounts for each one: 4 guarded (createShipment removed, trackShipment/cron/admin-single/admin-bulk guarded), paid removed, return/refund labels unaffected", () => {
   const paymentControllerSource = read("../src/controllers/paymentController.js");
   const returnControllerSource = read("../src/controllers/admin/returnController.js");
   const createShipmentSource = shippingControllerSource.slice(
@@ -869,16 +875,13 @@ test("a full-repo audit of every sendOrderStatusUpdateWhatsApp call site account
   for (const source of [shippingControllerSource, shippingCronSource, adminOrderControllerSource]) {
     assert.match(source, /shouldSendBreeStatusWhatsApp/);
   }
-  // Unaffected: paymentController's "paid" status notification still
-  // wires the real sendOrderStatusUpdateWhatsApp implementation — now via
-  // an injectable default parameter (`sendPaidWhatsApp =
-  // sendOrderStatusUpdateWhatsApp`) added by the ISSUE-004 fix so
-  // notifyPaidStatusUpdate's atomic-claim behavior is directly testable
-  // (see paymentIdempotency.test.js's concurrency tests) without touching
-  // a real database — production always uses the real import, unchanged.
+  // Removed (BREE-100020): paymentController's "paid" notification no
+  // longer sends the generic order_status_update WhatsApp ("Current
+  // Status: Confirmed") — the dedicated order_confirmed WhatsApp is the
+  // only Confirmed message. The paid email is unchanged.
   assert.match(paymentControllerSource, /status:\s*"paid",/);
-  assert.match(paymentControllerSource, /sendPaidWhatsApp = sendOrderStatusUpdateWhatsApp/);
-  assert.match(paymentControllerSource, /sendPaidWhatsApp\(\{/);
+  assert.doesNotMatch(paymentControllerSource, /sendPaidWhatsApp/);
+  assert.doesNotMatch(paymentControllerSource, /sendOrderStatusUpdateWhatsApp/);
   // Unaffected: returnController's return/refund event labels (never
   // literally "shipped"/"out_for_delivery"/"delivered").
   assert.match(returnControllerSource, /sendOrderStatusUpdateWhatsApp\(/);

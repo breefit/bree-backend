@@ -19,7 +19,10 @@ import {
 } from "../../services/dailyReminderService.js";
 import { publishOrderUpdateFromRequest } from "../../services/orderRealtime.js";
 import { invalidateDashboardCache } from "./dashboardController.js";
-import { shouldSendBreeStatusWhatsApp } from "../shippingController.js";
+import {
+  shouldSendBreeStatusWhatsApp,
+  getSkippedBreeStatusWhatsAppAction,
+} from "../shippingController.js";
 import {
   sendOrderStatusNotificationOnce,
   buildOrderStatusNotificationKey,
@@ -703,7 +706,7 @@ export const updateOrderStatus = async (req, res) => {
           orderId: updated.id,
           status,
           channel: "whatsapp",
-          action: "skipped_delhivery_duplicate",
+          action: getSkippedBreeStatusWhatsAppAction(status),
           result: "success",
         });
       } else if (recipientPhone) {
@@ -1012,7 +1015,7 @@ export const bulkUpdateStatus = async (req, res) => {
           orderId: orderItem.id,
           status,
           channel: "whatsapp",
-          action: "skipped_delhivery_duplicate",
+          action: getSkippedBreeStatusWhatsAppAction(status),
           result: "success",
         });
         return Promise.resolve();

@@ -762,10 +762,9 @@ export const buildOrderStatusMessage = (status) => {
   const messages = {
     pending_payment: "Your order has been placed and is awaiting payment.",
     paid: "Payment received successfully. Your order has been confirmed.",
-    processing:
-      "Your order is now being processed. We'll keep you updated as it moves forward.",
+    processing: "Your order is now being processed.",
     ready_to_ship:
-      "Your order is ready to ship. We'll notify you once it has been shipped.",
+      "Your order is ready to be shipped. We'll notify you when it is on its way.",
     shipped: "Your order has been shipped and is on its way to you.",
     out_for_delivery:
       "Your order is out for delivery and should reach you soon.",
@@ -789,8 +788,16 @@ export const buildOrderStatusMessage = (status) => {
 // instead, which — unlike every other status message here — has its own
 // customer-name greeting baked into the body itself, matching the exact
 // content requested for this notification.
+//
+// UPDATE (4-milestone notification spec): the order_status_update template
+// already supplies the "Hi {{1}}" greeting, order number, current status
+// and the closing "Thank you for choosing BREE! 💚" line, so the delivered
+// body variable no longer repeats a greeting — it carries only the
+// delivered-specific lines. `customerName` is accepted but unused, so
+// existing callers stay unchanged.
+// eslint-disable-next-line no-unused-vars
 export const buildOrderDeliveredThankYouMessage = (customerName) =>
-  `BREE Wellness 💚\n\nHi ${customerName || "there"} 👋\n\nYour order has been successfully delivered.\n\nThank you for choosing BREE Wellness! We hope you enjoy your order. 🌿\n\nWe appreciate your trust in BREE. 💚`;
+  "Your order has been delivered successfully. 🎉 We hope you enjoy your purchase.";
 
 /**
  * Maps an internal order status value to the human-readable label shown
@@ -808,7 +815,7 @@ export const getReadableOrderStatus = (status) => {
     pending_payment: "Pending Payment",
     paid: "Confirmed",
     processing: "Processing",
-    ready_to_ship: "Ready to Ship",
+    ready_to_ship: "Ready To Ship",
     shipped: "Shipped",
     out_for_delivery: "Out for Delivery",
     delivered: "Delivered",
