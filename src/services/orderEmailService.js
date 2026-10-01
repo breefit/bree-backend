@@ -1,5 +1,6 @@
 import nodemailer from "nodemailer";
 import { getOrderStatusLabel } from "../constants/orderStatus.js";
+import { getEmailLogoUrl } from "../config/emailAssets.js";
 
 const createTransporter = () =>
   nodemailer.createTransport({
@@ -109,12 +110,11 @@ const formatCurrency = (value) => `₹${Number(value || 0).toLocaleString()}`;
 // Reusable email building blocks
 // ==================================================
 
-const buildHeader = (frontendUrl) => {
-  // FIX (Medium #29 — Phase 3): this ignored its own `frontendUrl`
-  // parameter and hardcoded breefit.in regardless of FRONTEND_URL, so any
-  // domain migration would need a code change here even though the
-  // parameter already carries the correct env-driven value.
-  const logoUrl = `${frontendUrl}/images/logo.PNG`;
+const buildHeader = () => {
+  // The logo is deliberately NOT derived from `frontendUrl`/FRONTEND_URL
+  // (a CORS allow-list that can hold several, preview or localhost
+  // origins) — see src/config/emailAssets.js.
+  const logoUrl = getEmailLogoUrl();
   return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">
       <tr>
@@ -388,7 +388,7 @@ const buildBrandedEmail = ({ frontendUrl, content, preheader }) => `
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:${COLORS.white};border-radius:10px;overflow:hidden;">
               <tr>
                 <td>
-                  ${buildHeader(frontendUrl)}
+                  ${buildHeader()}
                   ${content}
                   ${buildFooter()}
                 </td>

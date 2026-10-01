@@ -42,6 +42,7 @@
 // notification to the customer over both channels.
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { getEmailLogoUrl } from "../config/emailAssets.js";
 import { transporter } from "./email.js";
 import {
   safelySendWhatsApp,
@@ -120,8 +121,8 @@ const COLORS = {
 // ==================================================
 
 const buildHeader = () => {
-  // Kept hardcoded — same reasoning as WEBSITE_URL above.
-  const logoUrl = `https://www.breefit.in/images/logo.PNG`;
+  // Not derived from FRONTEND_URL — same reasoning as WEBSITE_URL above.
+  const logoUrl = getEmailLogoUrl();
   return `
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${COLORS.white};">
       <tr>
