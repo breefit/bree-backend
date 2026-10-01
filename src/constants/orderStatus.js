@@ -81,6 +81,13 @@ export const isValidOrderStepTransition = (prevStatus, nextStatus) => {
   if (next === "cancelled") {
     return { ok: prev !== "delivered", prev, next, reason: "cancel_after_delivered" };
   }
+  // A cancelled order is terminal: it can never be moved back into the
+  // fulfillment lifecycle (processing, ready_to_ship, shipped, …) or any
+  // other status. Previously this only held implicitly, because "cancelled"
+  // sits after "delivered" in ORDER_STATUSES — now it is explicit.
+  if (prev === "cancelled") {
+    return { ok: false, prev, next, reason: "cancelled_is_terminal" };
+  }
   if (next === "returned") {
     return {
       ok: prev === "delivered" || prev === "out_for_delivery",

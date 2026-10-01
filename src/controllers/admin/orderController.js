@@ -464,6 +464,18 @@ export const getOrder = async (req, res) => {
 
   order.reminders = reminderRows;
 
+  // Status history (read-only) — the admin order timeline is built from the
+  // states the order actually reached, so a cancelled order shows its real
+  // branch instead of the normal lifecycle with invented "done" steps.
+  const { rows: historyRows } = await query(
+    `SELECT previous_status, new_status, created_at
+     FROM order_status_history
+     WHERE order_id = ?
+     ORDER BY created_at ASC`,
+    [req.params.id],
+  );
+  order.status_history = historyRows;
+
   res.json(order);
 };
 
@@ -513,6 +525,12 @@ export const updateOrderStatus = async (req, res) => {
           return res
             .status(400)
             .json({ message: "Cannot cancel a delivered order" });
+        }
+        if (transition.reason === "cancelled_is_terminal") {
+          return res.status(400).json({
+            message:
+              "This order has been cancelled and cannot be moved back to an active fulfillment status.",
+          });
         }
         return res.status(400).json({
           message: `Invalid status transition from ${prev} to ${next}`,
@@ -838,6 +856,11 @@ export const bulkUpdateStatus = async (req, res) => {
         if (transition.reason === "cancel_after_delivered") {
           return res.status(400).json({
             message: `Order ${o.order_number || o.id} cannot be cancelled after delivery`,
+          });
+        }
+        if (transition.reason === "cancelled_is_terminal") {
+          return res.status(400).json({
+            message: `Order ${o.order_number || o.id} has been cancelled and cannot be moved back to an active fulfillment status.`,
           });
         }
         return res.status(400).json({
