@@ -1770,7 +1770,7 @@ export const approveRefund = async (req, res, { getClientFn = getClient } = {}) 
     // deliberately, not overlooked. approveRefund only records an internal
     // decision + amount — Razorpay is never contacted here (see this
     // function's own doc comment above). completeRefund is what actually
-    // moves money and already sends "Refund Initiated"/"Refund Completed"
+    // moves money and already sends "Refund Initiated"/"Refund Processed"
     // the moment that happens, and on a normal admin workflow the two
     // actions happen back-to-back (approve, then immediately click
     // "Initiate Refund"). Notifying here too would almost always mean the
@@ -2427,7 +2427,7 @@ export const completeRefund = async (
     );
     notifyReturnEvent(
       updated,
-      isProcessed ? "Refund Completed" : "Refund Initiated",
+      isProcessed ? "Refund Processed" : "Refund Initiated",
     );
   }
 

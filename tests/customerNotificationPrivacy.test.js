@@ -239,7 +239,7 @@ test("an unknown event name sends nothing (no generic fallback text)", async () 
 
 test("buildCustomerEventPayload exposes only whitelisted customer fields", () => {
   const order = makeOrder();
-  const payload = notif.buildCustomerEventPayload(order, events.CUSTOMER_ORDER_EVENTS["Refund Completed"]);
+  const payload = notif.buildCustomerEventPayload(order, events.CUSTOMER_ORDER_EVENTS["Refund Processed"]);
   assert.deepEqual(Object.keys(payload).sort(), [
     "email",
     "emailMessage",

@@ -69,7 +69,7 @@ const setup = (overrides = {}) => {
 test("failed (SMTP 4xx — provably not accepted) is retried after backoff under the SAME key, then sent once", async () => {
   const { order, store, key, run } = setup();
   providers.emailModes = ["fail_4xx", "ok"];
-  await rc.notifyReturnEvent(order, "Refund Completed");
+  await rc.notifyReturnEvent(order, "Refund Processed");
 
   const row = store.notifications.get(key("refund_completed", "email"));
   assert.equal(row.status, "failed");
@@ -96,7 +96,7 @@ test("failed (SMTP 4xx — provably not accepted) is retried after backoff under
 test("backoff doubles and stops at the maximum attempt count", async () => {
   const { order, store, key, run } = setup();
   providers.emailModes = ["fail_4xx"];
-  await rc.notifyReturnEvent(order, "Refund Completed");
+  await rc.notifyReturnEvent(order, "Refund Processed");
   const row = store.notifications.get(key("refund_completed", "email"));
 
   const gaps = [];
@@ -117,7 +117,7 @@ test("backoff doubles and stops at the maximum attempt count", async () => {
 test("permanent failure (SMTP 5xx) is never retried", async () => {
   const { order, store, key, run } = setup();
   providers.emailModes = ["fail_5xx", "ok"];
-  await rc.notifyReturnEvent(order, "Refund Completed");
+  await rc.notifyReturnEvent(order, "Refund Processed");
   const row = store.notifications.get(key("refund_completed", "email"));
   assert.equal(row.status, "failed");
   assert.equal(row.next_retry_at, null);
@@ -130,7 +130,7 @@ test("permanent failure (SMTP 5xx) is never retried", async () => {
 test("permanent WhatsApp rejection (HTTP 400) is never retried", async () => {
   const { order, store, key, run } = setup();
   providers.whatsappModes = ["400", "ok"];
-  await rc.notifyReturnEvent(order, "Refund Completed");
+  await rc.notifyReturnEvent(order, "Refund Processed");
   const row = store.notifications.get(key("refund_completed", "whatsapp"));
   assert.equal(row.status, "failed");
   assert.equal(row.next_retry_at, null);
@@ -143,7 +143,7 @@ test("unknown outcome (SMTP timeout; WAPLIFY 5xx after acceptance) is never re-s
   const { order, store, key, run } = setup();
   providers.emailModes = ["timeout", "ok"];
   providers.whatsappModes = ["500_after", "ok"];
-  await rc.notifyReturnEvent(order, "Refund Completed");
+  await rc.notifyReturnEvent(order, "Refund Processed");
   assert.equal(store.status(key("refund_completed", "email")), "unknown");
   assert.equal(store.status(key("refund_completed", "whatsapp")), "unknown");
 
@@ -167,7 +167,7 @@ test("stale 'sending' claim (process died mid-send) is marked unknown and NOT re
   });
 
   store.advance(6 * MIN);
-  await rc.notifyReturnEvent(order, "Refund Completed"); // live re-trigger after 6 minutes
+  await rc.notifyReturnEvent(order, "Refund Processed"); // live re-trigger after 6 minutes
   assert.equal(providers.whatsapp.length, 0, "customer events never reclaim a stale 'sending' row");
 
   store.advance(10 * MIN);
@@ -180,7 +180,7 @@ test("stale 'sending' claim (process died mid-send) is marked unknown and NOT re
 test("two reconciler workers (two Hostinger processes) racing on the same due retry send it exactly once", async () => {
   const { order, store, key, run } = setup();
   providers.emailModes = ["fail_4xx", "ok"];
-  await rc.notifyReturnEvent(order, "Refund Completed");
+  await rc.notifyReturnEvent(order, "Refund Processed");
   store.advance(5 * MIN);
 
   const [a, b, c] = await Promise.all([run(), run(), run()]);
@@ -205,8 +205,8 @@ test("a retry for an event the order has moved past is dropped, not sent (no sta
     !providers.emails.some((m) => /Refund Initiated/.test(m.subject)),
     "the stale 'Refund Initiated' is never sent",
   );
-  // (The completed refund's own missing "Refund Completed" is recovered.)
-  assert.deepEqual(providers.emails.map((m) => m.subject), [`Order Status Updated — Refund Completed (#${order.order_number})`]);
+  // (The completed refund's own missing "Refund Processed" is recovered.)
+  assert.deepEqual(providers.emails.map((m) => m.subject), [`Order Status Updated — Refund Processed (#${order.order_number})`]);
 });
 
 test("admin double-click / duplicate trigger of the same event sends one message per channel", async () => {

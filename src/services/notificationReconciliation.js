@@ -16,7 +16,7 @@
  *      claim. Same notification_key, so it is still one logical
  *      notification. A row whose event no longer describes the order
  *      (e.g. "Refund Initiated" after the refund completed) is dropped.
- *   2. RECOVER  events produced by webhooks/crons (Refund Completed, Refund
+ *   2. RECOVER  events produced by webhooks/crons (Refund Processed, Refund
  *      Failed, Return Received, Return Pickup Scheduled) whose order is in
  *      that state, changed within the lookback window, and has NO
  *      notification row at all (or one stuck at 'pending'). Sent through

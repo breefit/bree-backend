@@ -3585,7 +3585,7 @@ export const handleWebhook = async (
     // FIX (return/refund E2E audit): (1) this completed the refund silently —
     // when Razorpay answered completeRefund with "pending" (so the customer
     // got "Refund Initiated"), nobody ever told them it completed. It now
-    // sends "Refund Completed" through the same exactly-once claim
+    // sends "Refund Processed" through the same at-most-once claim
     // (order:{id}:status:refund_completed:channel:*) completeRefund uses, so
     // whichever path observes completion first sends it and the other is a
     // no-op. (2) A webhook that arrived while completeRefund was still
@@ -3645,7 +3645,7 @@ export const handleWebhook = async (
         // FIX (audit finding 3): the refund is completed as of the guarded
         // UPDATE above. A failure in the bookkeeping below used to skip the
         // customer notification entirely, and Razorpay's redelivery then
-        // matched nothing (already 'completed'), so "Refund Completed" was
+        // matched nothing (already 'completed'), so the customer message was
         // lost for good. The bookkeeping error is now captured, the
         // customer is still notified, and the error is rethrown afterwards
         // so the webhook ledger records the failure exactly as before. A
@@ -3693,7 +3693,7 @@ export const handleWebhook = async (
           [refundOrder.id],
         );
         if (completedRows[0]) {
-          notifyRefundEvent(completedRows[0], "Refund Completed");
+          notifyRefundEvent(completedRows[0], "Refund Processed");
           publishOrderUpdateFromRequest(
             req,
             {

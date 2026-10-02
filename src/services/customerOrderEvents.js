@@ -116,10 +116,18 @@ const EVENTS = [
     isCurrent: (o) => o.refund_status === "initiated",
   },
   {
-    name: "Refund Completed",
+    // Razorpay's refund.processed (or a status check reporting "processed")
+    // means Razorpay has processed the refund — the bank/UPI credit can
+    // still take a few business days. So the customer is told "Refund
+    // Processed", never "Refund Completed", for BOTH refund sources
+    // (Cancel Order & Refund and Return → QC → Refund), which share this
+    // one event. The slug stays "refund_completed" (internal refund_status
+    // 'completed'), so existing notification rows keep deduping.
+    name: "Refund Processed",
     slug: "refund_completed",
-    label: "Refund Completed",
-    message: "Your refund has been completed successfully.",
+    label: "Refund Processed",
+    message:
+      "Your refund has been processed. It may take a few business days to reflect in your account, depending on your bank.",
     isCurrent: (o) => o.refund_status === "completed",
     recovery: {
       where: "refund_status = 'completed'",
@@ -173,7 +181,7 @@ export const CUSTOMER_ORDER_EVENTS = Object.freeze(
 
 const BY_SLUG = new Map(EVENTS.map((event) => [event.slug, CUSTOMER_ORDER_EVENTS[event.name]]));
 
-/** Event by its name ("Refund Completed") or slug ("refund_completed"); null if unknown. */
+/** Event by its name ("Refund Processed") or slug ("refund_completed"); null if unknown. */
 export const resolveCustomerOrderEvent = (nameOrSlug) =>
   CUSTOMER_ORDER_EVENTS[nameOrSlug] || BY_SLUG.get(nameOrSlug) || null;
 

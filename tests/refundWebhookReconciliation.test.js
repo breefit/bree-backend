@@ -329,7 +329,7 @@ const refundPayloadWithNotes = (event, refundId, paymentId, orderId) => ({
   },
 });
 
-test("audit: refund.processed completing an 'initiated' refund sends 'Refund Completed' exactly once, even when the webhook is delivered twice", async () => {
+test("audit: refund.processed completing an 'initiated' refund sends 'Refund Processed' exactly once, even when the webhook is delivered twice", async () => {
   const db = makeFakeOrdersDb({
     id: "order-1",
     order_status: "delivered",
@@ -346,7 +346,7 @@ test("audit: refund.processed completing an 'initiated' refund sends 'Refund Com
   const dup = makeRes();
   await handleWebhook(buildSignedRequest(payload), dup, { queryFn: db.queryFn, notifyRefundEvent });
 
-  assert.deepEqual(notified, [["order-1", "Refund Completed", "completed"]]);
+  assert.deepEqual(notified, [["order-1", "Refund Processed", "completed"]]);
   assert.equal(dup.body.duplicate, true);
   assert.equal(db.historyInserts.length, 1);
 });
@@ -372,7 +372,7 @@ test("audit: a refund.processed that arrives while completeRefund is still 'proc
   assert.equal(order.refund_status, "completed");
   assert.equal(order.refund_reference, "rfnd_race1");
   assert.equal(order.payment_status, "refunded");
-  assert.deepEqual(notified, ["Refund Completed"]);
+  assert.deepEqual(notified, ["Refund Processed"]);
 });
 
 test("audit: a 'processing' order on the same payment is NOT completed by a refund whose notes name a different order (or no order)", async () => {

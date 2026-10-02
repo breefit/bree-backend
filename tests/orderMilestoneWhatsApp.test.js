@@ -356,7 +356,7 @@ test("14: cancellation, return and refund WhatsApps are unaffected — still sen
   // notifyReturnEvent (returnController.js) — same sender, same claim
   // keyspace, return/refund labels as the status. It never consults the
   // milestone guard, so none of these can be suppressed by it.
-  for (const label of ["Return Approved", "Refund Initiated", "Refund Completed"]) {
+  for (const label of ["Return Approved", "Refund Initiated", "Refund Processed"]) {
     const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, "_");
     await notif.sendOrderStatusNotificationOnce({
       notificationKey: notif.buildOrderStatusNotificationKey({
@@ -380,12 +380,12 @@ test("14: cancellation, return and refund WhatsApps are unaffected — still sen
     "Cancelled",
     "Return Approved",
     "Refund Initiated",
-    "Refund Completed",
+    "Refund Processed",
   ]);
   assert.equal(waplify.accepted[0].body_data["4"], "Your order has been cancelled.");
   assert.equal(
     waplify.accepted[3].body_data["4"],
-    "Your refund has been completed successfully.",
+    "Your refund has been processed. It may take a few business days to reflect in your account, depending on your bank.",
   );
 
   const returnControllerSource = read("../src/controllers/admin/returnController.js");

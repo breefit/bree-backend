@@ -859,7 +859,7 @@ export const buildCustomerSafeOrderHistory = (order, historyRows = []) => {
         ["approved", "rejected"].includes(order.inspection_status) ? order.inspection_completed_at : null,
       ],
       ["refund_approved", "Refund Approved", order.refund_approved_at],
-      ["refund_completed", "Refund Completed", order.refund_status === "completed" ? order.refund_completed_at : null],
+      ["refund_processed", "Refund Processed", order.refund_status === "completed" ? order.refund_completed_at : null],
     ];
     for (const [status, label, timestamp] of milestones) {
       if (timestamp) entries.push({ status, label, timestamp });

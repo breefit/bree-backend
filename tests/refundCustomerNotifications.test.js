@@ -1,6 +1,6 @@
 /**
  * Audit findings 2 + 3 — refund.failed must tell the customer (safely, once),
- * and refund.processed's "Refund Completed" must survive a failure or crash
+ * and refund.processed's "Refund Processed" must survive a failure or crash
  * after the refund state commit.
  *
  * Drives the REAL handleWebhook (signed with a test-only secret) and the REAL
@@ -231,17 +231,17 @@ test("J. a failing Refund Failed notification never alters the refund state", as
   assert.equal(db.store.status(notificationKey(ORDER_ID, "refund_failed", "whatsapp")), "failed");
 });
 
-// ── I. Refund Completed ──────────────────────────────────────────────────────
+// ── I. Refund Processed ──────────────────────────────────────────────────────
 
-test("I. refund.processed → exactly one 'Refund Completed' WhatsApp and email; no refund id / RRN shown", async () => {
+test("I. refund.processed → exactly one 'Refund Processed' WhatsApp and email; no refund id / RRN shown", async () => {
   const db = setup();
   await handleWebhook(refundProcessed(), res(), { queryFn: db.queryFn });
   await settle();
   assert.equal(db.order().refund_status, "completed");
   assert.equal(providers.whatsapp.length, 1);
   assert.equal(providers.emails.length, 1);
-  assert.equal(providers.whatsapp[0].body_data[3], "Refund Completed");
-  assert.equal(providers.whatsapp[0].body_data[4], "Your refund has been completed successfully.");
+  assert.equal(providers.whatsapp[0].body_data[3], "Refund Processed");
+  assert.equal(providers.whatsapp[0].body_data[4], "Your refund has been processed. It may take a few business days to reflect in your account, depending on your bank.");
   assertSafe();
 });
 
@@ -269,7 +269,7 @@ test("I. a WhatsApp send whose outcome is unknown (5xx after acceptance) leaves 
   assert.equal(providers.whatsapp.length, 1, "the one possibly-delivered message only — no duplicate");
 });
 
-test("I. bookkeeping failing AFTER the refund state commit no longer loses 'Refund Completed'; Razorpay's redelivery does not duplicate it", async () => {
+test("I. bookkeeping failing AFTER the refund state commit no longer loses 'Refund Processed'; Razorpay's redelivery does not duplicate it", async () => {
   const db = setup({ failPaymentsUpdate: true });
   await assert.rejects(handleWebhook(refundProcessed(), res(), { queryFn: db.queryFn }), /Lock wait timeout/);
   await settle();
@@ -305,7 +305,7 @@ test("I. process dies after the refund commit (notification never claimed) → t
   assert.equal(a.recovered + b.recovered, 2, "one email + one WhatsApp, recovered by exactly one worker each");
   assert.equal(providers.whatsapp.length, 1);
   assert.equal(providers.emails.length, 1);
-  assert.equal(providers.whatsapp[0].body_data[3], "Refund Completed");
+  assert.equal(providers.whatsapp[0].body_data[3], "Refund Processed");
 
   // Later runs never send it again.
   db.store.advance(30 * 60 * 1000);

@@ -119,9 +119,9 @@ test("1. a customer can read their own order history — sanitized to {status, l
     "return_received",
     "quality_check_passed",
     "refund_approved",
-    "refund_completed",
+    "refund_processed",
   ]);
-  assert.equal(res.body.history.at(-1).label, "Refund Completed");
+  assert.equal(res.body.history.at(-1).label, "Refund Processed");
   const body = JSON.stringify(res.body);
   for (const secret of SECRETS) assert.ok(!body.includes(secret), `leaked ${secret}`);
   // The history query no longer even selects notes / changed_by.

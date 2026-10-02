@@ -810,7 +810,7 @@ export const getReadableOrderStatus = (status) => {
     "Return Rejected": "Return Rejected",
     "Return Quality Check Failed": "Return Quality Check Failed",
     "Refund Initiated": "Refund Initiated",
-    "Refund Completed": "Refund Completed",
+    "Refund Processed": "Refund Processed",
     "Refund Rejected": "Refund Rejected",
   };
 

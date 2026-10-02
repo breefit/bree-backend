@@ -581,7 +581,7 @@ test("ORDER-RETURN-E2E-001: payment captured → delivered → return approved �
   assert.equal(pay.refund_id, "rfnd_e2e_1");
   assert.equal(pay.status, "captured");
 
-  // Steps 16–17: refund.processed webhook → Refund Completed.
+  // Steps 16–17: refund.processed webhook → Refund Processed.
   razorpay.ledger[0].status = "processed";
   const hook = await refundWebhook("refund.processed", razorpay.ledger[0]);
   assert.equal(hook.statusCode, 200);
@@ -786,7 +786,7 @@ test("26-E: two concurrent approveRefund → one approval, one history row, amou
   assert.equal((await historyNotes(o.id)).filter((n) => /^Refund approved/.test(n)).length, 1);
 });
 
-test("26-F: completeRefund racing the refund.processed webhook (webhook lands while the Razorpay call is in flight) → one Razorpay refund, completed once, one 'Refund Completed' per channel, no 'Refund Initiated'", { skip }, async () => {
+test("26-F: completeRefund racing the refund.processed webhook (webhook lands while the Razorpay call is in flight) → one Razorpay refund, completed once, one 'Refund Processed' per channel, no 'Refund Initiated'", { skip }, async () => {
   const o = await seedPaidDeliveredOrder();
   await driveToQcPassed(o);
   await call(returns.approveRefund, o.id, {});
@@ -831,7 +831,7 @@ test("26-G: the same refund.processed webhook delivered twice (and concurrently)
   await settleNotifications(o.id, ["refund_completed:channel:email", "refund_completed:channel:whatsapp"]);
   await sleep(100);
   assert.equal((await historyNotes(o.id)).filter((n) => /confirmed completed via webhook/.test(n)).length, 1);
-  assert.equal(whatsappFor(o.orderNumber).filter((w) => JSON.stringify(w).includes("Refund Completed")).length, 1);
+  assert.equal(whatsappFor(o.orderNumber).filter((w) => JSON.stringify(w).includes("Refund Processed")).length, 1);
 });
 
 // ════════════════════════════════════════════════════════════════════════════
