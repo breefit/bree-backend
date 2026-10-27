@@ -61,6 +61,7 @@ const hasAwbShipment = (order) =>
 
 // GET /api/admin/orders
 export const getOrders = async (req, res) => {
+  res.set("Cache-Control", "no-store");
   const {
     search = "",
     page = 1,
@@ -298,6 +299,7 @@ export const getOrders = async (req, res) => {
 
 // GET /api/admin/orders/:id
 export const getOrder = async (req, res) => {
+  res.set("Cache-Control", "no-store");
   const schemaInfo = await getOrderSchemaInfo();
   const customerNameExpr = schemaInfo.isNewOrderSchema
     ? "o.contact_name"
