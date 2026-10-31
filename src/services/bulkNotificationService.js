@@ -453,7 +453,6 @@ export const notifyBulkOrderInProgress = async ({
         preheader: "Your BREE Wellness bulk order is now in progress.",
       }),
     });
-    console.log(`[BULK] In Progress email SUCCESS | bookingId=${bookingId}`);
   } catch (err) {
     console.error(
       `[BULK] In Progress email FAILED | bookingId=${bookingId} | ${err?.message}`,
@@ -468,9 +467,7 @@ export const notifyBulkOrderInProgress = async ({
     details: "",
   });
 
-  if (whatsappResult?.success) {
-    console.log(`[BULK] In Progress WhatsApp SUCCESS | bookingId=${bookingId}`);
-  } else {
+  if (!whatsappResult?.success) {
     console.error(
       `[BULK] In Progress WhatsApp FAILED | bookingId=${bookingId} | ${whatsappResult?.error?.message || "unknown error"}`,
     );
@@ -492,8 +489,6 @@ export const notifyQuoteReady = async ({
   deliveryDate,
   bookingId,
 }) => {
-  console.log(`[BULK] Quote notification START | bookingId=${bookingId}`);
-
   const quoteReviewUrl = buildBulkOrderQuoteReviewUrl(bookingId);
 
   try {
@@ -529,7 +524,6 @@ export const notifyQuoteReady = async ({
         preheader: "Your BREE Wellness bulk order quote is ready to review.",
       }),
     });
-    console.log(`[BULK] Quote email SUCCESS | bookingId=${bookingId}`);
   } catch (err) {
     console.error(
       `[BULK] Quote email FAILED | bookingId=${bookingId} | ${err?.message}`,
@@ -544,9 +538,7 @@ export const notifyQuoteReady = async ({
     details: quoteReviewUrl,
   });
 
-  if (whatsappResult?.success) {
-    console.log(`[BULK] Quote WhatsApp SUCCESS | bookingId=${bookingId}`);
-  } else {
+  if (!whatsappResult?.success) {
     console.error(
       `[BULK] Quote WhatsApp FAILED | bookingId=${bookingId} | ${whatsappResult?.error?.message || "unknown error"}`,
     );

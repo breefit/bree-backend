@@ -161,9 +161,11 @@ const logSuccess = (response, templateName) => {
   // console.log("Response Status:", response.status);
   // console.log("Timestamp:", timestamp);
 
-  // Full response body is verbose - keep production logs concise.
+  // Metadata only — the response body can carry the recipient's details.
   if (process.env.NODE_ENV !== "production") {
-    console.log("Response Data:", response.data);
+    console.log(
+      `[WAPLIFY OTP] SUCCESS | ${templateName} | status=${response.status} | requestId=${requestId || "N/A"}`,
+    );
   }
 
   // console.log("================================");
@@ -178,7 +180,6 @@ const logFailure = (error) => {
   console.error("[WAPLIFY OTP] Error Code:", code || "N/A");
   console.error("[WAPLIFY OTP] Error Message:", message);
   console.error("[WAPLIFY OTP] Request ID:", requestId || "N/A");
-  console.log("================================");
 };
 
 // Generic template-message sender: handles the HTTP call, retry policy,

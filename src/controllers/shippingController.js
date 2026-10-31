@@ -2456,8 +2456,6 @@ export const downloadShippingLabel = async (req, res) => {
   }
 
   try {
-    console.log(`[DOWNLOAD_LABEL] Fetching shipping label for AWB ${awb}`);
-
     let labelBuffer;
     try {
       labelBuffer = await delhiveryService.getShippingLabel(awb);
@@ -2483,8 +2481,6 @@ export const downloadShippingLabel = async (req, res) => {
       "Content-Disposition",
       `attachment; filename="label-${awb}.pdf"`,
     );
-
-    console.log(`[DOWNLOAD_LABEL] Label served successfully for AWB ${awb}`);
 
     return res.status(200).send(labelBuffer);
   } catch (error) {

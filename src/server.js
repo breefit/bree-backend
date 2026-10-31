@@ -18,28 +18,21 @@ import { registerSocketSecurity } from "./services/socketAuth.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const preloadedRazorpayEnv = {
-  keyId: Boolean(process.env.RAZORPAY_KEY_ID),
-  keySecret: Boolean(process.env.RAZORPAY_KEY_SECRET),
-};
-const dotenvResult = dotenv.config({
+dotenv.config({
   path: path.resolve(__dirname, "../.env"),
+  quiet: true,
 });
 
-const razorpayEnvSource =
-  preloadedRazorpayEnv.keyId && preloadedRazorpayEnv.keySecret
-    ? "process environment (Hostinger/PM2)"
-    : dotenvResult.parsed?.RAZORPAY_KEY_ID &&
-        dotenvResult.parsed?.RAZORPAY_KEY_SECRET
-      ? "backend .env fallback"
-      : "mixed or missing sources";
-
-console.info("[RAZORPAY] runtime configuration", {
-  nodeEnv: process.env.NODE_ENV || "development",
-  envSource: razorpayEnvSource,
-  dotenvLoaded: Boolean(dotenvResult.parsed),
-  ...getSafeRazorpayConfig(),
-});
+// Razorpay credentials are still validated at startup, but only a
+// misconfiguration is logged (same approach as the WhatsApp check below).
+// The message is static validation text — never key or secret values.
+const razorpayConfig = getSafeRazorpayConfig();
+if (!razorpayConfig.configured) {
+  console.error(
+    "[RAZORPAY] runtime configuration INVALID — payments will fail until this is fixed:",
+    razorpayConfig.error,
+  );
+}
 
 // FIX (Shipped/OFD/Delivered WhatsApp investigation): validateWhatsAppConfiguration()
 // already existed (checks WAPLIFY_BASE_URL, WAPLIFY_API_KEY, and every
@@ -64,17 +57,9 @@ try {
 
 // SMTP (Hostinger) connection check — same non-fatal approach as the
 // WhatsApp check above: a mail problem is logged, never blocks startup.
-// Only host/port/user are logged; the password never is.
+// Only a failure is logged; a successful check stays silent.
 smtpTransporter
   .verify()
-  .then(() => {
-    console.info("[SMTP] connection verified", {
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT),
-      secure: process.env.SMTP_SECURE === "true",
-      user: process.env.SMTP_USER,
-    });
-  })
   .catch((smtpError) => {
     console.error(
       "[SMTP] connection verification FAILED — emails will fail until this is fixed:",

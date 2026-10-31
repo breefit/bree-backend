@@ -549,8 +549,6 @@ export const sendTemplateMessage = async ({
     ...(mediaUrl ? { media_url: mediaUrl } : {}),
   };
 
-  console.log(`[WhatsApp] START | ${templateName} | ${maskedMobile}`);
-
   if (!IS_PRODUCTION) {
     // console.log("========== WAPLIFY REQUEST ==========");
     // console.log("Template:", templateName);
@@ -563,7 +561,6 @@ export const sendTemplateMessage = async ({
     //   "Payload:",
     //   JSON.stringify({ ...payload, contact_phone: maskedMobile }, null, 2),
     // );
-    console.log("======================================");
   }
 
   const startedAt = Date.now();

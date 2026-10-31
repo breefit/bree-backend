@@ -442,15 +442,6 @@ export const sendOrderConfirmationEmail = async ({
   items,
   shippingAddress, // FIX: now explicitly passed from paymentController
 }) => {
-  console.log(
-    "[EMAIL] sendOrderConfirmationEmail orderId:",
-    orderId,
-    "to:",
-    to,
-    "address present:",
-    !!shippingAddress,
-  );
-
   const frontendUrl = getFrontendUrl();
   const trackingLink = buildOrderTrackingUrl(orderId);
 
