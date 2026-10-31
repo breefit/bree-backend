@@ -1063,3 +1063,4 @@ This backend currently implements, and has been verified (via direct source insp
 - ✅ Three scheduled jobs: package fulfillment (daily), shipment tracking sync (every 30 min), OTP cleanup (hourly)
 
 This section reflects the current implementation only, verified directly against the source code — it is not a historical changelog or QA audit log.
+<!--  -->
