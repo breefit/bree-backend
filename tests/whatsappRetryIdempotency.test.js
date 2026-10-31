@@ -17,6 +17,7 @@
  * subscription_email_notifications, daily_reminder_sends) against a real
  * throwaway MySQL (TEST_DATABASE_URL — never production); skipped without it.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

@@ -14,6 +14,7 @@
  *
  * Skipped (not failed) when TEST_DATABASE_URL is not configured.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -217,6 +218,11 @@ beforeEach(async () => {
 const makeRes = () => ({
   statusCode: 200,
   body: null,
+  headers: {},
+  set(name, value) {
+    this.headers[name] = value;
+    return this;
+  },
   status(code) {
     this.statusCode = code;
     return this;
@@ -556,7 +562,13 @@ test("O: Mark Returned is refused until Delhivery reports DL/DTO; an explicit ov
   assert.equal(r.return_status, "returned");
   assert.equal(r.returned_source, "manual_override");
   assert.equal(r.reverse_tracking_raw_status, "PU/In Transit", "Delhivery status preserved");
-  const overrideNote = (await history(created.id)).find((n) => n.startsWith("MANUAL OVERRIDE"));
+  // markReturned writes this history row after COMMIT, fire-and-forget, and
+  // responds without waiting for it — poll for it instead of reading once.
+  let overrideNote;
+  for (const start = Date.now(); !overrideNote && Date.now() - start < 5000; ) {
+    overrideNote = (await history(created.id)).find((n) => n.startsWith("MANUAL OVERRIDE"));
+    if (!overrideNote) await new Promise((r) => setTimeout(r, 25));
+  }
   assert.match(overrideNote, /Reason: Parcel physically received/);
   assert.match(overrideNote, /Delhivery reverse status at override: PU\/In Transit/);
 
@@ -616,6 +628,7 @@ test("T/U/V: admin order API and customer tracking API return identical timeline
   const fetchBoth = async () => {
     const adminRes = makeRes();
     await adminOrders.getOrder({ params: { id: created.id } }, adminRes);
+    assert.equal(adminRes.headers["Cache-Control"], "no-store", "admin order detail is never cached");
     const customerRes = makeRes();
     await orders.getOrderTracking({ params: { id: created.id }, user: null }, customerRes);
     return { admin: adminRes.body, customer: customerRes.body.order };

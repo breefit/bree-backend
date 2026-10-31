@@ -21,6 +21,7 @@
  * in-memory counterparts that always run are in
  * tests/returnReminderStop.test.js.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

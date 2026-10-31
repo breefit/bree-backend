@@ -14,6 +14,7 @@
  *
  * The classifier unit tests at the bottom need no DB.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

@@ -11,6 +11,7 @@
  *
  * Prints one line: RESULT:{...runDailyReminderScheduler() result, pid}
  */
+import "./requireTestEnv.js";
 import { mock } from "node:test";
 
 const realNow = () => performance.timeOrigin + performance.now();

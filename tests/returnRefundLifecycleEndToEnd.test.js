@@ -22,6 +22,7 @@
  *
  * Skipped (not failed) when TEST_DATABASE_URL is not configured.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -846,6 +847,10 @@ test("26-H / 27: WhatsApp AND email fail when the refund completes → refund st
   smtp.fail = true;
   const res = await completeRefund(o.id);
   assert.equal(res.statusCode, 200);
+  // Creating a refund always records 'initiated' (BREE-100020); 'completed'
+  // comes only from a verified final Razorpay state — here the status recheck.
+  assert.equal((await row(o.id)).refund_status, "initiated");
+  assert.equal((await completeRefund(o.id)).statusCode, 200);
   await settleNotifications(o.id, ["refund_completed:channel:email", "refund_completed:channel:whatsapp"]);
   let r = await row(o.id);
   assert.equal(r.refund_status, "completed", "notification failure never rolls back the refund");
@@ -885,6 +890,9 @@ test("27: Razorpay call fails outright → refund stays approved (retryable), no
   razorpay.refundStatus = "processed";
   assert.equal((await completeRefund(o.id)).statusCode, 200);
   assert.equal(razorpay.refundCalls.length, 1);
+  assert.equal((await row(o.id)).refund_status, "initiated", "creating the refund never marks it completed");
+  assert.equal((await completeRefund(o.id)).statusCode, 200, "status recheck");
+  assert.equal(razorpay.refundCalls.length, 1, "the recheck never creates a second refund");
   assert.equal((await row(o.id)).refund_status, "completed");
 });
 
@@ -900,10 +908,20 @@ test("27: Razorpay accepted the refund but the DB write failed (claim stranded i
   const res = await completeRefund(o.id);
   assert.equal(res.statusCode, 200);
   assert.equal(razorpay.refundCalls.length, 1, "only the original refund exists");
-  const r = await row(o.id);
+  let r = await row(o.id);
+  assert.equal(r.refund_status, "initiated", "adopting the existing refund never marks it completed");
+  assert.equal(r.refund_reference, "rfnd_e2e_1");
+  // History is written after COMMIT, fire-and-forget.
+  await waitFor(
+    async () => (await historyNotes(o.id)).some((n) => /Existing Razorpay refund reconciled/.test(n)),
+    "reconciliation history note",
+  );
+
+  assert.equal((await completeRefund(o.id)).statusCode, 200, "status recheck");
+  assert.equal(razorpay.refundCalls.length, 1, "the recheck never creates a second refund");
+  r = await row(o.id);
   assert.equal(r.refund_status, "completed");
   assert.equal(r.refund_reference, "rfnd_e2e_1");
-  assert.match((await historyNotes(o.id)).at(-1) || "", /Existing Razorpay refund reconciled/);
 });
 
 test("25: timezone — return deadline boundary at deadline-1s / deadline / deadline+1s, and IST day boundaries 00:00, 05:00, 23:59", { skip }, async () => {

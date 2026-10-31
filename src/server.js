@@ -110,43 +110,52 @@ const startServer = async () => {
     // shutdown handler below can call .stop() on each.
     const cronTasks = [];
 
-    try {
-      await query("SELECT 1");
-      console.log("✅ Database connection verified");
+    // Automated tests that boot this server (tests/gracefulShutdown.test.js)
+    // may now reach a real local test database, which would otherwise start
+    // every cron and its Delhivery/Razorpay/WhatsApp/email side effects.
+    const cronDisabled = process.env.NODE_ENV?.trim() === "test";
 
-      // Start Delhivery tracking cron
-      cronTasks.push(startShippingTrackingCron());
+    if (cronDisabled) {
+      console.log("⏸️ Cron jobs disabled (NODE_ENV=test)");
+    } else {
+      try {
+        await query("SELECT 1");
+        console.log("✅ Database connection verified");
 
-      // Recurring package fulfillment cron (creates cycle 2+ orders)
-      cronTasks.push(startPackageFulfillmentCron());
+        // Start Delhivery tracking cron
+        cronTasks.push(startShippingTrackingCron());
 
-      // Refund reconciliation (missed refund.processed/failed webhooks) —
-      // status checks only, never creates a refund.
-      cronTasks.push(startRefundReconciliationCron());
+        // Recurring package fulfillment cron (creates cycle 2+ orders)
+        cronTasks.push(startPackageFulfillmentCron());
 
-      // Customer return/refund notification retry + recovery (failed sends
-      // the provider provably did not accept, and notifications lost to a
-      // crash after the state commit) — see notificationReconciliation.js.
-      cronTasks.push(startNotificationReconciliationCron());
+        // Refund reconciliation (missed refund.processed/failed webhooks) —
+        // status checks only, never creates a refund.
+        cronTasks.push(startRefundReconciliationCron());
 
-      // Daily wellness reminder cron (runs every minute to check for
-      // reminders). Idempotent per process — see startDailyReminderCron.
-      cronTasks.push(startDailyReminderCron());
+        // Customer return/refund notification retry + recovery (failed sends
+        // the provider provably did not accept, and notifications lost to a
+        // crash after the state commit) — see notificationReconciliation.js.
+        cronTasks.push(startNotificationReconciliationCron());
 
-      // OTP cleanup cron (runs every hour)
-      cronTasks.push(
-        cron.schedule("0 * * * *", () => {
-          cleanupExpiredOtps().catch((err) => {
-            console.error("[otpCleanupJob] Failed to clean expired OTPs:", err);
-          });
-        }),
-      );
-      console.log("🧹 OTP cleanup cron started (runs every hour)");
-    } catch (dbErr) {
-      console.error(
-        "⚠️ Database connection check failed; cron not started",
-        dbErr,
-      );
+        // Daily wellness reminder cron (runs every minute to check for
+        // reminders). Idempotent per process — see startDailyReminderCron.
+        cronTasks.push(startDailyReminderCron());
+
+        // OTP cleanup cron (runs every hour)
+        cronTasks.push(
+          cron.schedule("0 * * * *", () => {
+            cleanupExpiredOtps().catch((err) => {
+              console.error("[otpCleanupJob] Failed to clean expired OTPs:", err);
+            });
+          }),
+        );
+        console.log("🧹 OTP cleanup cron started (runs every hour)");
+      } catch (dbErr) {
+        console.error(
+          "⚠️ Database connection check failed; cron not started",
+          dbErr,
+        );
+      }
     }
 
     app.set("trust proxy", 1);

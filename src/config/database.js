@@ -1,6 +1,12 @@
 import dotenv from "dotenv";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+  assertSafeDatabaseMode,
+  assertSafeTestDatabase,
+  isTestRunnerProcess,
+} from "./testDatabaseGuard.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -39,14 +45,55 @@ const dbName = cleanEnv(process.env.DB_NAME);
 const prodDatabaseUrlRaw = cleanEnv(process.env.DATABASE_URL);
 const testDatabaseUrlRaw = cleanEnv(process.env.TEST_DATABASE_URL);
 
-if (isTestEnv && testDatabaseUrlRaw && prodDatabaseUrlRaw && testDatabaseUrlRaw === prodDatabaseUrlRaw) {
-  // Hard abort, never a warning: TEST_DATABASE_URL must never be allowed to
-  // resolve to the same database as production.
+// Runs before any pool, connectivity ping or startup schema change below.
+try {
+  assertSafeDatabaseMode({
+    isTestEnv,
+    testDatabaseUrl: testDatabaseUrlRaw,
+    underTestRunner: isTestRunnerProcess({
+      env: process.env,
+      execArgv: process.execArgv,
+      entryScript: process.argv[1],
+      testsDir: path.resolve(__dirname, "../../tests"),
+    }),
+  });
+} catch (guardError) {
   console.error(
-    "[FATAL] TEST_DATABASE_URL is identical to the production DATABASE_URL. " +
-      "Refusing to run tests against production. Aborting immediately.",
+    `[FATAL] ${guardError.message} Refusing to open any database ` +
+      "connection or run startup schema changes. Aborting immediately.",
   );
   process.exit(1);
+}
+
+if (isTestEnv && testDatabaseUrlRaw) {
+  // Hard abort, never a warning: TEST_DATABASE_URL must never be allowed to
+  // resolve to the production database. The on-disk .env is checked as well
+  // as process.env, because a test env file (node --env-file) masks the
+  // production DATABASE_URL in process.env.
+  const envFilePath = path.resolve(__dirname, "../../.env");
+  const envFile = fs.existsSync(envFilePath)
+    ? dotenv.parse(fs.readFileSync(envFilePath))
+    : {};
+  try {
+    assertSafeTestDatabase({
+      testDatabaseUrl: testDatabaseUrlRaw,
+      productionConfigs: [
+        { databaseUrl: prodDatabaseUrlRaw, dbHost, dbPort, dbName },
+        {
+          databaseUrl: envFile.DATABASE_URL,
+          dbHost: envFile.DB_HOST,
+          dbPort: envFile.DB_PORT,
+          dbName: envFile.DB_NAME,
+        },
+      ],
+    });
+  } catch (guardError) {
+    console.error(
+      `[FATAL] ${guardError.message} Refusing to run tests against a ` +
+        "possibly-production database. Aborting immediately.",
+    );
+    process.exit(1);
+  }
 }
 
 let poolConfig;

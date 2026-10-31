@@ -1,3 +1,4 @@
+import "./fixtures/requireTestEnv.js";
 import test, { after, before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";

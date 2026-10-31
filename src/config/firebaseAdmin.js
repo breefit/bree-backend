@@ -60,7 +60,8 @@
 // export { firebaseAdminReady, firebaseAdminMode };
 // export default firebaseAuth;
 
-import admin from "firebase-admin";
+import { cert, getApps, initializeApp } from "firebase-admin/app";
+import { getAuth } from "firebase-admin/auth";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -97,11 +98,11 @@ let firebaseAdminReady = false;
 let firebaseAdminMode = "none";
 
 try {
-  if (!admin.apps.length) {
+  if (!getApps().length) {
     const serviceAccount = JSON.parse(fs.readFileSync(credentialPath, "utf8"));
 
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
+    initializeApp({
+      credential: cert(serviceAccount),
     });
 
     firebaseAdminReady = true;
@@ -120,7 +121,7 @@ try {
   throw error;
 }
 
-const firebaseAuth = admin.auth();
+const firebaseAuth = getAuth();
 
 export { firebaseAdminReady, firebaseAdminMode };
 export default firebaseAuth;

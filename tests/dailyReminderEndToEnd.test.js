@@ -24,6 +24,7 @@
  * Skipped (not failed) when TEST_DATABASE_URL is not configured, matching
  * this repo's rule that tests never fall back to the production database.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after, beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";

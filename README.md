@@ -98,7 +98,7 @@ Versions below are taken directly from `package.json`. Node.js is an **ES Module
 
 **Delhivery**: no SDK — `axios` calls to the Delhivery HTTP API (base URL/token from environment).
 
-Node engine (from `package.json` → `engines`): Node `20.x`, npm `>=10.0.0`.
+Node engine (from `package.json` → `engines`): Node `24.x`, npm `>=10.0.0`.
 
 ---
 
@@ -893,7 +893,7 @@ There is no `npm run build` — this is a plain Node.js server with no compilati
 6. `npm run migrate` (initial schema), then `npm run seed` (admin account)
 7. `npm run dev` (or `npm start` for production)
 
-Node.js version is pinned in `package.json` → `engines`: Node `20.x`, npm `>=10.0.0`.
+Node.js version is pinned in `package.json` → `engines`: Node `24.x`, npm `>=10.0.0`.
 
 ---
 
@@ -945,7 +945,7 @@ Actual mechanisms present in this codebase:
 
 ## 34. Deployment
 
-- **Runtime**: plain Node.js (`node src/server.js` / `npm start`) — no build step, no bundler. `engines.node = "20.x"` in `package.json` pins the expected Node version.
+- **Runtime**: plain Node.js (`node src/server.js` / `npm start`) — no build step, no bundler. `engines.node = "24.x"` in `package.json` pins the expected Node version.
 - **Trust proxy**: `app.set("trust proxy", 1)` is set (both in `app.js` and again in `server.js`) — required when running behind a load balancer/reverse proxy (the code comments explicitly reference Render/Railway/Heroku-style platforms) so `req.ip` and rate limiting resolve the real client IP correctly. There is no platform-specific config file (no `render.yaml`, `Procfile`, `Dockerfile`, etc.) present in this repository — deploy target is whatever Node.js host is configured to run `npm start` with the required environment variables set.
 - **Environment variables**: all variables in [§5](#5-environment-variables) must be set on the hosting platform before start.
 - **Start command**: `npm start` (production) or `npm run dev` (development, via `nodemon`).

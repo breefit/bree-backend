@@ -8,6 +8,7 @@
  * admin_session_revocations; the last test runs the real SQL against a
  * throwaway MySQL (TEST_DATABASE_URL — never production), skipped without it.
  */
+import "./fixtures/requireTestEnv.js";
 import test, { before, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
